@@ -161,11 +161,12 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
 
     auto issue_kv_tile = [&](int tile_k0) {
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
+        const bool tile_live    = !paged_kv_page_is_hole(physical_page);
         for (int key_l = tid; key_l < Bc; key_l += kCausalPromptI8Threads) {
             const int key = tile_k0 + key_l;
             __half* kd    = &k_scale_s[key_l * Groups];
             __half* vd    = &v_scale_s[key_l * Groups];
-            if (key <= max_query_abs) {
+            if (key <= max_query_abs && tile_live) {
                 const std::int64_t off =
                     kv_cache_int8_quant_scale_index<Geometry>(physical_page, kv_head, 0, key_l);
                 ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
@@ -183,7 +184,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
             const int key   = tile_k0 + key_l;
             std::int8_t* kd = &k_i8[(key_l * DB16 + causal_prompt_swz(key_l, dc * 8)) * 2];
             std::int8_t* vd = &v_i8[key_l * D + d];
-            if (key <= max_query_abs) {
+            if (key <= max_query_abs && tile_live) {
                 const std::int64_t off =
                     kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d, key_l);
                 cp_async<16, Cache::cg>(kd, &cache_k[off]);
@@ -238,6 +239,10 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
     const float scale_l2 = scale * Log2E;
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = kb * Bc;
+        // Hole page: the tile stages zeros and its scores are all masked below;
+        // page-level check, uniform across the CTA, pipeline unchanged.
+        const bool tile_hole =
+            paged_kv_page_is_hole(block_table[k0 >> kPagedKVPageShift]);
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
             float score[QKNt][4];
@@ -307,7 +312,8 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
             const int row1             = row0 + 8;
             const int qabs0            = row0 < tile_rows ? base_pos + q0 + row0 : -1;
             const int qabs1            = row1 < tile_rows ? base_pos + q0 + row1 : -1;
-            const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
+            const bool full_score_tile =
+                !tile_hole && q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
@@ -315,10 +321,10 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
                 if (!full_score_tile) {
-                    score[nt][0] = key0 <= qabs0 ? score[nt][0] : -CUDART_INF_F;
-                    score[nt][1] = key1 <= qabs0 ? score[nt][1] : -CUDART_INF_F;
-                    score[nt][2] = key0 <= qabs1 ? score[nt][2] : -CUDART_INF_F;
-                    score[nt][3] = key1 <= qabs1 ? score[nt][3] : -CUDART_INF_F;
+                    score[nt][0] = key0 <= qabs0 && !tile_hole ? score[nt][0] : -CUDART_INF_F;
+                    score[nt][1] = key1 <= qabs0 && !tile_hole ? score[nt][1] : -CUDART_INF_F;
+                    score[nt][2] = key0 <= qabs1 && !tile_hole ? score[nt][2] : -CUDART_INF_F;
+                    score[nt][3] = key1 <= qabs1 && !tile_hole ? score[nt][3] : -CUDART_INF_F;
                 }
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
