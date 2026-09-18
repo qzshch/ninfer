@@ -292,10 +292,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float l1 = 0.0F;
 
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+        const bool tile_live = !paged_kv_page_is_hole(physical_page);
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key             = tile_k0 + key_l;
             std::uint8_t* v_scale_dst = v_scale_s + key_l * kKVCacheNvfp4Groups;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < split_end && tile_live) {
                 const std::int64_t k_scale_offset = kv_cache_fp8_scale_index<Geometry>(
                     physical_page, kv_head, key & kPagedKVPageMask);
                 const std::int64_t v_scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
@@ -314,7 +315,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int d         = dc * 16;
             const int key       = tile_k0 + key_l;
             std::uint8_t* k_dst = &k_fp8[(key_l * DB16 + causal_small_t_tc_swz(key_l, dc * 8)) * 2];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < split_end && tile_live) {
                 const std::int64_t code_offset = kv_cache_fp8_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
@@ -329,7 +330,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int d         = dc * 32;
             const int key       = tile_k0 + key_l;
             std::uint8_t* v_dst = &v_nvfp4[key_l * (D / 2) + d / 2];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < split_end && tile_live) {
                 const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(v_dst, &cache_v[code_offset]);
@@ -347,6 +348,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+        // Hole page: zeros staged above, scores masked below; page-level and CTA-uniform.
+        const bool tile_hole =
+            paged_kv_page_is_hole(physical_pages_s[(k0 >> kPagedKVPageShift) - first_page]);
         if (warp < RowTiles) {
             const int row_base = warp * 16;
             __half* p_sw       = &p_s[row_base * PStride];
@@ -402,19 +406,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key0 = k0 + col0;
                 const int key1 = key0 + 1;
                 score[nt][0] =
-                    row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0
+                    row0 < RowCount && !tile_hole && key0 >= split_start && key0 < split_end &&
+                    key0 <= qabs0
                         ? score[nt][0] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][1] =
-                    row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0
+                    row0 < RowCount && !tile_hole && key1 >= split_start && key1 < split_end &&
+                    key1 <= qabs0
                         ? score[nt][1] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][2] =
-                    row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1
+                    row1 < RowCount && !tile_hole && key0 >= split_start && key0 < split_end &&
+                    key0 <= qabs1
                         ? score[nt][2] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][3] =
-                    row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1
+                    row1 < RowCount && !tile_hole && key1 >= split_start && key1 < split_end &&
+                    key1 <= qabs1
                         ? score[nt][3] * attention_scale
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

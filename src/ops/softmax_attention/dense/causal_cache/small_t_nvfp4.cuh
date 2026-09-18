@@ -283,11 +283,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float l1 = 0.0F;
 
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+        const bool tile_live = !paged_kv_page_is_hole(physical_page);
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             auto* k_dst   = k_scale_s + key_l * kKVCacheNvfp4Groups;
             auto* v_dst   = v_scale_s + key_l * kKVCacheNvfp4Groups;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < split_end && tile_live) {
                 const std::int64_t scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 cp_async<16>(k_dst, cache_k_scale + scale_offset);
@@ -306,7 +307,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int physical_byte = causal_small_t_nvfp4_code_swz(key_l, dc * 16);
             std::uint8_t* k_dst     = &k_nvfp4[key_l * CodeRowBytes + physical_byte];
             std::uint8_t* v_dst     = &v_nvfp4[key_l * CodeRowBytes + d / 2];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < split_end && tile_live) {
                 const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
@@ -326,6 +327,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+        // Hole page: zeros staged above, scores masked below; page-level and CTA-uniform.
+        const bool tile_hole =
+            paged_kv_page_is_hole(physical_pages_s[(k0 >> kPagedKVPageShift) - first_page]);
 
 #pragma unroll 1
         for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
@@ -390,19 +394,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key0 = k0 + col0;
                 const int key1 = key0 + 1;
                 score[nt][0] =
-                    row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0
+                    row0 < RowCount && !tile_hole && key0 >= split_start && key0 < split_end &&
+                    key0 <= qabs0
                         ? score[nt][0] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][1] =
-                    row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0
+                    row0 < RowCount && !tile_hole && key1 >= split_start && key1 < split_end &&
+                    key1 <= qabs0
                         ? score[nt][1] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][2] =
-                    row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1
+                    row1 < RowCount && !tile_hole && key0 >= split_start && key0 < split_end &&
+                    key0 <= qabs1
                         ? score[nt][2] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][3] =
-                    row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1
+                    row1 < RowCount && !tile_hole && key1 >= split_start && key1 < split_end &&
+                    key1 <= qabs1
                         ? score[nt][3] * attention_scale
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
