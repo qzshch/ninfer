@@ -2449,6 +2449,13 @@ int run_nvfp4_cases() {
                             MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Nvfp4Group16, {1, 65535, 65536, 719u},
                             MappingPattern::Fragmented);
+    // NVFP4 hole coverage: written pages stay materialized; read-only cases cross hole pages.
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Nvfp4Group16, {6, 61, 192, 720u},
+                            MappingPattern::Holed);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Nvfp4Group16, {1, 128, 192, 721u},
+                            MappingPattern::Holed);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Nvfp4Group16, {7, 8192, 8199, 722u},
+                            MappingPattern::Holed);
     return failures;
 }
 
@@ -2482,6 +2489,13 @@ int run_k8v4_cases() {
                             MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
                             {1, 16383, 16384, 813u}, MappingPattern::Fragmented);
+    // K8V4 hole coverage: written pages stay materialized; read-only cases cross hole pages.
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value, {6, 61, 192, 814u},
+                            MappingPattern::Holed);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value, {1, 128, 192, 815u},
+                            MappingPattern::Holed);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value, {7, 8192, 8199, 816u},
+                            MappingPattern::Holed);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
                             {1, 65535, 65536, 814u}, MappingPattern::Fragmented);
     return failures;
