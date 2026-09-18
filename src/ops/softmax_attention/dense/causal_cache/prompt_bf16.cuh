@@ -38,6 +38,16 @@ __device__ __forceinline__ void causal_prompt_stage_kv(Element* dst, const Eleme
     constexpr int Threads   = kCausalPromptThreads;
     constexpr int VecPerRow = D / 8; // 8 two-byte elements per 16B cp.async
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
+    // Hole pages have no device replica: stage zeros without touching the cache.
+    if (paged_kv_page_is_hole(physical_page)) {
+#pragma unroll
+        for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
+            const int key_l = chunk >> 5;        // / VecPerRow (32)
+            const int d     = (chunk & 31) << 3; // (chunk % 32) * 8
+            store_vec(&dst[key_l * D + causal_prompt_swz(key_l, d)], make_int4(0, 0, 0, 0));
+        }
+        return;
+    }
     // Block base pointer computed once (int64); per-element offsets stay 32-bit.
     const Element* cache_block =
         cache + paged_kv_element_offset<kCausalPromptHeadDim, Geometry::KVHeads>(
@@ -198,6 +208,9 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
     for (int kb = 0; kb < n_block_max; ++kb) {
         const int k0                 = kb * Bc;
         const int next_physical_page = (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
+        // Hole page: stage_kv fills zeros and the score mask below makes the tile invisible.
+        // Bc == page size here, so the tile index is the page index.
+        const bool tile_hole         = paged_kv_page_is_hole(block_table[kb]);
 
         ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
@@ -258,7 +271,8 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         const int qrow1            = q0 + row1;
         const int qabs0            = (qrow0 < tokens) ? base_pos + qrow0 : -1;
         const int qabs1            = (qrow1 < tokens) ? base_pos + qrow1 : -1;
-        const bool full_score_tile = (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0));
+        const bool full_score_tile =
+            !tile_hole && (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0));
 
         // block row-max on raw (unscaled) scores; scale is folded into exp2 below
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
@@ -273,10 +287,14 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                score[nt][0]   = (qrow0 < tokens && key0 <= qabs0) ? score[nt][0] : -CUDART_INF_F;
-                score[nt][1]   = (qrow0 < tokens && key1 <= qabs0) ? score[nt][1] : -CUDART_INF_F;
-                score[nt][2]   = (qrow1 < tokens && key0 <= qabs1) ? score[nt][2] : -CUDART_INF_F;
-                score[nt][3]   = (qrow1 < tokens && key1 <= qabs1) ? score[nt][3] : -CUDART_INF_F;
+                score[nt][0]   = (qrow0 < tokens && key0 <= qabs0 && !tile_hole) ? score[nt][0]
+                                                                                 : -CUDART_INF_F;
+                score[nt][1]   = (qrow0 < tokens && key1 <= qabs0 && !tile_hole) ? score[nt][1]
+                                                                                 : -CUDART_INF_F;
+                score[nt][2]   = (qrow1 < tokens && key0 <= qabs1 && !tile_hole) ? score[nt][2]
+                                                                                 : -CUDART_INF_F;
+                score[nt][3]   = (qrow1 < tokens && key1 <= qabs1 && !tile_hole) ? score[nt][3]
+                                                                                 : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }

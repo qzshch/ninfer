@@ -219,6 +219,11 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
         }
+        // A hole table entry makes the whole tile invisible: zeros are staged (no cache read)
+        // and its scores are masked to -inf below. Page-level check, uniform across the CTA;
+        // pipeline and barriers unchanged.
+        const bool tile_hole =
+            paged_kv_page_is_hole(physical_pages_s[(k0 >> kPagedKVPageShift) - first_page]);
         // Stage BF16 K and persistent FP16 V with one cp.async wave (16B/thread, high MLP).
         // Current-step K comes from input and V from the row converted above; tail slots are
         // zeroed.
@@ -229,7 +234,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             const int key        = k0 + key_l;
             __nv_bfloat16* k_dst = &k_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
             __half* v_dst        = &v_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < split_end && !tile_hole) {
                 if constexpr (CacheInput::writes_cache) {
                     const int new_token = key - first_pos;
                     const bool from_new =
@@ -294,19 +299,23 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             const int key0 = k0 + col0;
             const int key1 = col1 + k0;
             score[nt][0] =
-                (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                (row0 < row_count && !tile_hole && key0 >= split_start && key0 < split_end &&
+                 key0 <= qabs0)
                     ? score[nt][0] * scale
                     : -CUDART_INF_F;
             score[nt][1] =
-                (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                (row0 < row_count && !tile_hole && key1 >= split_start && key1 < split_end &&
+                 key1 <= qabs0)
                     ? score[nt][1] * scale
                     : -CUDART_INF_F;
             score[nt][2] =
-                (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                (row1 < row_count && !tile_hole && key0 >= split_start && key0 < split_end &&
+                 key0 <= qabs1)
                     ? score[nt][2] * scale
                     : -CUDART_INF_F;
             score[nt][3] =
-                (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                (row1 < row_count && !tile_hole && key1 >= split_start && key1 < split_end &&
+                 key1 <= qabs1)
                     ? score[nt][3] * scale
                     : -CUDART_INF_F;
             bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

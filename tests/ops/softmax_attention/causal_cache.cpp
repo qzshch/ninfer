@@ -2369,14 +2369,13 @@ int run_geometry(const Geometry& geometry) {
     // Hole-pattern cases run per storage once that storage's kernels honor hole entries
     // (INT8 first; BF16 joins when its tile masks land). Append cases keep every written page
     // materialized (holes start at page 4), read-only cases cross many hole pages.
-    failures += run_a1_case(geometry, KvCacheStorage::Int8Group64, {6, 61, 67, 190u},
-                            MappingPattern::Holed);
-    failures += run_a3_case(geometry, KvCacheStorage::Int8Group64, {1, 128, 129, 191u},
-                            MappingPattern::Holed);
-    failures += run_a3_case(geometry, KvCacheStorage::Int8Group64, {7, 8192, 8199, 192u},
-                            MappingPattern::Holed);
-    failures += run_a3_case(geometry, KvCacheStorage::Int8Group64, {16, 513, 529, 193u},
-                            MappingPattern::Holed);
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64}) {
+        failures += run_a1_case(geometry, storage, {6, 61, 67, 190u}, MappingPattern::Holed);
+        failures += run_a3_case(geometry, storage, {1, 128, 129, 191u}, MappingPattern::Holed);
+        failures += run_a3_case(geometry, storage, {7, 8192, 8199, 192u}, MappingPattern::Holed);
+        failures += run_a3_case(geometry, storage, {16, 513, 529, 193u}, MappingPattern::Holed);
+    }
     return failures;
 }
 
@@ -2398,6 +2397,13 @@ int run_fp8_cases() {
                             MappingPattern::Identity);
     failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256, {1, 16384, 16385, 607u},
                             MappingPattern::Fragmented);
+    // FP8 hole coverage: written pages stay materialized; read-only cases cross hole pages.
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256, {6, 61, 192, 608u},
+                            MappingPattern::Holed);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256, {1, 128, 192, 609u},
+                            MappingPattern::Holed);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256, {7, 8192, 8199, 610u},
+                            MappingPattern::Holed);
     return failures;
 }
 
