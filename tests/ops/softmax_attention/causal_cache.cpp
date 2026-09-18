@@ -128,7 +128,7 @@ struct AttentionCase {
     bool graph_replay = false;
 };
 
-enum class MappingPattern { Identity, Offset, Fragmented };
+enum class MappingPattern { Identity, Offset, Fragmented, Holed };
 
 const char* mapping_name(MappingPattern pattern) {
     switch (pattern) {
@@ -138,8 +138,22 @@ const char* mapping_name(MappingPattern pattern) {
         return "offset";
     case MappingPattern::Fragmented:
         return "fragmented";
+    case MappingPattern::Holed:
+        return "holed";
     }
     return "unknown";
+}
+
+// Holed-pattern holes start at page 4 so every append-writing case (whose positions stay in
+// pages 0..2 in this suite) keeps writing materialized pages only; read-only cases see holes
+// from page 4 upward (4, 7, 10, ...).
+bool holed_page_is_hole(std::int32_t page) {
+    return page >= 4 && page % 3 == 1;
+}
+
+bool block_table_position_is_hole(std::span<const std::int32_t> block_table, std::int32_t position) {
+    const std::int32_t page = block_table[static_cast<std::size_t>(position / kPagedKVPageSize)];
+    return page == kPagedKVPageHole;
 }
 
 std::int32_t align_up_page(std::int32_t value) {
@@ -154,6 +168,8 @@ std::int32_t physical_page_count(std::int32_t logical_pages, MappingPattern patt
     case MappingPattern::Offset:
         return logical_pages + 2;
     case MappingPattern::Fragmented:
+        return 2 * logical_pages + 1;
+    case MappingPattern::Holed:
         return 2 * logical_pages + 1;
     }
     return 0;
@@ -170,6 +186,12 @@ std::vector<std::int32_t> make_block_table(std::int32_t logical_pages, MappingPa
         break;
     case MappingPattern::Fragmented:
         for (std::int32_t page = 0; page < logical_pages; ++page) { table[page] = 2 * page + 1; }
+        break;
+    case MappingPattern::Holed:
+        for (std::int32_t page = 0; page < logical_pages; ++page) {
+            table[static_cast<std::size_t>(page)] =
+                holed_page_is_hole(page) ? kPagedKVPageHole : 2 * page + 1;
+        }
         break;
     }
     return table;
@@ -267,6 +289,7 @@ std::vector<T> scatter_paged(const std::vector<T>& logical, std::int32_t leading
         for (std::int32_t position = 0; position < logical_capacity; ++position) {
             const std::int32_t page =
                 block_table[static_cast<std::size_t>(position) / kPagedKVPageSize];
+            if (page == kPagedKVPageHole) { continue; }
             for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
                 const std::size_t source = static_cast<std::size_t>(leading) +
                                            static_cast<std::size_t>(leading_extent) *
@@ -288,6 +311,7 @@ void scatter_paged_into(const std::vector<T>& logical, std::int32_t leading_exte
         for (std::int32_t position = 0; position < logical_capacity; ++position) {
             const std::int32_t page =
                 block_table[static_cast<std::size_t>(position) / kPagedKVPageSize];
+            if (page == kPagedKVPageHole) { continue; }
             for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
                 const std::size_t source = static_cast<std::size_t>(leading) +
                                            static_cast<std::size_t>(leading_extent) *
@@ -310,6 +334,7 @@ std::vector<T> gather_paged(std::span<const T> physical, std::int32_t leading_ex
         for (std::int32_t position = 0; position < logical_capacity; ++position) {
             const std::int32_t page =
                 block_table[static_cast<std::size_t>(position) / kPagedKVPageSize];
+            if (page == kPagedKVPageHole) { continue; }
             for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
                 const std::size_t target = static_cast<std::size_t>(leading) +
                                            static_cast<std::size_t>(leading_extent) *
@@ -855,9 +880,13 @@ double cache_value(const HostCache& cache, bool key, int head, int position, int
 }
 
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
-                                    const std::vector<std::int32_t>& positions) {
+                                    const std::vector<std::int32_t>& positions,
+                                    std::span<const std::int32_t> block_table = {}) {
     const Geometry& geometry = cache.geometry;
     const int tokens = positions.size(), visible = positions.back() + 1;
+    const auto key_is_hole = [&](int pos) {
+        return !block_table.empty() && block_table_position_is_hole(block_table, pos);
+    };
     const bool rotate_q = cache.storage != KvCacheStorage::BFloat16;
     const bool rotate_v = cache.storage == KvCacheStorage::Nvfp4Group16 ||
                           cache.storage == KvCacheStorage::Fp8KeyNvfp4Value;
@@ -889,7 +918,7 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
         [&](int d, int head, int token) { return query[q_index(geometry, head, d, token)]; },
         [&](int d, int head, int pos) { return keys[index(d, head, pos)]; },
         [&](int d, int head, int pos) { return values[index(d, head, pos)]; },
-        [&](int token, int pos) { return pos <= positions[token]; },
+        [&](int token, int pos) { return pos <= positions[token] && !key_is_hole(pos); },
         [&](int d, int head, int token, double value) {
             output[q_index(geometry, head, d, token)] = value;
         });
@@ -1573,6 +1602,52 @@ private:
     GuardedDeviceBuffer block_tables_;
 };
 
+// Zero every hole-page position of the cache's logical buffers. Hole pages have no device
+// replica, so their logical bytes are semantically irrelevant; zeroing both sides lets the
+// byte-exact cache-unchanged comparison ignore them instead of comparing data the kernel
+// cannot observe.
+void zero_hole_pages(HostCache& cache, std::span<const std::int32_t> block_table) {
+    const auto zero_plane = [&](auto& buffer, std::int32_t leading_extent) {
+        for (std::int32_t head = 0; head < cache.geometry.kv_heads; ++head) {
+            for (std::int32_t position = 0; position < cache.logical_capacity; ++position) {
+                if (!block_table_position_is_hole(block_table, position)) { continue; }
+                for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
+                    const std::size_t index =
+                        static_cast<std::size_t>(leading) +
+                        static_cast<std::size_t>(leading_extent) *
+                            (static_cast<std::size_t>(position) +
+                             static_cast<std::size_t>(cache.logical_capacity) * head);
+                    buffer[index] = 0;
+                }
+            }
+        }
+    };
+    if (cache.storage == KvCacheStorage::BFloat16) {
+        zero_plane(cache.k_bf16, kHeadDim);
+        zero_plane(cache.v_fp16, kHeadDim);
+    } else if (cache.storage == KvCacheStorage::Int8Group64) {
+        zero_plane(cache.k_i8, kHeadDim);
+        zero_plane(cache.v_i8, kHeadDim);
+        zero_plane(cache.k_scale, kQuantGroups);
+        zero_plane(cache.v_scale, kQuantGroups);
+    } else if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+        zero_plane(cache.k_fp8, kHeadDim);
+        zero_plane(cache.v_fp8, kHeadDim);
+        zero_plane(cache.k_scale, kFp8QuantGroups);
+        zero_plane(cache.v_scale, kFp8QuantGroups);
+    } else if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        zero_plane(cache.k_fp8, kHeadDim);
+        zero_plane(cache.v_nvfp4, kNvfp4CodeBytes);
+        zero_plane(cache.k_scale, kFp8QuantGroups);
+        zero_plane(cache.v_nvfp4_scale, kNvfp4QuantGroups);
+    } else {
+        zero_plane(cache.k_nvfp4, kNvfp4CodeBytes);
+        zero_plane(cache.v_nvfp4, kNvfp4CodeBytes);
+        zero_plane(cache.k_nvfp4_scale, kNvfp4QuantGroups);
+        zero_plane(cache.v_nvfp4_scale, kNvfp4QuantGroups);
+    }
+}
+
 int verify_cache(const std::string& label, const HostCache& got, const HostCache& expected,
                  bool verify_private_key_representation) {
     int failures = 0;
@@ -1743,7 +1818,9 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     const HostCache initial = make_cache(geometry, storage, max_context, test_case.seed + 10u);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
-    const std::vector<double> reference = ideal_attention(q, expected, positions);
+    const auto block_table =
+        make_block_table(initial.logical_capacity / kPagedKVPageSize, mapping);
+    const std::vector<double> reference = ideal_attention(q, expected, positions, block_table);
     DeviceCache cache(initial, mapping);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1834,7 +1911,10 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
                                                          test_case.envelope_max};
 
     const HostCache cache_host = make_cache(geometry, storage, max_context, test_case.seed + 10u);
-    const std::vector<double> reference = ideal_attention(q, cache_host, positions);
+    const auto block_table =
+        make_block_table(cache_host.logical_capacity / kPagedKVPageSize, mapping);
+    const std::vector<double> reference =
+        ideal_attention(q, cache_host, positions, block_table);
     DeviceCache cache(cache_host, mapping);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1867,7 +1947,10 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
                                     attention_criterion(storage));
-    failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host, true);
+    HostCache cache_before = cache_host;
+    if (mapping == MappingPattern::Holed) { zero_hole_pages(cache_before, block_table); }
+    failures +=
+        verify_cache(label + " cache unchanged", cache.snapshot(), cache_before, true);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
     failures += dout.verify_guards((label + " output").c_str());
@@ -2282,6 +2365,18 @@ int run_geometry(const Geometry& geometry) {
                 run_a3_case(geometry, storage, {16, 17, 1025, 404u}, MappingPattern::Identity);
         }
     }
+
+    // Hole-pattern cases run per storage once that storage's kernels honor hole entries
+    // (INT8 first; BF16 joins when its tile masks land). Append cases keep every written page
+    // materialized (holes start at page 4), read-only cases cross many hole pages.
+    failures += run_a1_case(geometry, KvCacheStorage::Int8Group64, {6, 61, 67, 190u},
+                            MappingPattern::Holed);
+    failures += run_a3_case(geometry, KvCacheStorage::Int8Group64, {1, 128, 129, 191u},
+                            MappingPattern::Holed);
+    failures += run_a3_case(geometry, KvCacheStorage::Int8Group64, {7, 8192, 8199, 192u},
+                            MappingPattern::Holed);
+    failures += run_a3_case(geometry, KvCacheStorage::Int8Group64, {16, 513, 529, 193u},
+                            MappingPattern::Holed);
     return failures;
 }
 
