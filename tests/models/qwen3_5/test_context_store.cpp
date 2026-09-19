@@ -760,6 +760,25 @@ void test_kv_placement(ninfer::DeviceContext& device) {
     addresses.ensure_mapped_to_tokens(*address, 256, device.stream);
     device.synchronize();
     expect(addresses.mapped_pages(*address) == 4, "growth past the working set still maps pages");
+
+    // Sparse activation: shrink the working set to {0, 2}, drop the address, and
+    // reactivate with a window-sized entitlement (2 < mapped 4). Only working-set
+    // pages must be device-resident; the row republishes holes for Host-only pages
+    // and freshly mapped growth pages stay live by actual residency.
+    const auto windowed = addresses.apply_device_placement(
+        *address, extents, std::array<const std::uint32_t, 2>{0U, 2U}, device.transfer_stream);
+    expect(windowed.demoted == 2 && windowed.promoted == 0, "window placement demotes 1 and 3");
+    addresses.commit_frontier(*address, 256);
+    addresses.deactivate(*address);
+    auto sparse_activation = addresses.prepare_activation(*address, 2, 1, 256);
+    addresses.commit_activation(std::move(sparse_activation), device.stream);
+    device.synchronize();
+    expect(addresses.entitlement(*address) == 2 && addresses.bound_row(*address) == 1,
+           "sparse activation accepts a window-sized entitlement");
+    const auto sparse_table = read_block_table(physical_tables, 1, 4);
+    expect(sparse_table[0] >= 0 && sparse_table[1] == ninfer::kPagedKVPageHole &&
+               sparse_table[2] >= 0 && sparse_table[3] == ninfer::kPagedKVPageHole,
+           "sparse activation republishes holes for Host-only pages");
     addresses.deactivate(*address);
     expect(addresses.release(*address), "placement address releases");
     expect(physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,

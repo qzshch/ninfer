@@ -787,26 +787,11 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     const auto missing_kv_restore = [&](const KVAddressSpaceStore& addresses,
                                         const LogicalKVPageStore& pages,
                                         KVAddressSpaceHandle address, std::uint32_t required) {
-        std::pair<std::uint32_t, std::uint32_t> out;
         if (required > addresses.mapped_pages(address)) {
             throw std::logic_error("checkpoint KV requirement exceeds address membership");
         }
-        std::optional<HostKVPageReplica> previous;
-        for (std::uint32_t page = 0; page < required; ++page) {
-            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-            if (pages.device_resident(logical)) { continue; }
-            if (!pages.host_resident(logical)) {
-                throw std::logic_error("checkpoint KV page has no restorable replica");
-            }
-            const HostKVPageReplica replica = pages.host_replica(logical);
-            if (!previous || previous->extent != replica.extent ||
-                previous->page_offset + 1U != replica.page_offset) {
-                ++out.second;
-            }
-            previous = replica;
-            ++out.first;
-        }
-        return out;
+        const auto estimate = addresses.restore_estimate(address, required);
+        return std::pair<std::uint32_t, std::uint32_t>(estimate.missing_pages, estimate.host_runs);
     };
     const detail::PhysicalResources source_resources =
         source != nullptr ? owner_exclusive_resources(*source) : detail::PhysicalResources{};

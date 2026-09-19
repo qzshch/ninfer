@@ -806,12 +806,14 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             }
             std::uint32_t missing = 0;
             for (std::uint32_t page = 0; page < mapped; ++page) {
+                if (!addresses.page_in_device_working_set(address, page)) { continue; }
                 if (!pages.device_resident(addresses.logical_page(address, page))) { ++missing; }
             }
             if (source_reservation) {
                 pages.physical_pool().resize_reservation(reservation, missing);
             }
             for (std::uint32_t page = 0; page < mapped; ++page) {
+                if (!addresses.page_in_device_working_set(address, page)) { continue; }
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
                 if (pages.device_resident(logical)) { continue; }
                 if (!pages.host_resident(logical) || !host_kv_extents) {

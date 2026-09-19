@@ -844,6 +844,11 @@ cudaStream_t transfer_stream)
                 ? reserved_before + resident_before - working_set
                 : 0U;
         pages_->physical_pool().resize_reservation(address.reservation, final_reservation);
+        // Record the set for the next activation: it defines the restore/verify scope.
+        // Freshly mapped growth pages materialize device-resident on ensure_mapped and are
+        // outside this list until the next placement or activation republishes residency.
+        address.device_working_set =
+            std::vector<std::uint32_t>(selected_pages.begin(), selected_pages.end());
         return counts;
     }
 
