@@ -87,6 +87,20 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
+    {
+        const std::size_t q_bytes = static_cast<std::size_t>(16U) * 6144U * sizeof(float);
+        const std::size_t k_bytes = static_cast<std::size_t>(16U) *
+                                    ops::kKvmemCaptureSlots * 1024U * sizeof(float);
+        const DeviceSpan q_span = persistent.alloc_bytes(q_bytes, 256);
+        const DeviceSpan k_span = persistent.alloc_bytes(k_bytes, 256);
+        CUDA_CHECK(cudaMemsetAsync(q_span.data, 0, q_bytes, device.stream));
+        CUDA_CHECK(cudaMemsetAsync(k_span.data, 0, k_bytes, device.stream));
+        kvmem_q_sum_ = Tensor(q_span.data, DType::FP32,
+                              {static_cast<std::int32_t>(16U * 6144U)});
+        kvmem_k_sum_ =
+            Tensor(k_span.data, DType::FP32,
+                   {static_cast<std::int32_t>(16U * ops::kKvmemCaptureSlots * 1024U)});
+    }
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
     }

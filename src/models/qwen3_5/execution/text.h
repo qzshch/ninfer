@@ -98,6 +98,14 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // Working-set capture wiring (null disables): q_sum accumulates [query_width] per
+    // full-attention layer over every chunk column; k_sum holds [kv_width] per completed
+    // 128-token block slot per layer.
+    void set_kvmem_capture(float* q_sum, float* k_sum) noexcept {
+        kvmem_q_sum_ = q_sum;
+        kvmem_k_sum_ = k_sum;
+    }
+
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
@@ -161,6 +169,8 @@ private:
     }
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    float* kvmem_q_sum_ = nullptr;
+    float* kvmem_k_sum_ = nullptr;
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);

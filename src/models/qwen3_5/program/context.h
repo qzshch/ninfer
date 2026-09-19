@@ -38,6 +38,12 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // Sparse working-set capture buffers (ProgramImpl-owned, feature-first FP32):
+    // q_sum is [layers * query_width] accumulating every query column of the turn;
+    // k_sum is [layers * slots * kv_width] holding one completed block per slot.
+    // Null keeps the attention path capture-free.
+    float* kvmem_q_sum = nullptr;
+    float* kvmem_k_sum = nullptr;
 };
 
 struct PrefillContext {

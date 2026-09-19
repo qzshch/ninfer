@@ -10,6 +10,8 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/retrieval/block_retrieval.h"
+#include "ninfer/ops/span_accumulate.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
@@ -586,6 +588,14 @@ public:
     std::unique_ptr<qwen3_5::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
+    // Sparse working-set capture state: per-layer FP32 sums on the device (q single-slot
+    // across the turn, k one slot per completed 128-token block of the current chunk) and
+    // the host retrieval index they publish into at chunk and turn boundaries.
+    Tensor kvmem_q_sum_;
+    Tensor kvmem_k_sum_;
+    detail::RetrievalIndex kvmem_index_{ops::kKvmemCaptureBlockTokens, 16U, 4U, 256U};
+    std::vector<float> kvmem_query_;
+    std::vector<std::uint32_t> kvmem_query_count_;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
@@ -1172,6 +1182,9 @@ private:
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void roll_sparse_decode_window(SequenceState& sequence);
+    void consume_kvmem_chunk_capture(std::uint32_t chunk_begin, std::uint32_t chunk_end);
+    void finalize_kvmem_query(std::uint32_t prompt_tokens);
+    void apply_kvmem_retrieval_placement(SequenceState& sequence);
     void roll_sparse_prefill_window(SequenceState& sequence, std::uint32_t prompt_tokens,
                                     std::uint32_t cursor, std::uint32_t next_chunk,
                                     std::uint32_t backend_valid);

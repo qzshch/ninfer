@@ -9,6 +9,14 @@
 
 namespace ninfer::ops {
 
+// Working-set capture geometry shared by the capture op callers: retrieval blocks are
+// 128 tokens, and one prefill chunk completes at most eight of them (chunk alignment
+// equals the block size, so the completed span is a whole number of blocks).
+inline constexpr std::uint32_t kKvmemCaptureBlockTokens = 128;
+inline constexpr std::uint32_t kKvmemCaptureSlots        = 8;
+
+
+
 /**
  * Accumulates columns [begin, begin + count) of a row-major BF16 matrix into an FP32
  * column-sum vector, adding into the existing sum values (+=, not overwrite).
