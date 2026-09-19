@@ -5,6 +5,7 @@
 
 #include "models/qwen3_5/state/state_image.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <array>
@@ -627,6 +628,144 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "staged retained fork closes Device and Host ownership without leaks");
 }
 
+void test_kv_placement(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+
+    const auto address = addresses.create_active(3, 0);
+    expect(address.has_value(), "placement KV address allocation");
+    addresses.ensure_mapped_to_tokens(*address, 192, device.stream);
+    addresses.commit_frontier(*address, 192);
+    device.synchronize();
+    expect(addresses.mapped_pages(*address) == 3, "placement membership covers three pages");
+
+    // Write a distinct pattern into every device page so promote/demote round-trips are
+    // observable. Page-major plane [X=8, P=64, H=2, N=8]: page n occupies 1024 half elements
+    // at element offset 1024 * n of plane 0.
+    const ninfer::Tensor plane = physical_pages.plane(0);
+    auto* plane_half          = static_cast<__half*>(plane.data);
+    for (std::uint32_t page = 0; page < 3; ++page) {
+        std::vector<__half> pattern(1024);
+        for (std::size_t element = 0; element < pattern.size(); ++element) {
+            pattern[element] = __float2half(
+                0.25F * static_cast<float>(page + 1U) +
+                0.001F * static_cast<float>(element % 251U));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(plane_half + 1024ULL * page, pattern.data(),
+                                   pattern.size() * sizeof(__half), cudaMemcpyHostToDevice,
+                                   device.stream));
+    }
+    device.synchronize();
+
+    // Establish current Host replicas for every page before any placement change.
+    const std::array logical_pages{addresses.logical_page(*address, 0),
+                                   addresses.logical_page(*address, 1),
+                                   addresses.logical_page(*address, 2)};
+    auto backup = extents.prepare(pages, logical_pages, true);
+    expect(backup.has_value(), "placement Host backup reservation");
+    physical_pages.copy_to_host(extents.device_sources(*backup),
+                                extents.writable_view(*backup), device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    (void)extents.publish(std::move(*backup));
+
+    // Corrupt the device copy of page 1 after the backup: a later promote must restore the
+    // backed-up bytes, proving the Host replica is the authority for stage-in.
+    std::vector<__half> garbage(1024, __float2half(-7.0F));
+    CUDA_CHECK(cudaMemcpyAsync(plane_half + 1024ULL, garbage.data(),
+                               garbage.size() * sizeof(__half), cudaMemcpyHostToDevice,
+                               device.stream));
+    device.synchronize();
+    const auto initial_table   = read_block_table(physical_tables, 0, 3);
+    const std::uint32_t allocated_before = physical_pages.allocated_pages();
+
+    const auto demoted = addresses.apply_device_placement(
+        *address, extents, std::array<const std::uint32_t, 2>{0U, 2U}, device.transfer_stream);
+    expect(demoted.demoted == 1 && demoted.promoted == 0, "placement demotes the unselected page");
+    expect(!pages.device_resident(logical_pages[1]) && pages.host_resident(logical_pages[1]),
+           "demoted page keeps only its Host replica");
+    expect(pages.device_resident(logical_pages[0]) && pages.device_resident(logical_pages[2]),
+           "selected pages stay resident");
+    const auto holed = read_block_table(physical_tables, 0, 3);
+    expect(holed[0] == initial_table[0] && holed[1] == ninfer::kPagedKVPageHole &&
+               holed[2] == initial_table[2],
+           "placement republishes holes for demoted pages only");
+    expect(physical_pages.allocated_pages() == allocated_before - 1U,
+           "demotion releases the outgoing device page");
+    expect(addresses.mapped_pages(*address) == 3 &&
+               addresses.committed_frontier(*address) == 192,
+           "placement changes device residency, not membership or frontier");
+
+    const auto swapped = addresses.apply_device_placement(
+        *address, extents, std::array<const std::uint32_t, 1>{1U}, device.transfer_stream);
+    expect(swapped.demoted == 2 && swapped.promoted == 1, "reselection swaps the working set");
+    const auto swapped_table = read_block_table(physical_tables, 0, 3);
+    expect(swapped_table[0] == ninfer::kPagedKVPageHole &&
+               swapped_table[2] == ninfer::kPagedKVPageHole && swapped_table[1] >= 0,
+           "reselection publishes holes around the promoted page");
+    expect(pages.device_resident(logical_pages[1]) && !pages.device_resident(logical_pages[0]) &&
+               !pages.device_resident(logical_pages[2]),
+           "reselection residency follows the selected set");
+
+    std::vector<__half> restored(1024);
+    const std::int64_t promoted_physical = swapped_table[1];
+    CUDA_CHECK(cudaMemcpyAsync(restored.data(), plane_half + 1024ULL * promoted_physical,
+                               restored.size() * sizeof(__half), cudaMemcpyDeviceToHost,
+                               device.stream));
+    device.synchronize();
+    bool roundtrip = true;
+    for (std::size_t element = 0; element < restored.size(); ++element) {
+        const __half expected =
+            __float2half(0.5F + 0.001F * static_cast<float>(element % 251U));
+        if (restored[element] != expected) {
+            roundtrip = false;
+            break;
+        }
+    }
+    expect(roundtrip, "promoted page restores the backed-up Host bytes over device garbage");
+
+    const auto full = addresses.apply_device_placement(
+        *address, extents, std::array<const std::uint32_t, 3>{0U, 1U, 2U}, device.transfer_stream);
+    expect(full.promoted == 2 && full.demoted == 0, "full reselection restores every page");
+    expect(pages.device_resident(logical_pages[0]) && pages.device_resident(logical_pages[1]) &&
+               pages.device_resident(logical_pages[2]),
+           "full reselection residency covers the membership");
+    const auto full_table = read_block_table(physical_tables, 0, 3);
+    expect(full_table[0] >= 0 && full_table[1] >= 0 && full_table[2] >= 0,
+           "full reselection publishes no holes");
+
+    addresses.resize_entitlement(*address, 4);
+    addresses.ensure_mapped_to_tokens(*address, 256, device.stream);
+    device.synchronize();
+    expect(addresses.mapped_pages(*address) == 4, "growth past the working set still maps pages");
+    addresses.deactivate(*address);
+    expect(addresses.release(*address), "placement address releases");
+    expect(physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
+           "placement teardown closes physical ownership");
+}
+
 } // namespace
 
 int main() {
@@ -642,6 +781,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_kv_placement(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

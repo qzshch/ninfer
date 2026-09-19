@@ -498,6 +498,25 @@ public:
         return true;
     }
 
+    // Sparse working-set variant of drop_device_replica: the owning address space remains
+    // active (and therefore the page's writer) while this page leaves its device working
+    // set. Attention consumes a kPagedKVPageHole entry for the page, so the missing replica
+    // is invisible to every consumer. The Host replica must be current and the page free of
+    // transfer pins; the caller guarantees the page is outside the read/write set of any
+    // in-flight execution unit -- in particular it must not be the growing tail the next
+    // launch appends into. The released lease returns to the global pool (not the address
+    // reservation).
+    [[nodiscard]] bool drop_device_replica_within_active(LogicalKVPageHandle handle) noexcept {
+        if (!valid(handle)) { return false; }
+        Page& page = pages_[handle.index_];
+        if (!page.device_replica || !host_replica_current(handle) ||
+            page.pending_device_replica || page.source_pins != 0 || page.destination_pinned) {
+            return false;
+        }
+        page.device_replica.reset();
+        return true;
+    }
+
     [[nodiscard]] bool host_replica_current(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
@@ -1435,6 +1454,25 @@ public:
         pages_->physical_pool().resize_reservation(address.reservation, 0);
     }
 
+    struct KVPlacementCounts {
+        std::uint32_t promoted = 0;
+        std::uint32_t demoted  = 0;
+    };
+
+    // Atomically moves the active address space's device working set to `selected_pages`
+    // (strictly ascending logical page indexes inside the mapped membership; the growth
+    // window past the current membership is unaffected and keeps consuming the reservation).
+    // Pages leaving the set are flushed to Host when stale and drop their device replica;
+    // pages entering it are restored from their current Host replica. The execution row is
+    // republished afterwards: selected pages name their physical page, every other mapped
+    // page publishes kPagedKVPageHole. Call only at a GPU boundary with no in-flight unit
+    // reading or writing this row; transfers use `transfer_stream` and are synchronized
+    // before their bookkeeping is published.
+    KVPlacementCounts apply_device_placement(KVAddressSpaceHandle handle,
+                                             HostKVExtentStore& host_kv_extents,
+                                             std::span<const std::uint32_t> selected_pages,
+                                             cudaStream_t transfer_stream);
+
     // Coverage is a lower bound. A speculative mapping may already extend beyond this stage's
     // needs; only an explicit truncate releases it, and commit_frontier publishes valid tokens.
     void ensure_mapped_to_tokens(KVAddressSpaceHandle handle, std::uint32_t tokens,
@@ -1859,6 +1897,7 @@ private:
     std::vector<std::uint32_t> free_;
     std::vector<LogicalKVPageHandle> memberships_;
     std::vector<DeviceKVPageHandle> publish_scratch_;
+    std::vector<DeviceKVPageHandle> placement_scratch_;
     std::uint32_t free_count_ = 0;
 };
 
