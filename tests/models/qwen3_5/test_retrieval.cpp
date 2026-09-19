@@ -122,6 +122,22 @@ void test_selection() {
     expect(!one_absent && skipped.scored_blocks == 3, "unscored blocks never win a slot");
 }
 
+void test_window_helpers() {
+    const auto full = r::prefill_window_page_set(5, 1, 4);
+    expect(full == std::vector<std::uint32_t>({0U, 1U, 2U, 3U, 4U}),
+           "a covering window keeps every page");
+
+    const auto windowed = r::prefill_window_page_set(20, 1, 4);
+    expect(windowed == std::vector<std::uint32_t>({0U, 16U, 17U, 18U, 19U}),
+           "a rolling window keeps the sink prefix and newest pages");
+
+    expect(r::prefill_window_page_set(0, 1, 4).empty(), "an empty prefix has no window");
+
+    const auto pages = r::block_pages(std::vector<std::uint32_t>{0U, 2U}, 128);
+    expect(pages == std::vector<std::uint32_t>({0U, 1U, 4U, 5U}),
+           "blocks expand to their 64-token pages");
+}
+
 } // namespace
 
 int main() {
@@ -129,6 +145,7 @@ int main() {
         test_append_and_truncate();
         test_scoring();
         test_selection();
+        test_window_helpers();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
         return 1;
