@@ -1499,8 +1499,10 @@ public:
 
     void resize_entitlement(KVAddressSpaceHandle handle, std::uint32_t entitlement) {
         Address& address = require_active(handle);
-        if (entitlement < address.page_count || entitlement > page_capacity_) {
-            throw std::invalid_argument("KV entitlement is smaller than mapped pages");
+        // Sparse membership may exceed the device guarantee; the floor is what must stay
+        // resident, not everything mapped.
+        if (entitlement < device_residency_floor(address) || entitlement > page_capacity_) {
+            throw std::invalid_argument("KV entitlement is smaller than its residency floor");
         }
         pages_->physical_pool().resize_reservation(address.reservation,
                                                    entitlement - address.page_count);

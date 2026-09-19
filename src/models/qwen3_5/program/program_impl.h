@@ -1171,6 +1171,7 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    void roll_sparse_decode_window(SequenceState& sequence);
     void roll_sparse_prefill_window(SequenceState& sequence, std::uint32_t prompt_tokens,
                                     std::uint32_t cursor, std::uint32_t next_chunk,
                                     std::uint32_t backend_valid);

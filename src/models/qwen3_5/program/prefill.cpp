@@ -1282,9 +1282,6 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
     const std::uint32_t next_target =
         std::min(prompt_tokens, cursor + next_chunk + window_tokens);
     const std::uint32_t next_pages = (next_target + kPagedKVPageSize - 1U) / kPagedKVPageSize;
-    if (next_pages > text_kv_addresses->entitlement(sequence.kv->text)) {
-        text_kv_addresses->resize_entitlement(sequence.kv->text, next_pages);
-    }
     std::uint32_t next_backend = backend_valid;
     if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp &&
         backend_valid > cursor) {
@@ -1297,12 +1294,16 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
             backend_kv_addresses->resize_entitlement(*sequence.kv->backend, next_backend_pages);
         }
     }
-    ensure_sequence_kv_mapped(sequence, next_target, next_backend);
-
+    // Demote first (shrinking the residency floor), then grow the entitlement, then
+    // materialize the next chunk's pages inside it.
     const std::uint32_t mapped_pages = text_kv_addresses->mapped_pages(sequence.kv->text);
     const auto window = prefill_window_page_set(mapped_pages, sink_pages, kvmem_window_pages);
     text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
                                               device.transfer_stream);
+    if (next_pages > text_kv_addresses->entitlement(sequence.kv->text)) {
+        text_kv_addresses->resize_entitlement(sequence.kv->text, next_pages);
+    }
+    ensure_sequence_kv_mapped(sequence, next_target, next_backend);
     if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t lead_pages = (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize;
         const std::uint32_t backend_mapped =
