@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/retrieval/block_retrieval.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -630,13 +631,29 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         sequence.endpoint_valid = false;
         if (!preserving_source) { trim_sequence_kv(sequence, base, backend_kv_valid(sequence)); }
         bind_sequence_kv(sequence);
-        const std::uint32_t backend_materialized =
+        std::uint32_t backend_materialized       =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
-        ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        std::uint32_t main_materialized = prompt_tokens;
+        if (kvmem_window_pages != 0) {
+            // Sparse prefill maps only the first chunk of growth plus the rolling window;
+            // chunk boundaries demote the committed overflow to Host replicas afterwards.
+            const std::uint32_t window_tokens =
+                kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize);
+            main_materialized = std::min(
+                prompt_tokens, std::min(prefill_chunk, prompt_tokens) + window_tokens);
+            if (speculative_backend == SpeculativeBackend::Mtp &&
+                backend_materialized > main_materialized) {
+                const std::uint32_t lead = backend_materialized > prompt_tokens
+                                               ? backend_materialized - prompt_tokens
+                                               : 0U;
+                backend_materialized = main_materialized + lead;
+            }
+        }
+        ensure_sequence_kv_mapped(sequence, main_materialized, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -1104,6 +1121,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     sequence.dflash_context_frontier = staged.cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+                if (kvmem_window_pages != 0 && staged.cursor < staged.prompt_tokens) {
+                    const std::uint32_t next_chunk = std::min(
+                        remaining, std::min(prefill_chunk, staged.prompt_tokens - staged.cursor));
+                    roll_sparse_prefill_window(sequence, staged.prompt_tokens, staged.cursor,
+                                               next_chunk, backend_kv_valid(sequence));
+                }
 
                 // Prompt transitions are canonical immediately. If this was the first write after
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
@@ -1245,4 +1268,49 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 }
 
 
+
+// Rolls the sparse prefill working set one chunk forward: maps the next chunk's growth
+// pages (inside the window entitlement), then demotes every mapped page outside the
+// sink prefix plus the rolling window to Host replicas. Runs at the chunk GPU boundary
+// with no in-flight unit on the lane.
+void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint32_t prompt_tokens,
+                                             std::uint32_t cursor, std::uint32_t next_chunk,
+                                             std::uint32_t backend_valid) {
+    constexpr std::uint32_t sink_pages = 2U;  // one 128-token retrieval block
+    const std::uint32_t window_tokens =
+        kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t next_target =
+        std::min(prompt_tokens, cursor + next_chunk + window_tokens);
+    const std::uint32_t next_pages = (next_target + kPagedKVPageSize - 1U) / kPagedKVPageSize;
+    if (next_pages > text_kv_addresses->entitlement(sequence.kv->text)) {
+        text_kv_addresses->resize_entitlement(sequence.kv->text, next_pages);
+    }
+    std::uint32_t next_backend = backend_valid;
+    if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp &&
+        backend_valid > cursor) {
+        const std::uint32_t lead = backend_valid - cursor;
+        next_backend =
+            std::min<std::uint32_t>(capacity, next_target + lead < capacity ? next_target + lead : capacity);
+        const std::uint32_t next_backend_pages =
+            (next_backend + kPagedKVPageSize - 1U) / kPagedKVPageSize;
+        if (next_backend_pages > backend_kv_addresses->entitlement(*sequence.kv->backend)) {
+            backend_kv_addresses->resize_entitlement(*sequence.kv->backend, next_backend_pages);
+        }
+    }
+    ensure_sequence_kv_mapped(sequence, next_target, next_backend);
+
+    const std::uint32_t mapped_pages = text_kv_addresses->mapped_pages(sequence.kv->text);
+    const auto window = prefill_window_page_set(mapped_pages, sink_pages, kvmem_window_pages);
+    text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
+                                              device.transfer_stream);
+    if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp) {
+        const std::uint32_t lead_pages = (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize;
+        const std::uint32_t backend_mapped =
+            backend_kv_addresses->mapped_pages(*sequence.kv->backend);
+        const auto backend_window = prefill_window_page_set(
+            backend_mapped, sink_pages, kvmem_window_pages + lead_pages);
+        backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
+                                                     backend_window, device.transfer_stream);
+    }
+}
 } // namespace ninfer::models::qwen3_5::detail

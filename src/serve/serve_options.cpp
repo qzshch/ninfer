@@ -170,6 +170,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
+        } else if (arg == "--kvmem-window-pages") {
+            options.kvmem_window_pages = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kvmem-window-pages"),
+                                      "kvmem-window-pages"));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));

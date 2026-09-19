@@ -260,10 +260,27 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                            ? 0U
                                            : base->summary.effective_output_tokens - 1U);
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    if (kvmem_window_pages != 0) {
+        // Sparse working set: the device guarantee is the window plus one prefill chunk of
+        // growth for Main, or the window plus the draft lead for the MTP follower pool;
+        // everything else lives as Host replicas behind holes.
+        const std::uint32_t main_window_pages =
+            kvmem_window_pages + pages_for_tokens(prefill_chunk);
+        if (base->text_kv_page_entitlement > main_window_pages) {
+            base->text_kv_page_entitlement = main_window_pages;
+        }
+    }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
+        if (kvmem_window_pages != 0) {
+            const std::uint32_t mtp_window_pages =
+                kvmem_window_pages + pages_for_tokens(draft_window);
+            if (base->backend_kv_page_entitlement > mtp_window_pages) {
+                base->backend_kv_page_entitlement = mtp_window_pages;
+            }
+        }
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }

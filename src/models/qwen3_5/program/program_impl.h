@@ -567,6 +567,8 @@ public:
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
+    // Sparse working-set window (pages) for prefill rolling; 0 keeps dense semantics.
+    const std::uint32_t kvmem_window_pages;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
@@ -1169,6 +1171,9 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    void roll_sparse_prefill_window(SequenceState& sequence, std::uint32_t prompt_tokens,
+                                    std::uint32_t cursor, std::uint32_t next_chunk,
+                                    std::uint32_t backend_valid);
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

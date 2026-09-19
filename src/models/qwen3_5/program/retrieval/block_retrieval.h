@@ -104,4 +104,43 @@ BlockSelection select_blocks(const RetrievalIndex& index, std::span<const float>
                              const BlockSelectionConfig& config,
                              std::span<const std::uint32_t> mandatory = {});
 
+// Rolling prefill window over the mapped prefix: the sink prefix plus the newest
+// `window_pages` pages. A window that covers everything returns the full set, so short
+// prompts never demote. Ascending page indexes.
+inline std::vector<std::uint32_t> prefill_window_page_set(std::uint32_t mapped_pages,
+                                                          std::uint32_t sink_pages,
+                                                          std::uint32_t window_pages) {
+    if (mapped_pages == 0) { return {}; }
+    if (sink_pages >= mapped_pages || mapped_pages <= sink_pages + window_pages) {
+        std::vector<std::uint32_t> all(mapped_pages);
+        for (std::uint32_t page = 0; page < mapped_pages; ++page) { all[page] = page; }
+        return all;
+    }
+    std::vector<std::uint32_t> pages;
+    pages.reserve(sink_pages + window_pages);
+    for (std::uint32_t page = 0; page < sink_pages; ++page) { pages.push_back(page); }
+    for (std::uint32_t page = mapped_pages - window_pages; page < mapped_pages; ++page) {
+        pages.push_back(page);
+    }
+    return pages;
+}
+
+// Expands ascending retrieval blocks into their page indexes (block_tokens is a whole
+// number of 64-token pages). Growth tail pages of a partial trailing block are not part
+// of any block and stay out; the caller keeps them materialized on its own.
+inline std::vector<std::uint32_t> block_pages(std::span<const std::uint32_t> blocks,
+                                              std::uint32_t block_tokens) {
+    constexpr std::uint32_t page_size = 64;
+    if (block_tokens % page_size != 0) { return {}; }
+    const std::uint32_t pages_per_block = block_tokens / page_size;
+    std::vector<std::uint32_t> pages;
+    pages.reserve(blocks.size() * pages_per_block);
+    for (const std::uint32_t block : blocks) {
+        for (std::uint32_t offset = 0; offset < pages_per_block; ++offset) {
+            pages.push_back(block * pages_per_block + offset);
+        }
+    }
+    return pages;
+}
+
 } // namespace ninfer::models::qwen3_5::detail

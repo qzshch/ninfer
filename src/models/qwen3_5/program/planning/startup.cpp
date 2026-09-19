@@ -820,6 +820,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
+    impl->kvmem_window_pages  = inputs.kvmem_window_pages;
     impl->draft_window        = inputs.draft_window;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
@@ -890,6 +891,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
+        .kvmem_window_pages  = options.kvmem_window_pages,
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,
@@ -901,7 +903,11 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .context_cache       = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    // A sparse working set no longer guarantees the full logical prefix device-resident:
+    // its floor is the window itself (growth consumes the reservation beyond it).
+    const std::uint32_t resident_floor_pages =
+        inputs.kvmem_window_pages != 0 ? inputs.kvmem_window_pages : logical_pages;
+    const std::uint32_t minimum_pages = std::max(resident_floor_pages, inputs.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
