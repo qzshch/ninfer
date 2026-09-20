@@ -1325,6 +1325,10 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
             backend_mapped, sink_pages, kvmem_window_pages + lead_pages);
         backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
                                                      backend_window, device.transfer_stream);
+        const std::uint32_t backend_floor = kvmem_window_pages + lead_pages + 2U;
+        if (backend_kv_addresses->entitlement(*sequence.kv->backend) < backend_floor) {
+            backend_kv_addresses->resize_entitlement(*sequence.kv->backend, backend_floor);
+        }
     }
 }
 
@@ -1421,6 +1425,7 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     if (blocks == 0) { return; }
     std::vector<float> scores(blocks, std::numeric_limits<float>::quiet_NaN());
     for (std::uint32_t block = 0; block < blocks; ++block) {
+        if (!kvmem_index_.block(block).full) { continue; }
         (void)kvmem_index_.score(block, kvmem_query_, kvmem_query_count_, scores[block]);
     }
     detail::BlockSelectionConfig config;
@@ -1433,6 +1438,9 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     std::vector<std::uint32_t> pages =
         detail::block_pages(selection.selected, kBlockTokens);
     const std::uint32_t mapped = text_kv_addresses->mapped_pages(sequence.kv->text);
+    pages.erase(std::remove_if(pages.begin(), pages.end(),
+                               [mapped](std::uint32_t page) { return page >= mapped; }),
+                pages.end());
     const std::uint32_t recent_begin =
         mapped > kvmem_window_pages ? mapped - kvmem_window_pages : 0U;
     for (std::uint32_t page = recent_begin; page < mapped; ++page) { pages.push_back(page); }
@@ -1440,6 +1448,12 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
     text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, pages,
                                               device.transfer_stream);
+    // The placement transaction rebalances the reservation to its working set, which
+    // can leave zero growth headroom; restore the window floor so the next turn maps.
+    const std::uint32_t floor_pages = kvmem_window_pages + 2U;
+    if (text_kv_addresses->entitlement(sequence.kv->text) < floor_pages) {
+        text_kv_addresses->resize_entitlement(sequence.kv->text, floor_pages);
+    }
 }
 
 } // namespace ninfer::models::qwen3_5::detail

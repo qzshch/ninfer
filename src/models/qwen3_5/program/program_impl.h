@@ -591,6 +591,8 @@ public:
     // Sparse working-set capture state: per-layer FP32 sums on the device (q single-slot
     // across the turn, k one slot per completed 128-token block of the current chunk) and
     // the host retrieval index they publish into at chunk and turn boundaries.
+    void* kvmem_q_memory_ = nullptr;
+    void* kvmem_k_memory_ = nullptr;
     Tensor kvmem_q_sum_;
     Tensor kvmem_k_sum_;
     detail::RetrievalIndex kvmem_index_{ops::kKvmemCaptureBlockTokens, 16U, 4U, 256U};

@@ -345,6 +345,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+        options.kvmem_window_pages == 0 &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

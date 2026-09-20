@@ -134,6 +134,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
+                     .kvmem_window_pages        = plan.kvmem_window_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
                  });
     qwen3_5::StateImageSpec state_image_spec{
@@ -760,7 +761,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
-        if (options.kv_capacity.explicit_tokens < options.max_context) {
+        // Sparse working sets lower the floor from the logical ceiling to the window:
+        // the pool holds the window; the tables stay logical-sized and publish holes.
+        const std::uint32_t capacity_floor =
+            options.kvmem_window_pages != 0
+                ? options.kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize)
+                : options.max_context;
+        if (options.kv_capacity.explicit_tokens < capacity_floor) {
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
@@ -886,6 +893,13 @@ std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
+    // A sparse working set sizes the Main pool by the window; automatic free-memory
+    // sizing would otherwise grow the pool to the logical ceiling and defeat the point.
+    KvCapacityPolicy kv_capacity = options.kv_capacity;
+    if (options.kvmem_window_pages != 0 && kv_capacity.mode == KvCapacityMode::Automatic) {
+        kv_capacity = KvCapacityPolicy::explicit_capacity(
+            options.kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize));
+    }
     SequencePlanningInputs inputs{
         .parameters          = &parameters,
         .capacity            = options.max_context,

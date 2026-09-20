@@ -1583,7 +1583,7 @@ void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
         text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
                                                   device.transfer_stream);
         const std::uint32_t clamped = kvmem_window_pages + slack_pages;
-        if (text_kv_addresses->entitlement(sequence.kv->text) > clamped) {
+        if (text_kv_addresses->entitlement(sequence.kv->text) != clamped) {
             text_kv_addresses->resize_entitlement(sequence.kv->text, clamped);
         }
     }

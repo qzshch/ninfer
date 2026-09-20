@@ -87,18 +87,21 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
-    {
+    if (plan.kvmem_window_pages != 0) {
+        // Capture buffers own their allocations outside the planned persistent arena:
+        // the arena is sized exactly by the startup plan, so co-locating them would
+        // need plan-level coupling for a sub-megabyte pair of sums.
         const std::size_t q_bytes = static_cast<std::size_t>(16U) * 6144U * sizeof(float);
         const std::size_t k_bytes = static_cast<std::size_t>(16U) *
                                     ops::kKvmemCaptureSlots * 1024U * sizeof(float);
-        const DeviceSpan q_span = persistent.alloc_bytes(q_bytes, 256);
-        const DeviceSpan k_span = persistent.alloc_bytes(k_bytes, 256);
-        CUDA_CHECK(cudaMemsetAsync(q_span.data, 0, q_bytes, device.stream));
-        CUDA_CHECK(cudaMemsetAsync(k_span.data, 0, k_bytes, device.stream));
-        kvmem_q_sum_ = Tensor(q_span.data, DType::FP32,
+        CUDA_CHECK(cudaMalloc(&kvmem_q_memory_, q_bytes));
+        CUDA_CHECK(cudaMalloc(&kvmem_k_memory_, k_bytes));
+        CUDA_CHECK(cudaMemsetAsync(kvmem_q_memory_, 0, q_bytes, device.stream));
+        CUDA_CHECK(cudaMemsetAsync(kvmem_k_memory_, 0, k_bytes, device.stream));
+        kvmem_q_sum_ = Tensor(kvmem_q_memory_, DType::FP32,
                               {static_cast<std::int32_t>(16U * 6144U)});
         kvmem_k_sum_ =
-            Tensor(k_span.data, DType::FP32,
+            Tensor(kvmem_k_memory_, DType::FP32,
                    {static_cast<std::int32_t>(16U * ops::kKvmemCaptureSlots * 1024U)});
     }
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
@@ -326,6 +329,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
+    if (kvmem_q_memory_ != nullptr) { (void)cudaFree(kvmem_q_memory_); }
+    if (kvmem_k_memory_ != nullptr) { (void)cudaFree(kvmem_k_memory_); }
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
