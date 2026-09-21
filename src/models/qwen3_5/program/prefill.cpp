@@ -1302,11 +1302,15 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
         std::min(prompt_tokens, cursor + next_chunk + window_tokens);
     const std::uint32_t next_pages = (next_target + kPagedKVPageSize - 1U) / kPagedKVPageSize;
     std::uint32_t next_backend = backend_valid;
-    if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp &&
-        backend_valid > cursor) {
-        const std::uint32_t lead = backend_valid - cursor;
+    if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp) {
+        // During prefill mtp_kv_valid tracks the cursor, so the lead here is the draft
+        // window unless verify state already runs ahead. The backend membership must
+        // follow the roll target unconditionally: prompts past the window keep writing
+        // MTP KV past the one-shot mapping start_sequence did.
+        const std::uint32_t lead =
+            backend_valid > cursor ? backend_valid - cursor : draft_window;
         next_backend =
-            std::min<std::uint32_t>(capacity, next_target + lead < capacity ? next_target + lead : capacity);
+            std::min<std::uint32_t>(capacity, next_target + lead);
         const std::uint32_t next_backend_pages =
             (next_backend + kPagedKVPageSize - 1U) / kPagedKVPageSize;
         if (next_backend_pages > backend_kv_addresses->entitlement(*sequence.kv->backend)) {
@@ -1322,7 +1326,25 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
     if (next_pages > text_kv_addresses->entitlement(sequence.kv->text)) {
         text_kv_addresses->resize_entitlement(sequence.kv->text, next_pages);
     }
-    ensure_sequence_kv_mapped(sequence, next_target, next_backend);
+    // Grow membership directly: the roll's own placement above just rang the window, so
+    // routing through ensure_sequence_kv_mapped would re-run the decode ring and clamp
+    // the growth reservation this resize just established.
+    text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, next_target, device.stream);
+    if (next_backend != 0 && sequence.kv->backend) {
+        backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, next_backend,
+                                                      device.stream);
+    }
+    if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp) {
+        // The MTP follower rolls its own window: demote the overflow to Host replicas so
+        // backend residency tracks the window plus draft lead, not the whole prefix.
+        const std::uint32_t lead_pages = (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize;
+        const std::uint32_t backend_mapped =
+            backend_kv_addresses->mapped_pages(*sequence.kv->backend);
+        const auto backend_window = prefill_window_page_set(
+            backend_mapped, sink_pages, kvmem_window_pages + lead_pages);
+        backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
+                                                     backend_window, device.transfer_stream);
+    }
 }
 
 // Publishes the completed-block key sums of one prefill chunk into the retrieval index.
@@ -1423,7 +1445,11 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     }
     detail::BlockSelectionConfig config;
     config.block_tokens  = kBlockTokens;
-    config.budget_blocks = kvmem_window_pages / 2U;
+    // The device budget is one window shared by sink, recency, and retrieval; the
+    // selection must leave the recency and sink share inside the window or the
+    // placement's promote side overflows the pool.
+    const std::uint32_t recent_pages = kvmem_window_pages / 4U;
+    config.budget_blocks = (kvmem_window_pages - recent_pages - 2U) / 2U;
     config.sink_blocks   = 1U;
     config.recent_blocks = 2U;
     const detail::BlockSelection selection =
@@ -1434,8 +1460,7 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     pages.erase(std::remove_if(pages.begin(), pages.end(),
                                [mapped](std::uint32_t page) { return page >= mapped; }),
                 pages.end());
-    const std::uint32_t recent_begin =
-        mapped > kvmem_window_pages ? mapped - kvmem_window_pages : 0U;
+    const std::uint32_t recent_begin = mapped > recent_pages ? mapped - recent_pages : 0U;
     for (std::uint32_t page = recent_begin; page < mapped; ++page) { pages.push_back(page); }
     std::sort(pages.begin(), pages.end());
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());

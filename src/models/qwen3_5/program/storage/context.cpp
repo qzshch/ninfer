@@ -1582,7 +1582,10 @@ void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
             prefill_window_page_set(mapped_pages, sink_pages, kvmem_window_pages);
         text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
                                                   device.transfer_stream);
-        const std::uint32_t clamped = kvmem_window_pages + slack_pages;
+        // Membership keeps growing with the conversation, so the clamp targets
+        // mapped+slack (never a fixed page count): the reservation lands on the slack
+        // margin regardless of how far the mapped prefix extends past the window.
+        const std::uint32_t clamped = mapped_pages + slack_pages;
         if (text_kv_addresses->entitlement(sequence.kv->text) != clamped) {
             text_kv_addresses->resize_entitlement(sequence.kv->text, clamped);
         }
@@ -1598,11 +1601,9 @@ void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
             backend_kv_addresses->apply_device_placement(*sequence.kv->backend,
                                                          *host_kv_extents, backend_window,
                                                          device.transfer_stream);
-            const std::uint32_t backend_clamped =
-                kvmem_window_pages + lead_pages + slack_pages;
-            if (backend_kv_addresses->entitlement(*sequence.kv->backend) > backend_clamped) {
-                backend_kv_addresses->resize_entitlement(*sequence.kv->backend,
-                                                         backend_clamped);
+            const std::uint32_t backend_clamped = backend_mapped + slack_pages;
+            if (backend_kv_addresses->entitlement(*sequence.kv->backend) != backend_clamped) {
+                backend_kv_addresses->resize_entitlement(*sequence.kv->backend, backend_clamped);
             }
         }
     }

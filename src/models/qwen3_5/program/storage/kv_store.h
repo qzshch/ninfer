@@ -952,7 +952,12 @@ public:
             address.device_working_set ? resident_historical + missing_replicas : required_pages;
         const std::uint32_t growth =
             entitlement > growth_base ? entitlement - growth_base : 0U;
-        const std::uint64_t required = static_cast<std::uint64_t>(missing_replicas) + growth;
+        std::uint64_t required = static_cast<std::uint64_t>(missing_replicas) + growth;
+        if (sparse_activation_budget_pages_ != 0 && required > sparse_activation_budget_pages_) {
+            // Sparse working set: membership beyond the window materializes later from the
+            // rolling margins, so the activation claims at most the window budget now.
+            required = sparse_activation_budget_pages_;
+        }
         if (required > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("KV activation reservation overflow");
         }
@@ -969,6 +974,12 @@ public:
     // full mapped prefix under dense semantics.
     [[nodiscard]] std::uint32_t device_residency_floor_pages(KVAddressSpaceHandle handle) const {
         return device_residency_floor(require(handle));
+    }
+
+    // Zero (default) keeps dense semantics: an activation reserves its whole entitlement.
+    // A nonzero cap bounds the device claim of a sparse activation to the window budget.
+    void set_sparse_activation_budget(std::uint32_t pages) noexcept {
+        sparse_activation_budget_pages_ = pages;
     }
     [[nodiscard]] bool page_in_device_working_set(KVAddressSpaceHandle handle,
                                                   std::uint32_t page) const {
@@ -1029,6 +1040,13 @@ public:
         return activation.page_reservation_;
     }
 
+    // Non-throwing variant for cleanup paths: an address released by an earlier abort
+    // step must not turn staging cleanup into std::terminate.
+    [[nodiscard]] bool activation_address_valid(const KVActivationReservation& activation)
+        const noexcept {
+        return activation.owner_ == this && valid(activation.address_);
+    }
+
     void commit_activation(KVActivationReservation&& activation, cudaStream_t stream = nullptr) {
         if (activation.owner_ != this) {
             throw std::logic_error("KV activation reservation belongs to another store");
@@ -1048,10 +1066,15 @@ public:
             throw std::logic_error("KV activation destination changed after reservation");
         }
         const std::uint32_t residency_base = device_residency_floor(address);
-        const std::uint32_t expected =
+        std::uint32_t expected =
             activation.requested_entitlement_ > residency_base
                 ? activation.requested_entitlement_ - residency_base
                 : 0U;
+        if (sparse_activation_budget_pages_ != 0 && expected > sparse_activation_budget_pages_) {
+            // Sparse activations claim at most the window budget (see prepare_activation);
+            // membership past the working set materializes later from rolling margins.
+            expected = sparse_activation_budget_pages_;
+        }
         if (!activation.page_reservation_.belongs_to(pages_->physical_pool()) ||
             activation.page_reservation_.pages() != expected) {
             throw std::logic_error("KV activation capacity reservation changed");
@@ -1318,7 +1341,12 @@ public:
             const LogicalKVPageHandle logical = membership(source, page);
             const std::uint32_t references    = pages_->address_references(logical);
             const std::uint8_t writers        = pages_->writer_references(logical);
-            if (!pages_->device_resident(logical) || references == 0 ||
+            // Sparse working sets keep out-of-window pages as current Host replicas behind
+            // holes; those are snapshot-stable too (restores materialize them on demand).
+            const bool replica_stable =
+                pages_->device_resident(logical) ||
+                (pages_->host_resident(logical) && pages_->host_replica_current(logical));
+            if (!replica_stable || references == 0 ||
                 pages_->committed_columns(logical) < page_size ||
                 !pages_->can_retain_reference(logical, false)) {
                 throw std::logic_error("active KV snapshot full page is not stable");
@@ -2000,6 +2028,7 @@ private:
     LogicalKVPageStore* pages_    = nullptr;
     KVExecutionTablePool* tables_ = nullptr;
     std::uint32_t page_capacity_  = 0;
+    std::uint32_t sparse_activation_budget_pages_ = 0;
     std::vector<Address> addresses_;
     std::vector<std::uint32_t> free_;
     std::vector<LogicalKVPageHandle> memberships_;

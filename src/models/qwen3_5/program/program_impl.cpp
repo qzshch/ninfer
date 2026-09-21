@@ -194,6 +194,19 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());
     }
+    if (plan.kvmem_window_pages != 0) {
+        // Window + chunk + sink/slack margins: the most a sparse activation may claim
+        // from the device pool, even though its membership (entitlement) spans the
+        // whole logical context.
+        const std::uint32_t chunk_pages =
+            (plan.prefill_chunk + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
+            static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t budget = plan.kvmem_window_pages + chunk_pages + 4U;
+        text_kv_addresses->set_sparse_activation_budget(budget);
+        if (backend_kv_addresses) {
+            backend_kv_addresses->set_sparse_activation_budget(budget);
+        }
+    }
     pressure_text_page_scratch_.resize(text_kv_pages->capacity());
     pressure_text_selected_pages_.reserve(text_kv_pages->capacity());
     if (backend_kv_pages) {

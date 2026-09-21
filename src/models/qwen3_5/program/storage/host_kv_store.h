@@ -780,9 +780,12 @@ cudaStream_t transfer_stream)
             if (!pages_->device_resident(membership(address, page))) { incoming.push_back(page); }
         }
         if (!incoming.empty()) {
+            // Reserve exactly the pending materializations: the pages the demote above
+            // released are re-earmarked only by the final-reservation formula below, so
+            // folding the old margin in here would transiently exceed the pool even when
+            // the final state fits.
             pages_->physical_pool().resize_reservation(
-                address.reservation,
-                reserved_before + static_cast<std::uint32_t>(incoming.size()));
+                address.reservation, static_cast<std::uint32_t>(incoming.size()));
             std::vector<HostKVPageReplica> sources;
             placement_scratch_.clear();
             for (const std::uint32_t page : incoming) {

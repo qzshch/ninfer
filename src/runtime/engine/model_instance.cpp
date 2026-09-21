@@ -183,13 +183,14 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     KvCapacityPolicy effective_kv_capacity = options.kv_capacity;
     if (options.kvmem_window_pages != 0 &&
         effective_kv_capacity.mode == KvCapacityMode::Automatic) {
-        // The pool must also cover one prefill chunk of growth past the window (the
-        // rolling prefill window and entitlement floors size to window + chunk).
+        // The pool must also cover one prefill chunk of growth past the window plus the
+        // sink/slack margins of the rolling placements (peak residency is window + chunk
+        // + sink pages transiently before the demote runs).
         const std::uint32_t chunk_pages =
             (std::min(options.prefill_chunk, options.max_context) + kPagedKVPageSize - 1U) /
             kPagedKVPageSize;
         effective_kv_capacity = KvCapacityPolicy::explicit_capacity(
-            (options.kvmem_window_pages + chunk_pages) *
+            (options.kvmem_window_pages + chunk_pages + 4U) *
             static_cast<std::uint32_t>(kPagedKVPageSize));
     }
     auto resolution = resolve_kv_capacity(effective_kv_capacity, planner.capacity_curve(),

@@ -1259,6 +1259,12 @@ void ProgramImpl::abort_materialization_transfers(
             state_store->abort_transfer(std::move(*transaction.state_restore));
             transaction.state_restore.reset();
         }
+        if (transaction.text_activation && !transaction.text_source_restore_reservation &&
+            !text_kv_addresses->activation_address_valid(*transaction.text_activation)) {
+            // The address was already released by an earlier abort step; its pool
+            // reservation is returned by RAII, so only the replica bookkeeping skips.
+            transaction.text_activation.reset();
+        }
         if (transaction.text_activation || transaction.text_source_restore_reservation) {
             DeviceKVPageReservation& reservation =
                 transaction.text_source_restore_reservation
@@ -1268,6 +1274,10 @@ void ProgramImpl::abort_materialization_transfers(
                  transaction.text_restores) {
                 text_kv_pages->abort_device_replica(restore.logical, reservation);
             }
+        }
+        if (transaction.backend_activation && !transaction.backend_source_restore_reservation &&
+            !backend_kv_addresses->activation_address_valid(*transaction.backend_activation)) {
+            transaction.backend_activation.reset();
         }
         if (transaction.backend_activation || transaction.backend_source_restore_reservation) {
             DeviceKVPageReservation& reservation =

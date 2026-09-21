@@ -253,42 +253,47 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
-    base->summary.publish_continuation =
-        options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+    // Sparse capture/fork of a prefix beyond the window would snapshot Host-backed
+    // pages through device-only stability checks; long conversations re-prefill
+    // instead until that subsystem grows Host-aware pins.
+    const bool prefix_cache_participation =
+        options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled &&
+        (kvmem_window_pages == 0 ||
+         base->summary.prompt_tokens <=
+             kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize));
+    base->summary.publish_continuation = prefix_cache_participation;
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
                                            : base->summary.effective_output_tokens - 1U);
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
-    if (kvmem_window_pages != 0) {
-        // Sparse working set: the device guarantee is the window plus one prefill chunk of
-        // growth for Main, or the window plus the draft lead for the MTP follower pool;
-        // everything else lives as Host replicas behind holes.
-        const std::uint32_t main_window_pages =
-            kvmem_window_pages + pages_for_tokens(prefill_chunk);
-        if (base->text_kv_page_entitlement > main_window_pages) {
-            base->text_kv_page_entitlement = main_window_pages;
-        }
-    }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
-        if (kvmem_window_pages != 0) {
-            const std::uint32_t mtp_window_pages =
-                kvmem_window_pages + pages_for_tokens(draft_window);
-            if (base->backend_kv_page_entitlement > mtp_window_pages) {
-                base->backend_kv_page_entitlement = mtp_window_pages;
-            }
-        }
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    }
+    // Sparse working sets keep the whole logical prefix mapped (out-of-window pages hold
+    // Host replicas behind holes), so entitlements still track the full context; only the
+    // device claim is window-bounded and reported as admission demand below.
+    std::uint32_t main_demand_pages    = base->text_kv_page_entitlement;
+    std::uint32_t backend_demand_pages = base->backend_kv_page_entitlement;
+    if (kvmem_window_pages != 0) {
+        const std::uint32_t main_budget =
+            kvmem_window_pages + pages_for_tokens(prefill_chunk) + 4U;
+        const std::uint32_t backend_budget =
+            main_budget + (speculative_backend == SpeculativeBackend::Mtp
+                               ? pages_for_tokens(draft_window)
+                               : 0U);
+        main_demand_pages    = std::min(main_demand_pages, main_budget);
+        backend_demand_pages = std::min(backend_demand_pages, backend_budget);
     }
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
         .state_slots      = 1U,
-        .main_kv_pages    = base->text_kv_page_entitlement,
-        .backend_kv_pages = base->backend_kv_page_entitlement,
+        .main_kv_pages    = main_demand_pages,
+        .backend_kv_pages = backend_demand_pages,
     };
     if (prompt.has_media()) {
         if (!workspace_plan.vision) {
@@ -340,7 +345,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         base->prefix_identity_tag =
             capture_identity_tag(speculative_backend, proposal_head, kv_storage);
     }
-    if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
+    if (prefix_cache_participation) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
                                      std::optional<RewriteCheckpointKind> rewrite, bool shared,
                                      bool long_anchor, SharedCandidateEvidence evidence) {
