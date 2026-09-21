@@ -2029,7 +2029,13 @@ private:
                 try {
                     publish_runtime_stats();
                 } catch (...) {}
-                return;
+                // fail_all_cleanup() above restores the Program to an empty servable state,
+                // so an exception from one request degrades to that request's error instead
+                // of permanently killing the worker (which would 503 every later submit).
+                {
+                    std::lock_guard lock(queue_mutex_);
+                    if (!stopping_) { failed_ = false; }
+                }
             }
             execution_lock.unlock();
             std::unique_lock wait_lock(queue_mutex_);
