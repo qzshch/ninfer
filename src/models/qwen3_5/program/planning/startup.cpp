@@ -761,8 +761,6 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
-        // Sparse working sets lower the floor from the logical ceiling to the window:
-        // the pool holds the window; the tables stay logical-sized and publish holes.
         const std::uint32_t capacity_floor =
             options.kvmem_window_pages != 0
                 ? options.kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize)

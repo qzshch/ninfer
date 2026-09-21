@@ -1448,8 +1448,6 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
     text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, pages,
                                               device.transfer_stream);
-    // The placement transaction rebalances the reservation to its working set, which
-    // can leave zero growth headroom; restore the window floor so the next turn maps.
     const std::uint32_t floor_pages = kvmem_window_pages + 2U;
     if (text_kv_addresses->entitlement(sequence.kv->text) < floor_pages) {
         text_kv_addresses->resize_entitlement(sequence.kv->text, floor_pages);

@@ -23,8 +23,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     }
     const PagedKVStorageLayout layer_storage = paged_kv_storage_layout(storage, head_dim);
 
-    // A sparse working set sizes the pool by its window, not the logical ceiling; the
-    // execution tables stay sized to the logical capacity and publish holes.
+    // A sparse working set sizes the pool by its window, not the logical ceiling.
     const std::uint32_t logical_pages = page_count(capacity);
     const std::uint32_t resident_floor = window_pages != 0 ? window_pages : logical_pages;
     if (physical_page_groups < resident_floor) {

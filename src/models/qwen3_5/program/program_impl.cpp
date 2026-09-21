@@ -88,9 +88,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     if (plan.kvmem_window_pages != 0) {
-        // Capture buffers own their allocations outside the planned persistent arena:
-        // the arena is sized exactly by the startup plan, so co-locating them would
-        // need plan-level coupling for a sub-megabyte pair of sums.
+        // Capture buffers own their allocations outside the exactly-sized persistent arena.
         const std::size_t q_bytes = static_cast<std::size_t>(16U) * 6144U * sizeof(float);
         const std::size_t k_bytes = static_cast<std::size_t>(16U) *
                                     ops::kKvmemCaptureSlots * 1024U * sizeof(float);
