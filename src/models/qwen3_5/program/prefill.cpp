@@ -488,6 +488,14 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             sequence.prefix_digests.clear();
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
+            if (kvmem_window_pages != 0) {
+                // The retrieval index tracks the newest conversation; a Root start is a new
+                // conversation, so stale block means from a finished one must not pollute
+                // scoring (page numbering restarts at zero, so stale hits would be wrong).
+                kvmem_index_.truncate_to(0);
+                kvmem_query_.clear();
+                kvmem_query_count_.clear();
+            }
         } else if (preserving_source) {
             const SequenceState* private_source =
                 transaction.has_source ? &continuation_states[transaction.source_index] : nullptr;
@@ -1315,21 +1323,6 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
         text_kv_addresses->resize_entitlement(sequence.kv->text, next_pages);
     }
     ensure_sequence_kv_mapped(sequence, next_target, next_backend);
-   
-
- if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp) {
-        const std::uint32_t lead_pages = (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize;
-        const std::uint32_t backend_mapped =
-            backend_kv_addresses->mapped_pages(*sequence.kv->backend);
-        const auto backend_window = prefill_window_page_set(
-            backend_mapped, sink_pages, kvmem_window_pages + lead_pages);
-        backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
-                                                     backend_window, device.transfer_stream);
-        const std::uint32_t backend_floor = kvmem_window_pages + lead_pages + 2U;
-        if (backend_kv_addresses->entitlement(*sequence.kv->backend) < backend_floor) {
-            backend_kv_addresses->resize_entitlement(*sequence.kv->backend, backend_floor);
-        }
-    }
 }
 
 // Publishes the completed-block key sums of one prefill chunk into the retrieval index.
@@ -1448,10 +1441,6 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
     text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, pages,
                                               device.transfer_stream);
-    const std::uint32_t floor_pages = kvmem_window_pages + 2U;
-    if (text_kv_addresses->entitlement(sequence.kv->text) < floor_pages) {
-        text_kv_addresses->resize_entitlement(sequence.kv->text, floor_pages);
-    }
 }
 
 } // namespace ninfer::models::qwen3_5::detail
