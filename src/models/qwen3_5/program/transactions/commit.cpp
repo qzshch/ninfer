@@ -116,7 +116,16 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         detail::PhysicalResources actual         = owner_exclusive_resources(sequence);
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
-        if (actual != expected) {
+        // Sparse working sets may legitimately hold fewer resident KV pages than the
+        // planned entitlement (a retrieval placement can demote below the window), so
+        // the KV page fields only forbid exceeding the plan; structural fields stay exact.
+        const bool structurally_equal =
+            actual.device.active_lanes == expected.device.active_lanes &&
+            actual.device.state_slots == expected.device.state_slots;
+        const bool kv_within_plan =
+            actual.device.main_kv_pages <= expected.device.main_kv_pages &&
+            actual.device.backend_kv_pages <= expected.device.backend_kv_pages;
+        if (!structurally_equal || !kv_within_plan) {
             throw std::logic_error("materialized sequence does not match its active entitlement");
         }
         if (details.reuse != ReusePath::Root) {

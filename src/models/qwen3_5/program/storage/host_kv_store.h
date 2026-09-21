@@ -764,6 +764,10 @@ cudaStream_t transfer_stream)
                 (void)host_kv_extents.publish(std::move(*backup));
             }
             for (const std::uint32_t page : outgoing) {
+                // A pinned page belongs to a pending active snapshot or transfer: demoting
+                // it would break that publication. Keep it resident; the next placement
+                // reconsiders once the pin clears.
+                if (pages_->source_pins(membership(address, page)) != 0) { continue; }
                 if (!pages_->drop_device_replica_within_active(membership(address, page))) {
                     throw std::logic_error("KV device placement cannot demote an outgoing page");
                 }

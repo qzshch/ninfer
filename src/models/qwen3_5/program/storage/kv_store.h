@@ -965,6 +965,11 @@ public:
 
     // True when an activation must hold this mapped page device-resident: every page
     // under dense semantics, or a sparse working-set member under sparse semantics.
+    // Device pages this address space guarantees resident: the sparse working set, or the
+    // full mapped prefix under dense semantics.
+    [[nodiscard]] std::uint32_t device_residency_floor_pages(KVAddressSpaceHandle handle) const {
+        return device_residency_floor(require(handle));
+    }
     [[nodiscard]] bool page_in_device_working_set(KVAddressSpaceHandle handle,
                                                   std::uint32_t page) const {
         return page_in_working_set(require(handle), page);
@@ -1930,10 +1935,13 @@ private:
     }
 
     [[nodiscard]] std::uint32_t entitlement(const Address& address) const noexcept {
-        // Device-page guarantee: the sparse working set plus reserved growth, or the
-        // full mapped prefix plus reserved growth under dense semantics.
-        return device_residency_floor(address) +
-               (address.reservation.valid() ? address.reservation.pages() : 0U);
+        // Reachable-device ceiling: every mapped page is promotable (hole pages hold
+        // Host replicas), so the ceiling is the mapped prefix under dense semantics
+        // and max(mapped, sparse floor) otherwise, plus reserved growth either way.
+        const std::uint32_t base = address.page_count > device_residency_floor(address)
+                                       ? address.page_count
+                                       : device_residency_floor(address);
+        return base + (address.reservation.valid() ? address.reservation.pages() : 0U);
     }
 
     [[nodiscard]] LogicalKVPageHandle& membership(Address& address, std::uint32_t page) noexcept {
