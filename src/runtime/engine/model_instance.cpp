@@ -1,4 +1,5 @@
 #include "runtime/engine/model_instance.h"
+#include "core/paged_kv_cache.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "core/startup.h"
@@ -175,8 +176,23 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
-    auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
+    auto planner = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
+    // A sparse working set sizes the Main pool by its window: automatic free-memory sizing
+    // would otherwise grow the pool toward the logical ceiling and defeat the window. This
+    // must happen here (the resolver consumes the engine options, not the planner inputs).
+    KvCapacityPolicy effective_kv_capacity = options.kv_capacity;
+    if (options.kvmem_window_pages != 0 &&
+        effective_kv_capacity.mode == KvCapacityMode::Automatic) {
+        // The pool must also cover one prefill chunk of growth past the window (the
+        // rolling prefill window and entitlement floors size to window + chunk).
+        const std::uint32_t chunk_pages =
+            (std::min(options.prefill_chunk, options.max_context) + kPagedKVPageSize - 1U) /
+            kPagedKVPageSize;
+        effective_kv_capacity = KvCapacityPolicy::explicit_capacity(
+            (options.kvmem_window_pages + chunk_pages) *
+            static_cast<std::uint32_t>(kPagedKVPageSize));
+    }
+    auto resolution = resolve_kv_capacity(effective_kv_capacity, planner.capacity_curve(),
                                           current_free_device_bytes());
     auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
