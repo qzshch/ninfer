@@ -1652,6 +1652,12 @@ public:
             pages_->release_active_reference(page);
             pages_->dematerialize(page, address.reservation);
         }
+        if (address.device_working_set) {
+            // Dropping membership past the truncate target voids those working-set
+            // entries; leaving them would inflate the residency floor past page_count.
+            std::vector<std::uint32_t>& set = *address.device_working_set;
+            set.erase(std::lower_bound(set.begin(), set.end(), target), set.end());
+        }
         if (target != 0) {
             const std::uint32_t columns =
                 frontier - (target - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -1984,9 +1990,12 @@ private:
     }
 
     [[nodiscard]] std::uint32_t device_residency_floor(const Address& address) const noexcept {
-        return address.device_working_set
-                   ? static_cast<std::uint32_t>(address.device_working_set->size())
-                   : address.page_count;
+        if (!address.device_working_set) { return address.page_count; }
+        // The working set is sorted ascending; entries at or past the current membership
+        // are stale leftovers of a truncate and carry no residency guarantee.
+        const std::vector<std::uint32_t>& set = *address.device_working_set;
+        return static_cast<std::uint32_t>(
+            std::lower_bound(set.begin(), set.end(), address.page_count) - set.begin());
     }
 
     [[nodiscard]] bool page_in_working_set(const Address& address,

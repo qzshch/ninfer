@@ -253,14 +253,14 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
-    // Sparse capture/fork snapshots Host-backed pages through device-only stability
-    // checks, and the capture publication race ("active KV snapshot changed before
-    // publication") leaves resource accounting that blocks every later admission.
-    // Until that subsystem grows Host-aware pins and a clean abort, kvmem mode forgoes
-    // prefix-cache participation entirely: every turn re-prefills instead.
+    // Sparse capture/fork of a prefix beyond the window would snapshot Host-backed
+    // pages through device-only stability checks; long conversations re-prefill
+    // instead until that subsystem grows Host-aware pins.
     const bool prefix_cache_participation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled &&
-        kvmem_window_pages == 0;
+        (kvmem_window_pages == 0 ||
+         base->summary.prompt_tokens <=
+             kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize));
     base->summary.publish_continuation = prefix_cache_participation;
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
