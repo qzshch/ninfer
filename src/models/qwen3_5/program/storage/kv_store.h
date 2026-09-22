@@ -953,10 +953,16 @@ public:
         const std::uint32_t growth =
             entitlement > growth_base ? entitlement - growth_base : 0U;
         std::uint64_t required = static_cast<std::uint64_t>(missing_replicas) + growth;
-        if (sparse_activation_budget_pages_ != 0 && required > sparse_activation_budget_pages_) {
+        if (sparse_activation_budget_pages_ != 0) {
             // Sparse working set: membership beyond the window materializes later from the
             // rolling margins, so the activation claims at most the window budget now.
-            required = sparse_activation_budget_pages_;
+            // The restored set (growth_base pages) stays allocated in the same pool, so
+            // only the remaining share of the budget is claimable as growth.
+            const std::uint32_t claimable_growth =
+                sparse_activation_budget_pages_ > growth_base
+                    ? sparse_activation_budget_pages_ - growth_base
+                    : 0U;
+            required = missing_replicas + std::min(growth, claimable_growth);
         }
         if (required > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("KV activation reservation overflow");
@@ -1070,10 +1076,14 @@ public:
             activation.requested_entitlement_ > residency_base
                 ? activation.requested_entitlement_ - residency_base
                 : 0U;
-        if (sparse_activation_budget_pages_ != 0 && expected > sparse_activation_budget_pages_) {
-            // Sparse activations claim at most the window budget (see prepare_activation);
-            // membership past the working set materializes later from rolling margins.
-            expected = sparse_activation_budget_pages_;
+        if (sparse_activation_budget_pages_ != 0) {
+            // Sparse activations claim at most the window budget net of the restored set,
+            // which stays allocated in the same pool (see prepare_activation).
+            const std::uint32_t claimable =
+                sparse_activation_budget_pages_ > residency_base
+                    ? sparse_activation_budget_pages_ - residency_base
+                    : 0U;
+            expected = std::min(expected, claimable);
         }
         if (!activation.page_reservation_.belongs_to(pages_->physical_pool()) ||
             activation.page_reservation_.pages() != expected) {
@@ -1537,8 +1547,20 @@ public:
         if (entitlement < device_residency_floor(address) || entitlement > page_capacity_) {
             throw std::invalid_argument("KV entitlement is smaller than its residency floor");
         }
-        pages_->physical_pool().resize_reservation(address.reservation,
-                                                   entitlement - address.page_count);
+        std::uint32_t reservation_target = entitlement - address.page_count;
+        if (sparse_activation_budget_pages_ != 0) {
+            // Sparse device claim is bounded by the window budget: the working set (floor)
+            // plus the growth reservation together may not exceed it. Membership past the
+            // window materializes later from the rolling margins, so a caller's
+            // full-context entitlement only ever sizes the reservation up to this bound.
+            const std::uint32_t floor = device_residency_floor(address);
+            const std::uint32_t max_reservation =
+                sparse_activation_budget_pages_ > floor
+                    ? sparse_activation_budget_pages_ - floor
+                    : 0U;
+            reservation_target = std::min(reservation_target, max_reservation);
+        }
+        pages_->physical_pool().resize_reservation(address.reservation, reservation_target);
     }
 
     void release_growth_entitlement(KVAddressSpaceHandle handle) {
