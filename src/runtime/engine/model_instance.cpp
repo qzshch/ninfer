@@ -190,7 +190,7 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
             (std::min(options.prefill_chunk, options.max_context) + kPagedKVPageSize - 1U) /
             kPagedKVPageSize;
         effective_kv_capacity = KvCapacityPolicy::explicit_capacity(
-            (options.kvmem_window_pages + chunk_pages + 4U) *
+            (options.kvmem_window_pages + chunk_pages + 16U) *
             static_cast<std::uint32_t>(kPagedKVPageSize));
     }
     auto resolution = resolve_kv_capacity(effective_kv_capacity, planner.capacity_curve(),

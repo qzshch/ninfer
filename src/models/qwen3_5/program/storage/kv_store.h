@@ -954,14 +954,12 @@ public:
             entitlement > growth_base ? entitlement - growth_base : 0U;
         std::uint64_t required = static_cast<std::uint64_t>(missing_replicas) + growth;
         if (sparse_activation_budget_pages_ != 0) {
-            // Sparse working set: membership beyond the window materializes later from the
-            // rolling margins, so the activation claims at most the window budget now.
-            // The restored set (growth_base pages) stays allocated in the same pool, so
-            // only the remaining share of the budget is claimable as growth.
+            // Sparse: the activation claims at most the window budget. Restores
+            // (missing) plus exclusive resident pages plus the growth reservation
+            // share it - the same arithmetic the materialization audit applies.
+            const std::uint32_t cap = sparse_reservation_cap(address);
             const std::uint32_t claimable_growth =
-                sparse_activation_budget_pages_ > growth_base
-                    ? sparse_activation_budget_pages_ - growth_base
-                    : 0U;
+                cap > missing_replicas ? cap - missing_replicas : 0U;
             required = missing_replicas + std::min(growth, claimable_growth);
         }
         if (required > std::numeric_limits<std::uint32_t>::max()) {
@@ -1071,23 +1069,24 @@ public:
              address.committed_frontier != *activation.activation_frontier_)) {
             throw std::logic_error("KV activation destination changed after reservation");
         }
-        const std::uint32_t residency_base = device_residency_floor(address);
-        std::uint32_t expected =
-            activation.requested_entitlement_ > residency_base
-                ? activation.requested_entitlement_ - residency_base
-                : 0U;
         if (sparse_activation_budget_pages_ != 0) {
-            // Sparse activations claim at most the window budget net of the restored set,
-            // which stays allocated in the same pool (see prepare_activation).
-            const std::uint32_t claimable =
-                sparse_activation_budget_pages_ > residency_base
-                    ? sparse_activation_budget_pages_ - residency_base
+            // Sparse: the writers own the exact reservation sizing (restores consume
+            // from it between prepare and commit); the commit guards the budget
+            // invariant with the audit's own arithmetic.
+            if (!activation.page_reservation_.belongs_to(pages_->physical_pool()) ||
+                activation.page_reservation_.pages() > sparse_reservation_cap(address)) {
+                throw std::logic_error("KV activation capacity reservation changed");
+            }
+        } else {
+            const std::uint32_t residency_base = device_residency_floor(address);
+            const std::uint32_t expected =
+                activation.requested_entitlement_ > residency_base
+                    ? activation.requested_entitlement_ - residency_base
                     : 0U;
-            expected = std::min(expected, claimable);
-        }
-        if (!activation.page_reservation_.belongs_to(pages_->physical_pool()) ||
-            activation.page_reservation_.pages() != expected) {
-            throw std::logic_error("KV activation capacity reservation changed");
+            if (!activation.page_reservation_.belongs_to(pages_->physical_pool()) ||
+                activation.page_reservation_.pages() != expected) {
+                throw std::logic_error("KV activation capacity reservation changed");
+            }
         }
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             if (!page_in_working_set(address, page)) { continue; }
@@ -1548,18 +1547,10 @@ public:
             throw std::invalid_argument("KV entitlement is smaller than its residency floor");
         }
         std::uint32_t reservation_target = entitlement - address.page_count;
-        if (sparse_activation_budget_pages_ != 0) {
-            // Sparse device claim is bounded by the window budget: the working set (floor)
-            // plus the growth reservation together may not exceed it. Membership past the
-            // window materializes later from the rolling margins, so a caller's
-            // full-context entitlement only ever sizes the reservation up to this bound.
-            const std::uint32_t floor = device_residency_floor(address);
-            const std::uint32_t max_reservation =
-                sparse_activation_budget_pages_ > floor
-                    ? sparse_activation_budget_pages_ - floor
-                    : 0U;
-            reservation_target = std::min(reservation_target, max_reservation);
-        }
+        // Sparse device claim is bounded by the window budget: exclusive resident pages
+        // plus the growth reservation share it (the audit's arithmetic). Membership past
+        // the window materializes later from the rolling margins.
+        reservation_target = std::min(reservation_target, sparse_reservation_cap(address));
         pages_->physical_pool().resize_reservation(address.reservation, reservation_target);
     }
 
@@ -1625,6 +1616,24 @@ public:
             throw;
         }
         for (const LogicalKVPageHandle page : added) { pages_->retain_active_reference(page); }
+        if (address.device_working_set) {
+            // Growth materializes device-resident, so the recorded set must follow it:
+            // a stale set under-reports the residency floor and turns restore
+            // inventories inconsistent once the pages are later demoted or adopted.
+            for (std::uint32_t page = begin; page < target; ++page) {
+                address.device_working_set->push_back(page);
+            }
+            if (sparse_activation_budget_pages_ != 0) {
+                // Exclusive resident pages and the reservation share the budget
+                // (the audit's arithmetic); growth must shrink the reservation.
+                const std::uint32_t max_reservation = sparse_reservation_cap(address);
+                if (address.reservation.valid() &&
+                    address.reservation.pages() > max_reservation) {
+                    pages_->physical_pool().resize_reservation(address.reservation,
+                                                               max_reservation);
+                }
+            }
+        }
         address.page_count = target;
     }
 
@@ -2018,6 +2027,28 @@ private:
         const std::vector<std::uint32_t>& set = *address.device_working_set;
         return static_cast<std::uint32_t>(
             std::lower_bound(set.begin(), set.end(), address.page_count) - set.begin());
+    }
+
+    // Sparse budget cap for growth reservations, using the same arithmetic the
+    // materialization audit uses (owner_exclusive_resources): exclusive resident
+    // pages plus the reservation share one budget, so the cap is the budget minus
+    // the pages already exclusively resident. Floor-based caps undercount here -
+    // adopted fork tails and COW copies sit outside the working set but still
+    // count against the audit.
+    [[nodiscard]] std::uint32_t sparse_reservation_cap(const Address& address) const {
+        if (sparse_activation_budget_pages_ == 0) {
+            return std::numeric_limits<std::uint32_t>::max();
+        }
+        std::uint32_t resident_exclusive = 0;
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (pages_->device_resident(logical) && pages_->address_references(logical) == 1) {
+                ++resident_exclusive;
+            }
+        }
+        return sparse_activation_budget_pages_ > resident_exclusive
+                   ? sparse_activation_budget_pages_ - resident_exclusive
+                   : 0U;
     }
 
     [[nodiscard]] bool page_in_working_set(const Address& address,

@@ -846,10 +846,17 @@ cudaStream_t transfer_stream)
 
         const std::uint32_t working_set =
             resident_before - counts.demoted + counts.promoted;
-        const std::uint32_t final_reservation =
+        std::uint32_t final_reservation =
             reserved_before + resident_before > working_set
                 ? reserved_before + resident_before - working_set
                 : 0U;
+        if (sparse_activation_budget_pages_ != 0) {
+            // The margin demoted pages release is re-earmarked for growth here, but
+            // exclusive resident pages and the reservation share the budget (the
+            // audit's arithmetic); clamp the absorbed share accordingly.
+            final_reservation =
+                std::min(final_reservation, sparse_reservation_cap(address));
+        }
         pages_->physical_pool().resize_reservation(address.reservation, final_reservation);
         // Record the set for the next activation: it defines the restore/verify scope.
         // Freshly mapped growth pages materialize device-resident on ensure_mapped and are

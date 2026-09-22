@@ -201,7 +201,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         const std::uint32_t chunk_pages =
             (plan.prefill_chunk + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
             static_cast<std::uint32_t>(kPagedKVPageSize);
-        const std::uint32_t budget = plan.kvmem_window_pages + chunk_pages + 4U;
+        const std::uint32_t budget = plan.kvmem_window_pages + chunk_pages + 16U;
         text_kv_addresses->set_sparse_activation_budget(budget);
         if (backend_kv_addresses) {
             backend_kv_addresses->set_sparse_activation_budget(budget);

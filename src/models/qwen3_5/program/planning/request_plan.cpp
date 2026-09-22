@@ -281,7 +281,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     std::uint32_t backend_demand_pages = base->backend_kv_page_entitlement;
     if (kvmem_window_pages != 0) {
         const std::uint32_t main_budget =
-            kvmem_window_pages + pages_for_tokens(prefill_chunk) + 4U;
+            kvmem_window_pages + pages_for_tokens(prefill_chunk) + 16U;
         const std::uint32_t backend_budget =
             main_budget + (speculative_backend == SpeculativeBackend::Mtp
                                ? pages_for_tokens(draft_window)
@@ -867,7 +867,15 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         const auto [main_missing, main_contiguous_runs] =
             missing_kv_restore(*text_kv_addresses, *text_kv_pages, source_kv->text, main_required);
         if (main_missing != main_required - main_device) {
-            throw std::logic_error("Text KV restore inventory is inconsistent");
+            throw std::logic_error(
+                "Text KV restore inventory is inconsistent [required=" +
+                std::to_string(main_required) + " device=" + std::to_string(main_device) +
+                " missing=" + std::to_string(main_missing) + " mapped=" +
+                std::to_string(text_kv_addresses->mapped_pages(source_kv->text)) +
+                " working_set=" +
+                std::to_string(
+                    text_kv_addresses->device_residency_floor_pages(source_kv->text)) +
+                " reuse=" + std::to_string(plan->reuse_base) + "]");
         }
         plan->needs_transfer = plan->needs_transfer || main_missing != 0;
         if (main_missing != 0) {
