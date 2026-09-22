@@ -803,12 +803,41 @@ void ProgramImpl::fail_all_cleanup() noexcept {
         }
     }
     for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) { continue; }
-        shared_prefix_states[index].active_references = 0;
-        auto handle =
-            ContractAccess::make_shared_prefix(this, index, shared_prefix_slots[index].generation);
-        (void)release_shared_prefix(std::move(handle));
+        if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Free) { continue; }
+        if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Catalogued) {
+            shared_prefix_states[index].active_references = 0;
+            auto handle = ContractAccess::make_shared_prefix(
+                this, index, shared_prefix_slots[index].generation);
+            (void)release_shared_prefix(std::move(handle));
+            continue;
+        }
+        // A failed capture can leave staging in a transient role; its KV address space and
+        // StateImage references would pin engine resources forever (every later admission
+        // reports "isolated-feasible request is blocked in an idle Engine"). Drop them
+        // best-effort and recycle the slot.
+        SharedPrefixState& shared = shared_prefix_states[index];
+        shared.active_references  = 0;
+        if (shared.kv) {
+            if (shared.kv->backend && backend_kv_addresses) {
+                (void)backend_kv_addresses->release(*shared.kv->backend);
+            }
+            (void)text_kv_addresses->release(shared.kv->text);
+            shared.kv.reset();
+        }
+        if (state_store && state_store->valid(shared.state)) {
+            const std::uint32_t references = state_store->checkpoint_references(shared.state);
+            for (std::uint32_t drop = 0; drop < references; ++drop) {
+                state_store->release_checkpoint_reference(shared.state);
+            }
+            (void)state_store->release(shared.state);
+        }
+        shared                          = SharedPrefixState{};
+        shared_prefix_slots[index].role = SharedPrefixSlotRole::Free;
+        if (++shared_prefix_slots[index].generation == 0) {
+            ++shared_prefix_slots[index].generation;
+        }
     }
+    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
 }
 
 
