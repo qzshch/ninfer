@@ -418,6 +418,8 @@ struct RequestControl {
         std::uint64_t pending_capture_offer = 0;
         std::uint32_t base                  = 0;
         std::uint32_t cursor                = 0;
+        // Replay advances independently: prompt progress must not count these tokens twice.
+        std::optional<std::uint32_t> query_replay_cursor;
         std::uint32_t prompt_tokens         = 0;
         std::uint32_t initial_mtp_extent    = 0;
         double elapsed_seconds              = 0.0;
@@ -591,13 +593,18 @@ public:
     // Sparse working-set capture state: per-layer FP32 sums on the device (q single-slot
     // across the turn, k one slot per completed 128-token block of the current chunk) and
     // the host retrieval index they publish into at chunk and turn boundaries.
-    void* kvmem_q_memory_ = nullptr;
-    void* kvmem_k_memory_ = nullptr;
     Tensor kvmem_q_sum_;
     Tensor kvmem_k_sum_;
-    detail::RetrievalIndex kvmem_index_{ops::kKvmemCaptureBlockTokens, 16U, 4U, 256U};
+    detail::RetrievalIndex kvmem_index_;
+    std::uint32_t kvmem_capture_begin_ = 0;
+    std::uint32_t kvmem_query_begin_ = 0;
+    std::uint32_t kvmem_query_end_ = 0;
+    std::optional<LinearAttentionStatePool> kvmem_query_checkpoint_;
+    bool kvmem_query_checkpoint_valid_ = false;
+    std::uint32_t kvmem_capture_slots_ = 0;
     std::vector<float> kvmem_query_;
     std::vector<std::uint32_t> kvmem_query_count_;
+    std::vector<std::uint32_t> kvmem_retrieved_pages_;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
@@ -1186,10 +1193,14 @@ private:
     void roll_sparse_decode_window(SequenceState& sequence);
     void consume_kvmem_chunk_capture(std::uint32_t chunk_begin, std::uint32_t chunk_end);
     void finalize_kvmem_query(std::uint32_t prompt_tokens);
+    void copy_kvmem_query_state(SequenceState& sequence, bool restore);
+    std::uint32_t advance_kvmem_query_replay(SequenceState& sequence,
+                                            RequestControl::Prefill& staged,
+                                            runtime::ExecutionTimingRecorder& timing);
     void apply_kvmem_retrieval_placement(SequenceState& sequence);
     void roll_sparse_prefill_window(SequenceState& sequence, std::uint32_t prompt_tokens,
-                                    std::uint32_t cursor, std::uint32_t next_chunk,
-                                    std::uint32_t backend_valid);
+                                    std::uint32_t cursor,
+                                    std::uint32_t backend_valid, bool retrieved_history = false);
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

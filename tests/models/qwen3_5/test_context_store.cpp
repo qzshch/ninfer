@@ -758,6 +758,7 @@ void test_kv_placement(ninfer::DeviceContext& device) {
 
     addresses.resize_entitlement(*address, 4);
     addresses.ensure_mapped_to_tokens(*address, 256, device.stream);
+    addresses.commit_frontier(*address, 256);
     device.synchronize();
     expect(addresses.mapped_pages(*address) == 4, "growth past the working set still maps pages");
 
@@ -773,16 +774,108 @@ void test_kv_placement(ninfer::DeviceContext& device) {
     auto sparse_activation = addresses.prepare_activation(*address, 2, 1, 256);
     addresses.commit_activation(std::move(sparse_activation), device.stream);
     device.synchronize();
-    expect(addresses.entitlement(*address) == 2 && addresses.bound_row(*address) == 1,
-           "sparse activation accepts a window-sized entitlement");
+    expect(addresses.entitlement(*address) == 4 && addresses.bound_row(*address) == 1 &&
+               physical_pages.reserved_pages() == 0,
+           "sparse activation preserves logical coverage without reserving holes");
     const auto sparse_table = read_block_table(physical_tables, 1, 4);
     expect(sparse_table[0] >= 0 && sparse_table[1] == ninfer::kPagedKVPageHole &&
                sparse_table[2] >= 0 && sparse_table[3] == ninfer::kPagedKVPageHole,
            "sparse activation republishes holes for Host-only pages");
     addresses.deactivate(*address);
+    addresses.truncate_inactive_prefix(*address, 64);
+    addresses.activate(*address, 3, 0);
+    addresses.ensure_mapped_to_tokens(*address, 192, device.stream);
+    expect(addresses.device_residency_floor_pages(*address) == 3,
+           "inactive truncate followed by growth has no stale or duplicate working-set entries");
+    addresses.deactivate(*address);
     expect(addresses.release(*address), "placement address releases");
     expect(physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
            "placement teardown closes physical ownership");
+}
+
+void test_sparse_replay_truncate(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const auto layout = ninfer::plan_device_kv_page_pool(builder, {
+        .page_group_count = 6,
+        .geometry = {.page_tokens = 64,
+                     .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                     .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
+    const auto table_layout = ninfer::plan_kv_execution_tables(
+        builder, {.logical_page_capacity = 8, .table_rows = 1});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical(backing, layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, physical);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(physical.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical, 16);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, tables, 2, 8);
+    addresses.set_sparse_activation_budget(6);
+    const auto address = addresses.create_active(6, 0);
+    addresses.ensure_mapped_to_tokens(*address, 256, device.stream);
+    addresses.commit_frontier(*address, 256);
+    device.synchronize();
+    addresses.apply_device_placement(*address, extents, std::array{0U, 3U}, device.transfer_stream);
+    addresses.apply_device_placement(*address, extents, std::array{0U, 1U, 3U}, device.transfer_stream);
+    const auto tail = addresses.logical_page(*address, 1);
+    const auto removed = addresses.logical_page(*address, 2);
+    expect(pages.host_resident(tail) && pages.device_resident(tail) &&
+               !pages.device_resident(removed), "replay fixture has a copied tail and Host-only suffix");
+    addresses.truncate_for_replay(*address, 70, extents);
+    expect(addresses.mapped_pages(*address) == 2 && addresses.committed_frontier(*address) == 70 &&
+               pages.committed_columns(tail) == 6 && !pages.host_resident(tail) &&
+               !pages.valid(removed), "replay rewind drops stale Host coverage and suffix ownership");
+    addresses.resize_entitlement(*address, 6);
+    addresses.ensure_mapped_to_tokens(*address, 256, device.stream);
+    addresses.commit_frontier(*address, 256);
+    expect(addresses.device_residency_floor_pages(*address) == 4 &&
+               pages.committed_columns(tail) == 64, "replayed growth republishes valid coverage");
+    addresses.deactivate(*address);
+    expect(addresses.release(*address), "replay test releases its address");
+    (void)extents.release_unreferenced();
+    expect(physical.allocated_pages() == 0 && physical.reserved_pages() == 0 &&
+               pages.occupied() == 0, "replay rewind and growth leave no physical or logical leak");
+}
+
+void test_sparse_shared_reservation(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const auto layout = ninfer::plan_device_kv_page_pool(builder, {
+        .page_group_count = 8,
+        .geometry = {.page_tokens = 64,
+                     .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                     .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
+    const auto table_layout = ninfer::plan_kv_execution_tables(
+        builder, {.logical_page_capacity = 64, .table_rows = 1});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical(backing, layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, physical);
+    store::LogicalKVPageStore pages(physical, 64);
+    store::KVAddressSpaceStore addresses(pages, tables, 4, 64);
+    addresses.set_sparse_activation_budget(8);
+
+    auto source = addresses.create_active(8, 0);
+    addresses.ensure_mapped_to_tokens(*source, 256, device.stream);
+    addresses.commit_frontier(*source, 256);
+    addresses.deactivate(*source);
+    auto destination = addresses.create_inactive();
+    auto fork = addresses.prepare_prefix_fork(*source, *destination, 256, 8, 0);
+    addresses.commit_prefix_fork(std::move(fork), device.stream);
+    device.synchronize();
+    // Four shared pages already consume the physical pool. A large logical request
+    // must not add another full window's reservation on top of them.
+    addresses.resize_entitlement(*destination, 64);
+    expect(physical.allocated_pages() + physical.reserved_pages() == 8,
+           "shared prefix and sparse growth together fit one physical window budget");
+    addresses.ensure_mapped_to_tokens(*destination, 512, device.stream);
+    addresses.commit_frontier(*destination, 512);
+    addresses.deactivate(*destination);
+    expect(addresses.release(*destination) && addresses.release(*source),
+           "sparse shared-prefix test releases both owners");
+    expect(physical.allocated_pages() == 0 && physical.reserved_pages() == 0,
+           "sparse shared-prefix test leaves no physical claim");
 }
 
 } // namespace
@@ -801,6 +894,8 @@ int main() {
         test_state_store(device);
         test_kv_store(device);
         test_kv_placement(device);
+        test_sparse_replay_truncate(device);
+        test_sparse_shared_reservation(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

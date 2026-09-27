@@ -10,10 +10,9 @@
 namespace ninfer::ops {
 
 // Working-set capture geometry shared by the capture op callers: retrieval blocks are
-// 128 tokens, and one prefill chunk completes at most eight of them (chunk alignment
-// equals the block size, so the completed span is a whole number of blocks).
+// 128 tokens. Buffer slots are sized by the Program's configured prefill chunk;
+// split chunks can contribute to one block across multiple launches.
 inline constexpr std::uint32_t kKvmemCaptureBlockTokens = 128;
-inline constexpr std::uint32_t kKvmemCaptureSlots        = 8;
 
 
 

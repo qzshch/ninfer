@@ -624,9 +624,9 @@ public:
 
     void commit_coverage(LogicalKVPageHandle handle, std::uint32_t columns) {
         Page& page = require(handle);
-        // Committed coverage is logical state: the columns must live in a current replica
-        // on the Device (the dense path) or on the Host (a placement-demoted page).
-        if ((!page.device_replica && !page.host_replica) || page.writer_references != 1 ||
+        // New columns must have been written on Device. Existing full Host-backed
+        // pages need no coverage update when the address frontier moves past them.
+        if (!page.device_replica || page.writer_references != 1 ||
             columns < page.committed_columns ||
             columns > static_cast<std::uint32_t>(kPagedKVPageSize)) {
             throw std::invalid_argument("logical KV committed coverage is not monotonic");
@@ -648,12 +648,14 @@ public:
     }
 
     [[nodiscard]] bool can_destructive_truncate(LogicalKVPageHandle handle,
-                                                std::uint32_t columns) const noexcept {
+                                                std::uint32_t columns,
+                                                bool host_will_be_released = false) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
         return columns <= page.committed_columns && columns >= page.protected_columns &&
                page.references == 1 && page.writer_references == 1 && page.source_pins == 0 &&
-               !page.destination_pinned && !page.host_replica && page.device_replica.has_value();
+               !page.destination_pinned && (host_will_be_released || !page.host_replica) &&
+               page.device_replica.has_value();
     }
 
     [[nodiscard]] bool can_destructive_truncate_inactive(LogicalKVPageHandle handle,
@@ -955,8 +957,7 @@ public:
         std::uint64_t required = static_cast<std::uint64_t>(missing_replicas) + growth;
         if (sparse_activation_budget_pages_ != 0) {
             // Sparse: the activation claims at most the window budget. Restores
-            // (missing) plus exclusive resident pages plus the growth reservation
-            // share it - the same arithmetic the materialization audit applies.
+            // (missing), all resident pages, and the growth reservation share it.
             const std::uint32_t cap = sparse_reservation_cap(address);
             const std::uint32_t claimable_growth =
                 cap > missing_replicas ? cap - missing_replicas : 0U;
@@ -1546,9 +1547,10 @@ public:
         if (entitlement < device_residency_floor(address) || entitlement > page_capacity_) {
             throw std::invalid_argument("KV entitlement is smaller than its residency floor");
         }
-        std::uint32_t reservation_target = entitlement - address.page_count;
-        // Sparse device claim is bounded by the window budget: exclusive resident pages
-        // plus the growth reservation share it (the audit's arithmetic). Membership past
+        std::uint32_t reservation_target =
+            entitlement > address.page_count ? entitlement - address.page_count : 0U;
+        // Sparse device claim is bounded by the window budget: all resident pages
+        // plus the growth reservation share it. Membership past
         // the window materializes later from the rolling margins.
         reservation_target = std::min(reservation_target, sparse_reservation_cap(address));
         pages_->physical_pool().resize_reservation(address.reservation, reservation_target);
@@ -1577,6 +1579,11 @@ public:
                                              HostKVExtentStore& host_kv_extents,
                                              std::span<const std::uint32_t> selected_pages,
                                              cudaStream_t transfer_stream);
+
+    // Rewind a private active sequence for replay. Unlike dense rollback, removed
+    // pages may be Host-only. The retained partial tail must be Device-resident.
+    void truncate_for_replay(KVAddressSpaceHandle handle, std::uint32_t frontier,
+                             HostKVExtentStore& host_kv_extents);
 
     // Coverage is a lower bound. A speculative mapping may already extend beyond this stage's
     // needs; only an explicit truncate releases it, and commit_frontier publishes valid tokens.
@@ -1624,8 +1631,8 @@ public:
                 address.device_working_set->push_back(page);
             }
             if (sparse_activation_budget_pages_ != 0) {
-                // Exclusive resident pages and the reservation share the budget
-                // (the audit's arithmetic); growth must shrink the reservation.
+                // Resident pages and the reservation share the budget;
+                // growth must shrink the reservation.
                 const std::uint32_t max_reservation = sparse_reservation_cap(address);
                 if (address.reservation.valid() &&
                     address.reservation.pages() > max_reservation) {
@@ -1748,6 +1755,7 @@ public:
                 pages_->destructive_truncate_inactive(tail, columns);
             }
         }
+        trim_working_set(address);
         address.committed_frontier  = frontier;
         address.checkpoint_frontier = 0;
         rebuild_checkpoint_protection();
@@ -1789,6 +1797,7 @@ public:
             membership(address, index)        = {};
             if (!pages_->release_reference(logical, false)) { std::terminate(); }
         }
+        trim_working_set(address);
         address.committed_frontier  = frontier;
         address.checkpoint_frontier = std::min(address.checkpoint_frontier, frontier);
         rebuild_checkpoint_protection();
@@ -2029,25 +2038,26 @@ private:
             std::lower_bound(set.begin(), set.end(), address.page_count) - set.begin());
     }
 
-    // Sparse budget cap for growth reservations, using the same arithmetic the
-    // materialization audit uses (owner_exclusive_resources): exclusive resident
-    // pages plus the reservation share one budget, so the cap is the budget minus
-    // the pages already exclusively resident. Floor-based caps undercount here -
-    // adopted fork tails and COW copies sit outside the working set but still
-    // count against the audit.
+    static void trim_working_set(Address& address) {
+        if (address.device_working_set) {
+            auto& set = *address.device_working_set;
+            set.erase(std::lower_bound(set.begin(), set.end(), address.page_count), set.end());
+        }
+    }
+
+    // Shared prefixes also occupy physical pages. Count every resident member,
+    // including fork tails and COW copies, before reserving future sparse growth.
     [[nodiscard]] std::uint32_t sparse_reservation_cap(const Address& address) const {
         if (sparse_activation_budget_pages_ == 0) {
             return std::numeric_limits<std::uint32_t>::max();
         }
-        std::uint32_t resident_exclusive = 0;
+        std::uint32_t resident = 0;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
-            if (pages_->device_resident(logical) && pages_->address_references(logical) == 1) {
-                ++resident_exclusive;
-            }
+            if (pages_->device_resident(logical)) { ++resident; }
         }
-        return sparse_activation_budget_pages_ > resident_exclusive
-                   ? sparse_activation_budget_pages_ - resident_exclusive
+        return sparse_activation_budget_pages_ > resident
+                   ? sparse_activation_budget_pages_ - resident
                    : 0U;
     }
 

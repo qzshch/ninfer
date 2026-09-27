@@ -1574,18 +1574,19 @@ void ProgramImpl::ordered_reset(SequenceState& sequence) {
 // and the entitlement re-clamps, so unbounded generation rings the window instead of
 // exhausting it. Idempotent; runs at a decode GPU boundary before KV growth mapping.
 void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
-    constexpr std::uint32_t sink_pages  = 2U;
     constexpr std::uint32_t slack_pages = 2U;
     const std::uint32_t mapped_pages = text_kv_addresses->mapped_pages(sequence.kv->text);
-    if (mapped_pages > kvmem_window_pages + slack_pages) {
+    if (mapped_pages > kvmem_window_pages) {
+        requests[sequence.lane].publish_continuation = false;
         const auto window =
-            prefill_window_page_set(mapped_pages, sink_pages, kvmem_window_pages);
+            decode_window_page_set(mapped_pages, kvmem_window_pages, kvmem_retrieved_pages_);
         text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
                                                   device.transfer_stream);
         // Membership keeps growing with the conversation, so the clamp targets
         // mapped+slack (never a fixed page count): the reservation lands on the slack
         // margin regardless of how far the mapped prefix extends past the window.
-        const std::uint32_t clamped = mapped_pages + slack_pages;
+        const std::uint32_t clamped = std::min(
+            (capacity + kPagedKVPageSize - 1U) / kPagedKVPageSize, mapped_pages + slack_pages);
         if (text_kv_addresses->entitlement(sequence.kv->text) != clamped) {
             text_kv_addresses->resize_entitlement(sequence.kv->text, clamped);
         }
@@ -1595,13 +1596,14 @@ void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
             (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize;
         const std::uint32_t backend_mapped =
             backend_kv_addresses->mapped_pages(*sequence.kv->backend);
-        if (backend_mapped > kvmem_window_pages + lead_pages + slack_pages) {
-            const auto backend_window = prefill_window_page_set(
-                backend_mapped, sink_pages, kvmem_window_pages + lead_pages);
+        if (backend_mapped > kvmem_window_pages + lead_pages) {
+            const auto backend_window = decode_window_page_set(
+                backend_mapped, kvmem_window_pages + lead_pages, kvmem_retrieved_pages_);
             backend_kv_addresses->apply_device_placement(*sequence.kv->backend,
                                                          *host_kv_extents, backend_window,
                                                          device.transfer_stream);
-            const std::uint32_t backend_clamped = backend_mapped + slack_pages;
+            const std::uint32_t backend_clamped = std::min(
+                (capacity + kPagedKVPageSize - 1U) / kPagedKVPageSize, backend_mapped + slack_pages);
             if (backend_kv_addresses->entitlement(*sequence.kv->backend) != backend_clamped) {
                 backend_kv_addresses->resize_entitlement(*sequence.kv->backend, backend_clamped);
             }

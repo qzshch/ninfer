@@ -13,6 +13,7 @@
 //     query head; GQA groups map onto KV heads by summation before scoring.
 
 #include <cstdint>
+#include <algorithm>
 #include <span>
 #include <vector>
 
@@ -140,6 +141,25 @@ inline std::vector<std::uint32_t> block_pages(std::span<const std::uint32_t> blo
             pages.push_back(block * pages_per_block + offset);
         }
     }
+    return pages;
+}
+
+// Preserve retrieved historical pages throughout decode; only the remaining share
+// rolls with generated tokens. The total includes the sink and never exceeds budget.
+inline std::vector<std::uint32_t> decode_window_page_set(
+    std::uint32_t mapped, std::uint32_t budget, std::span<const std::uint32_t> retrieved) {
+    std::vector<std::uint32_t> pages;
+    for (std::uint32_t p = 0; p < std::min({mapped, budget, 2U}); ++p) { pages.push_back(p); }
+    for (const auto p : retrieved) {
+        if (p < mapped && p >= 2 && pages.size() < budget) { pages.push_back(p); }
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    for (std::uint32_t p = mapped; p > 0 && pages.size() < budget;) {
+        --p;
+        if (std::find(pages.begin(), pages.end(), p) == pages.end()) { pages.push_back(p); }
+    }
+    std::sort(pages.begin(), pages.end());
     return pages;
 }
 

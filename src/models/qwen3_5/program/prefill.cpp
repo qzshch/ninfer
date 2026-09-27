@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/retrieval/block_retrieval.h"
+#include "models/qwen3_5/program/retrieval/query_span.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -15,6 +16,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <span>
@@ -47,6 +51,9 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
+    card.set_kvmem_capture(execution.kvmem_q_sum, execution.kvmem_k_sum,
+                           execution.kvmem_capture_slots, execution.kvmem_query_begin,
+                           execution.kvmem_query_end);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
@@ -647,12 +654,31 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                                                 : 0U;
         std::uint32_t main_materialized = prompt_tokens;
         if (kvmem_window_pages != 0) {
-            // Sparse prefill maps only the first chunk of growth plus the rolling window;
+            // Features belong to the request being admitted, including cache-hit
+            // branches. Never reuse another conversation's block IDs or aborted sums.
+            kvmem_index_.truncate_to(0);
+            (void)kvmem_index_.append(base);
+            kvmem_query_.clear();
+            kvmem_query_count_.clear();
+            kvmem_retrieved_pages_.clear();
+            kvmem_capture_begin_ = base;
+            kvmem_query_checkpoint_valid_ = false;
+            // Long sparse requests currently restart from root, so their User span is
+            // available to capture even when followed by an arbitrarily long tool tail.
+            const auto query = kvmem_query_span(prompt_tokens, base, staged.prompt.retrieval_query);
+            kvmem_query_end_ = query.end;
+            kvmem_query_begin_ = query.begin;
+            if (std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+                std::fprintf(stderr, "KVMEM query source=%s begin=%u end=%u prompt=%u\n",
+                             query.exact ? "last_user" : "suffix", kvmem_query_begin_,
+                             kvmem_query_end_, prompt_tokens);
+            }
+            CUDA_CHECK(cudaMemsetAsync(kvmem_q_sum_.data, 0, kvmem_q_sum_.bytes(), device.stream));
+            CUDA_CHECK(cudaMemsetAsync(kvmem_k_sum_.data, 0, kvmem_k_sum_.bytes(), device.stream));
+            // Sparse prefill maps only the first chunk of growth;
             // chunk boundaries demote the committed overflow to Host replicas afterwards.
-            const std::uint32_t window_tokens =
-                kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize);
             main_materialized = std::min(
-                prompt_tokens, std::min(prefill_chunk, prompt_tokens) + window_tokens);
+                prompt_tokens, base + prefill_chunk);
             if (speculative_backend == SpeculativeBackend::Mtp &&
                 backend_materialized > main_materialized) {
                 const std::uint32_t lead = backend_materialized > prompt_tokens
@@ -1014,19 +1040,25 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
+        const bool needs_query_replay =
+            kvmem_window_pages != 0 &&
+            staged.prompt_tokens > kvmem_window_pages * kPagedKVPageSize && kvmem_query_begin_ != 0;
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head,
              kvmem_window_pages != 0 ? static_cast<float*>(kvmem_q_sum_.data) : nullptr,
-             kvmem_window_pages != 0 ? static_cast<float*>(kvmem_k_sum_.data) : nullptr},
+             kvmem_window_pages != 0 ? static_cast<float*>(kvmem_k_sum_.data) : nullptr,
+             kvmem_capture_slots_, kvmem_query_begin_, kvmem_query_end_},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
             decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
             staged.cursor,
-            static_cast<const ops::SamplingConfig*>(
+            // The probe's throwaway bridge token uses argmax. Sampling here would
+            // publish a phantom token into penalty history before the real replay.
+            needs_query_replay ? nullptr : static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
             rewrite_capture_hidden_ptr,
             selectors.source,
@@ -1062,7 +1094,25 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.mtp_bridge = MtpBridgeMode::None;
         }
 
-        if (staged.cursor < staged.prompt_tokens) {
+        if (staged.query_replay_cursor) {
+            mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
+                                                    : workspace_plan.text_prefill);
+            const auto final_chunk_tokens = advance_kvmem_query_replay(sequence, staged, timing);
+            if (*staged.query_replay_cursor < staged.prompt_tokens) {
+                timing.begin_wait();
+                device.synchronize();
+                timing.end_wait();
+                staged.elapsed_seconds +=
+                    std::chrono::duration<double>(Clock::now() - started).count();
+                return runtime::PrefillStepResult{
+                    .summary = summary,
+                    .timing  = timing.finish(),
+                };
+            }
+            timing.resume_submit();
+            copy_tail(sequence, prefill_hidden.slice(
+                                    1, static_cast<std::int32_t>(final_chunk_tokens) - 1, 1));
+        } else if (staged.cursor < staged.prompt_tokens) {
             const std::uint32_t nominal =
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
@@ -1100,6 +1150,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     (!split_frontier || *rewrite_split < *split_frontier)) {
                     split_frontier = *rewrite_split;
                 }
+                if (kvmem_window_pages != 0 && !kvmem_query_checkpoint_valid_ &&
+                    staged.prompt_tokens > kvmem_window_pages * kPagedKVPageSize &&
+                    kvmem_query_begin_ > staged.cursor &&
+                    (!split_frontier || kvmem_query_begin_ < *split_frontier)) {
+                    split_frontier = kvmem_query_begin_;
+                }
                 execution::PrefillChunkResult result;
                 timing.pause();
                 if (staged.vision) {
@@ -1135,17 +1191,19 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     consume_kvmem_chunk_capture(staged.cursor - result.processed_tokens,
                                                 staged.cursor);
                     if (staged.cursor < staged.prompt_tokens) {
-                        const std::uint32_t next_chunk =
-                            std::min(remaining, std::min(prefill_chunk,
-                                                         staged.prompt_tokens - staged.cursor));
                         roll_sparse_prefill_window(sequence, staged.prompt_tokens, staged.cursor,
-                                                   next_chunk, backend_kv_valid(sequence));
+                                                   backend_kv_valid(sequence));
                     }
                 }
 
                 // Prompt transitions are canonical immediately. If this was the first write after
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
                 settle_state_fork(sequence);
+                if (kvmem_window_pages != 0 && staged.cursor == kvmem_query_begin_ &&
+                    staged.prompt_tokens > kvmem_window_pages * kPagedKVPageSize) {
+                    copy_kvmem_query_state(sequence, false);
+                    kvmem_query_checkpoint_valid_ = true;
+                }
                 const bool reached_capture = capture_frontier && staged.cursor == *capture_frontier;
                 if (reached_capture) {
                     if (result.finalized) {
@@ -1186,6 +1244,21 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             if (kvmem_window_pages != 0) {
                 finalize_kvmem_query(staged.prompt_tokens);
                 apply_kvmem_retrieval_placement(sequence);
+                if (needs_query_replay) {
+                    // Hand control back before replay. Each subsequent step executes at most
+                    // one chunk so Engine can observe cancellation at stable GPU boundaries.
+                    staged.query_replay_cursor = kvmem_query_begin_;
+                    timing.begin_wait();
+                    device.synchronize();
+                    timing.end_wait();
+                    staged.elapsed_seconds +=
+                        std::chrono::duration<double>(Clock::now() - started).count();
+                    return runtime::PrefillStepResult{
+                        .summary                 = summary,
+                        .processed_prompt_tokens = processed_prompt_tokens,
+                        .timing                  = timing.finish(),
+                    };
+                }
             }
             timing.resume_submit();
             copy_tail(sequence, prefill_hidden.slice(
@@ -1293,13 +1366,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 // sink prefix plus the rolling window to Host replicas. Runs at the chunk GPU boundary
 // with no in-flight unit on the lane.
 void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint32_t prompt_tokens,
-                                             std::uint32_t cursor, std::uint32_t next_chunk,
-                                             std::uint32_t backend_valid) {
+                                             std::uint32_t cursor,
+                                             std::uint32_t backend_valid, bool retrieved_history) {
     constexpr std::uint32_t sink_pages = 2U;  // one 128-token retrieval block
-    const std::uint32_t window_tokens =
-        kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize);
     const std::uint32_t next_target =
-        std::min(prompt_tokens, cursor + next_chunk + window_tokens);
+        std::min(prompt_tokens, cursor + prefill_chunk);
     const std::uint32_t next_pages = (next_target + kPagedKVPageSize - 1U) / kPagedKVPageSize;
     std::uint32_t next_backend = backend_valid;
     if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp) {
@@ -1320,7 +1391,11 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
     // Demote first (shrinking the residency floor), then grow the entitlement, then
     // materialize the next chunk's pages inside it.
     const std::uint32_t mapped_pages = text_kv_addresses->mapped_pages(sequence.kv->text);
-    const auto window = prefill_window_page_set(mapped_pages, sink_pages, kvmem_window_pages);
+    const auto window = retrieved_history
+                            ? decode_window_page_set(mapped_pages, kvmem_window_pages,
+                                                     kvmem_retrieved_pages_)
+                            : prefill_window_page_set(mapped_pages, sink_pages,
+                                                      kvmem_window_pages - sink_pages);
     text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
                                               device.transfer_stream);
     if (next_pages > text_kv_addresses->entitlement(sequence.kv->text)) {
@@ -1340,22 +1415,121 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
         const std::uint32_t lead_pages = (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize;
         const std::uint32_t backend_mapped =
             backend_kv_addresses->mapped_pages(*sequence.kv->backend);
-        const auto backend_window = prefill_window_page_set(
-            backend_mapped, sink_pages, kvmem_window_pages + lead_pages);
+        const auto backend_window = retrieved_history
+            ? decode_window_page_set(backend_mapped, kvmem_window_pages + lead_pages,
+                                     kvmem_retrieved_pages_)
+            : prefill_window_page_set(backend_mapped, sink_pages,
+                                      kvmem_window_pages - sink_pages + lead_pages);
         backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
                                                      backend_window, device.transfer_stream);
     }
 }
 
+void ProgramImpl::copy_kvmem_query_state(SequenceState& sequence, bool restore) {
+    auto& live = state_images->linear();
+    auto& snapshot = *kvmem_query_checkpoint_;
+    const auto slot = state_selectors(sequence).destination;
+    for (std::uint32_t layer = 0; layer < live.layer_count(); ++layer) {
+        for (const bool recurrent : {false, true}) {
+            const Tensor active = recurrent ? live.recurrent_slot(layer, slot) : live.conv_slot(layer, slot);
+            const Tensor saved = recurrent ? snapshot.recurrent_slot(layer, 0) : snapshot.conv_slot(layer, 0);
+            CUDA_CHECK(cudaMemcpyAsync(restore ? active.data : saved.data,
+                                       restore ? saved.data : active.data, active.bytes(),
+                                       cudaMemcpyDeviceToDevice, device.stream));
+        }
+    }
+}
+
+std::uint32_t ProgramImpl::advance_kvmem_query_replay(SequenceState& sequence,
+                                                     RequestControl::Prefill& staged,
+                                                     runtime::ExecutionTimingRecorder& timing) {
+    if (!kvmem_query_checkpoint_valid_ || !staged.query_replay_cursor || staged.vision ||
+        !staged.capture_groups.empty()) {
+        throw std::logic_error("sparse query replay has no private text checkpoint");
+    }
+    auto& cursor = *staged.query_replay_cursor;
+    if (cursor < kvmem_query_begin_ || cursor >= staged.prompt_tokens) {
+        throw std::logic_error("sparse query replay cursor is outside the prompt");
+    }
+    if (cursor == kvmem_query_begin_) {
+        const auto* counts = requests[sequence.lane].sampling_host.token_counts;
+        if (counts != nullptr && std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+            // Admission resets generated-token counts. The unpublished probe must not
+            // change penalty history before replay samples the actual Begin token.
+            TokenId probe_token = 0;
+            std::int32_t probe_count = 0;
+            CUDA_CHECK(cudaMemcpy(&probe_token, io.token.data, sizeof(probe_token),
+                                   cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&probe_count, counts + probe_token, sizeof(probe_count),
+                                   cudaMemcpyDeviceToHost));
+            std::fprintf(stderr, "KVMEM probe sample_history=%d\n", probe_count);
+        }
+        // Rewind the unpublished probe's complete causal state exactly once.
+        copy_kvmem_query_state(sequence, true);
+        text_kv_addresses->truncate_for_replay(sequence.kv->text, cursor, *host_kv_extents);
+        if (sequence.kv->backend) {
+            backend_kv_addresses->truncate_for_replay(*sequence.kv->backend, cursor, *host_kv_extents);
+        }
+        const auto historical_pages = (cursor + kPagedKVPageSize - 1U) / kPagedKVPageSize;
+        kvmem_retrieved_pages_.erase(
+            std::lower_bound(kvmem_retrieved_pages_.begin(), kvmem_retrieved_pages_.end(), historical_pages),
+            kvmem_retrieved_pages_.end());
+        sequence.text_kv_valid = cursor;
+        if (staged.prepare_mtp) sequence.mtp_kv_valid = cursor;
+    }
+
+    // One bounded execution unit. Placement republishes the truncated execution row
+    // before this chunk; the caller synchronizes before returning control to Engine.
+    {
+        roll_sparse_prefill_window(sequence, staged.prompt_tokens, cursor,
+                                   backend_kv_valid(sequence), true);
+        const auto slots = state_selectors(sequence);
+        execution::PrefillContext replay{
+            {device, parameters, work, state_images->linear(),
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             proposal_head}, // No Q/K accumulation: the probe owns the retrieval features.
+            text_kv_view(sequence), mtp_kv_view(sequence), decoder->text_kv, decoder->mtp_cache(),
+            nullptr, cursor,
+            static_cast<const ops::SamplingConfig*>(
+                sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
+            nullptr, slots.source, slots.destination, staged.initial_mtp_extent, nullptr};
+        const auto count = std::min(prefill_chunk, staged.prompt_tokens - cursor);
+        const auto split = std::upper_bound(staged.prompt.identity.rewrite_execution_frontiers.begin(),
+                                            staged.prompt.identity.rewrite_execution_frontiers.end(), cursor);
+        const auto frontier = split == staged.prompt.identity.rewrite_execution_frontiers.end()
+                                  ? std::optional<std::uint32_t>{} : std::optional<std::uint32_t>{*split};
+        timing.pause();
+        const auto result = execution::prefill_text_chunk(
+            replay, staged.prompt.token_ids, count, frontier, cursor + count == staged.prompt_tokens);
+        timing.include(result.timing);
+        timing.resume_post();
+        if (result.processed_tokens == 0 || result.processed_tokens > count) {
+            throw std::logic_error("sparse query replay made invalid progress");
+        }
+        cursor += result.processed_tokens;
+        sequence.text_kv_valid = cursor;
+        if (staged.prepare_mtp) sequence.mtp_kv_valid = cursor;
+        commit_sequence_kv(sequence, cursor, backend_kv_valid(sequence));
+        if (cursor == staged.prompt_tokens && !result.finalized) {
+            throw std::logic_error("sparse query replay did not replace the probe sample");
+        }
+        if (cursor == staged.prompt_tokens && std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+            std::fprintf(stderr, "KVMEM replay begin=%u end=%u tokens=%u\n", kvmem_query_begin_,
+                         cursor, cursor - kvmem_query_begin_);
+        }
+        return result.processed_tokens;
+    }
+}
+
 // Publishes the completed-block key sums of one prefill chunk into the retrieval index.
-// Slot i of the capture buffer holds the i-th 128-token block the chunk completed, matching
-// the span the attention path accumulated.
+// Global block IDs select ring slots. An incomplete block retains its partial sum
+// across chunk boundaries; only completed slots are cleared after publication.
 void ProgramImpl::consume_kvmem_chunk_capture(std::uint32_t chunk_begin,
                                               std::uint32_t chunk_end) {
-    constexpr std::uint32_t kLayers = 16U;
-    constexpr std::uint32_t kKvWidth = 1024U;
+    const std::uint32_t kLayers = kvmem_index_.layers();
+    const std::uint32_t kKvWidth = kvmem_index_.kv_heads() * kvmem_index_.head_dim();
     const std::uint32_t first_block =
-        (chunk_begin + ops::kKvmemCaptureBlockTokens - 1U) / ops::kKvmemCaptureBlockTokens;
+        chunk_begin / ops::kKvmemCaptureBlockTokens;
     const std::uint32_t last_block = chunk_end / ops::kKvmemCaptureBlockTokens;
     if (last_block <= first_block) {
         // No block completed; still advance the index so block numbering tracks tokens.
@@ -1374,37 +1548,42 @@ void ProgramImpl::consume_kvmem_chunk_capture(std::uint32_t chunk_begin,
     }
     const std::uint32_t block_count = last_block - first_block;
     std::vector<float> sums(static_cast<std::size_t>(kLayers) *
-                            ops::kKvmemCaptureSlots * kKvWidth);
+                            kvmem_capture_slots_ * kKvWidth);
     CUDA_CHECK(cudaMemcpyAsync(sums.data(), kvmem_k_sum_.data,
                                sums.size() * sizeof(float), cudaMemcpyDeviceToHost,
                                device.stream));
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
     std::vector<float> mean(kKvWidth);
     for (std::uint32_t offset = 0; offset < block_count; ++offset) {
+        const auto block = first_block + offset;
+        const auto slot = block % kvmem_capture_slots_;
         for (std::uint32_t layer = 0; layer < kLayers; ++layer) {
             const float* source =
                 sums.data() +
-                (static_cast<std::size_t>(layer) * ops::kKvmemCaptureSlots + offset) * kKvWidth;
+                (static_cast<std::size_t>(layer) * kvmem_capture_slots_ + slot) * kKvWidth;
             for (std::uint32_t element = 0; element < kKvWidth; ++element) {
                 mean[element] = source[element] /
                                 static_cast<float>(ops::kKvmemCaptureBlockTokens);
             }
-            kvmem_index_.write_block_mean(first_block + offset, layer, mean);
+            if (block * ops::kKvmemCaptureBlockTokens >= kvmem_capture_begin_) {
+                kvmem_index_.write_block_mean(block, layer, mean);
+            }
+            auto* device_sum = static_cast<float*>(kvmem_k_sum_.data) +
+                (static_cast<std::size_t>(layer) * kvmem_capture_slots_ + slot) * kKvWidth;
+            CUDA_CHECK(cudaMemsetAsync(device_sum, 0, kKvWidth * sizeof(float), device.stream));
         }
     }
-    CUDA_CHECK(cudaMemsetAsync(kvmem_k_sum_.data, 0,
-                               static_cast<std::size_t>(kLayers) * ops::kKvmemCaptureSlots *
-                                   kKvWidth * sizeof(float),
-                               device.stream));
 }
 
 // Folds the per-layer query sum into the GQA-summed query mean the index scores against.
 void ProgramImpl::finalize_kvmem_query(std::uint32_t prompt_tokens) {
-    constexpr std::uint32_t kLayers = 16U;
-    constexpr std::uint32_t kQHeads = 24U;
-    constexpr std::uint32_t kKvHeads = 4U;
-    constexpr std::uint32_t kHeadDim = 256U;
-    if (prompt_tokens == 0) { return; }
+    const auto& attention = *parameters.model.config().text.attention;
+    const std::uint32_t kLayers = kvmem_index_.layers();
+    const std::uint32_t kQHeads = attention.num_attention_heads;
+    const std::uint32_t kKvHeads = attention.num_key_value_heads;
+    const std::uint32_t kHeadDim = attention.head_dim;
+    const auto query_tokens = std::min(prompt_tokens, kvmem_query_end_) - kvmem_query_begin_;
+    if (query_tokens == 0) { return; }
     std::vector<float> sums(static_cast<std::size_t>(kLayers) * kQHeads * kHeadDim);
     CUDA_CHECK(cudaMemcpyAsync(sums.data(), kvmem_q_sum_.data,
                                sums.size() * sizeof(float), cudaMemcpyDeviceToHost,
@@ -1423,18 +1602,28 @@ void ProgramImpl::finalize_kvmem_query(std::uint32_t prompt_tokens) {
             }
         }
     }
-    const float scale = 1.0F / static_cast<float>(prompt_tokens);
+    const float scale = 1.0F / static_cast<float>(query_tokens);
     for (float& value : kvmem_query_) { value *= scale; }
-    kvmem_query_count_.assign(kLayers, prompt_tokens);
+    kvmem_query_count_.assign(kLayers, query_tokens);
+    double norm = 0;
+    for (const auto value : kvmem_query_) { norm += static_cast<double>(value) * value; }
+    if (!std::isfinite(norm) || norm == 0) {
+        throw std::runtime_error("KVMem query capture is empty or nonfinite");
+    }
+    if (std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+        std::fprintf(stderr, "KVMEM capture query_tokens=%u blocks=%u query_norm=%.6g\n",
+                     query_tokens, kvmem_index_.block_count(), std::sqrt(norm));
+    }
     CUDA_CHECK(cudaMemsetAsync(kvmem_q_sum_.data, 0,
                                sums.size() * sizeof(float), device.stream));
 }
 
 // Replaces the rolling recency window with the retrieval-scored window once a turn's
-// query mean exists. The newest window pages stay resident by union so decode growth
-// and recent context are never demoted.
+// query mean exists. Retrieval and recent pages share one bounded device window.
 void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     constexpr std::uint32_t kBlockTokens = 128U;
+    const std::uint32_t mapped = text_kv_addresses->mapped_pages(sequence.kv->text);
+    if (mapped <= kvmem_window_pages) { return; }
     if (kvmem_query_count_.empty() || kvmem_query_count_[0] == 0) { return; }
     const std::uint32_t blocks = kvmem_index_.block_count();
     if (blocks == 0) { return; }
@@ -1456,16 +1645,32 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
         detail::select_blocks(kvmem_index_, scores, config);
     std::vector<std::uint32_t> pages =
         detail::block_pages(selection.selected, kBlockTokens);
-    const std::uint32_t mapped = text_kv_addresses->mapped_pages(sequence.kv->text);
     pages.erase(std::remove_if(pages.begin(), pages.end(),
                                [mapped](std::uint32_t page) { return page >= mapped; }),
                 pages.end());
+    kvmem_retrieved_pages_ = pages;
     const std::uint32_t recent_begin = mapped > recent_pages ? mapped - recent_pages : 0U;
     for (std::uint32_t page = recent_begin; page < mapped; ++page) { pages.push_back(page); }
+    // Rewind may shorten a Host-backed partial page. Restore its preserved prefix
+    // before dropping the probe suffix; later replay writes into that same page.
+    if (kvmem_query_begin_ != 0) {
+        pages.push_back((kvmem_query_begin_ - 1U) / kPagedKVPageSize);
+    }
     std::sort(pages.begin(), pages.end());
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-    text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, pages,
-                                              device.transfer_stream);
+    const auto placement = text_kv_addresses->apply_device_placement(
+        sequence.kv->text, *host_kv_extents, pages, device.transfer_stream);
+    if (std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+        std::fprintf(stderr, "KVMEM retrieval scored=%u selected=%zu promoted=%u demoted=%u\n",
+                     selection.scored_blocks, pages.size(), placement.promoted, placement.demoted);
+    }
+    if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp) {
+        const auto backend_mapped = backend_kv_addresses->mapped_pages(*sequence.kv->backend);
+        pages.erase(std::lower_bound(pages.begin(), pages.end(), backend_mapped), pages.end());
+        for (std::uint32_t page = mapped; page < backend_mapped; ++page) { pages.push_back(page); }
+        backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
+                                                     pages, device.transfer_stream);
+    }
 }
 
 } // namespace ninfer::models::qwen3_5::detail

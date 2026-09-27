@@ -51,6 +51,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
+      kvmem_index_(ops::kKvmemCaptureBlockTokens,
+                    parameters.model.config().text.full_attention_layers,
+                    parameters.model.config().text.attention->num_key_value_heads,
+                    parameters.model.config().text.attention->head_dim),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
       round_host(plan.causal_scoring ? std::nullopt
@@ -88,19 +92,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     if (plan.kvmem_window_pages != 0) {
-        // Capture buffers own their allocations outside the exactly-sized persistent arena.
-        const std::size_t q_bytes = static_cast<std::size_t>(16U) * 6144U * sizeof(float);
-        const std::size_t k_bytes = static_cast<std::size_t>(16U) *
-                                    ops::kKvmemCaptureSlots * 1024U * sizeof(float);
-        CUDA_CHECK(cudaMalloc(&kvmem_q_memory_, q_bytes));
-        CUDA_CHECK(cudaMalloc(&kvmem_k_memory_, k_bytes));
-        CUDA_CHECK(cudaMemsetAsync(kvmem_q_memory_, 0, q_bytes, device.stream));
-        CUDA_CHECK(cudaMemsetAsync(kvmem_k_memory_, 0, k_bytes, device.stream));
-        kvmem_q_sum_ = Tensor(kvmem_q_memory_, DType::FP32,
-                              {static_cast<std::int32_t>(16U * 6144U)});
-        kvmem_k_sum_ =
-            Tensor(kvmem_k_memory_, DType::FP32,
-                   {static_cast<std::int32_t>(16U * ops::kKvmemCaptureSlots * 1024U)});
+        kvmem_q_sum_ = plan.persistent.kvmem_query_sum->bind(backing);
+        kvmem_k_sum_ = plan.persistent.kvmem_key_sums->bind(backing);
+        kvmem_capture_slots_ = (prefill_chunk + 127U) / 128U + 1U;
+        kvmem_query_checkpoint_.emplace(backing, *plan.persistent.kvmem_query_checkpoint);
     }
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
@@ -340,8 +335,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
-    if (kvmem_q_memory_ != nullptr) { (void)cudaFree(kvmem_q_memory_); }
-    if (kvmem_k_memory_ != nullptr) { (void)cudaFree(kvmem_k_memory_); }
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }

@@ -164,6 +164,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         }
     }
     out.state_images = qwen3_5::plan_state_image_device_pool(builder, state_image_spec);
+    if (plan.kvmem_window_pages != 0) {
+        auto query_state = state_image_spec.linear;
+        query_state.slot_count = 1;
+        out.kvmem_query_checkpoint = plan_linear_attention_state_pool(builder, query_state);
+    }
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
             builder,
@@ -244,6 +249,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
+    if (plan.kvmem_window_pages != 0) {
+        const auto layers = static_cast<std::uint64_t>(config.full_attention_layers);
+        const auto slots = static_cast<std::uint64_t>((effective_prefill_chunk + 127) / 128 + 1);
+        out.kvmem_query_sum = add_tensor(builder, DType::FP32,
+            {dimension(layers * config.attention->query_width())}, "KVMem query sum");
+        out.kvmem_key_sums = add_tensor(builder, DType::FP32,
+            {dimension(layers * slots * config.attention->key_width())}, "KVMem key sums");
+    }
     if (plan.causal_scoring) {
         out.score_hidden =
             add_tensor(builder, DType::BF16,
@@ -753,7 +766,10 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
-    const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
+    const std::uint32_t minimum_pages = options.kvmem_window_pages != 0
+        ? std::min(logical_pages, options.kvmem_window_pages +
+              page_count(std::min(options.prefill_chunk, options.max_context)) + 16U)
+        : std::max(logical_pages, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
@@ -891,13 +907,6 @@ std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
-    // A sparse working set sizes the Main pool by the window; automatic free-memory
-    // sizing would otherwise grow the pool to the logical ceiling and defeat the point.
-    KvCapacityPolicy kv_capacity = options.kv_capacity;
-    if (options.kvmem_window_pages != 0 && kv_capacity.mode == KvCapacityMode::Automatic) {
-        kv_capacity = KvCapacityPolicy::explicit_capacity(
-            options.kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize));
-    }
     SequencePlanningInputs inputs{
         .parameters          = &parameters,
         .capacity            = options.max_context,

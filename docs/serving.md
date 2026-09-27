@@ -1,5 +1,41 @@
 # HTTP serving
 
+## Experimental KVMem window
+
+`--kvmem-window-pages N` enables sparse Host/Device KV placement (`0` is dense).
+One page is 64 tokens. The supported surface is single-lane text generation with
+ordinary decoding or MTP. Vision, DFlash, multiple active lanes, scoring, disabled
+context caching, and windows below 8 pages are rejected at startup.
+
+```bash
+./build/apps/ninfer-serve /absolute/qwen3_8_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 8095 --max-context 262144 \
+  --kv-dtype int8 --kv-capacity auto --kvmem-window-pages 1536 \
+  --host-kv-mib 12288 --max-concurrency 1 \
+  --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+This keeps a 96K historical Device window and bounded prefill/growth margins.
+Host RAM retains evicted KV at original positions. Prefill rolls over processed
+history; completed block means and pre-RoPE Q features choose the decode window.
+The query uses at most the last 512 tokens of the last typed user message, even
+when tool results follow it. If the template cannot prove that message's token
+boundaries, the query falls back to the new prompt suffix. Long prompts checkpoint
+the recurrent state before the query, select history, then replay from that
+checkpoint through the prompt end before publishing the first generated token.
+Main and MTP KV are rewound together. Retrieved history stays selected during
+generation; its recent share rolls, and MTP follows the same selection.
+Budget allocation, partial-block features and long-prefix feature ownership still
+differ from reference KVMem. Quality equivalence has not been established.
+
+Prompts fitting the window retain exact-prefix caching. Longer prompts are
+recomputed because cached continuations do not own retrieval features; generation
+crossing the window does not publish a sparse continuation. Host headroom is
+included in admission for requests that can spill. Configure enough Host capacity
+for the requested context and Main/MTP payloads; the INT8 27B 256K regression uses
+12 GiB. See [the test pipeline](../tests/e2e/README.md) and
+[integration audit](maintainer/kvmem-audit.md).
+
 `build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 

@@ -123,6 +123,11 @@ void test_selection() {
 }
 
 void test_window_helpers() {
+    const auto decoded = r::decode_window_page_set(40, 8, std::array{8U, 9U});
+    expect(decoded == std::vector<std::uint32_t>({0, 1, 8, 9, 36, 37, 38, 39}),
+           "decode retains retrieved history and rolls only its recent share");
+    expect(r::decode_window_page_set(3, 8, {}).size() == 3,
+           "short contexts stay dense");
     const auto full = r::prefill_window_page_set(5, 1, 4);
     expect(full == std::vector<std::uint32_t>({0U, 1U, 2U, 3U, 4U}),
            "a covering window keeps every page");

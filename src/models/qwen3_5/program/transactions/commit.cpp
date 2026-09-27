@@ -122,21 +122,12 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         const bool structurally_equal =
             actual.device.active_lanes == expected.device.active_lanes &&
             actual.device.state_slots == expected.device.state_slots;
-        // Sparse working sets evolve while the materialization transaction runs
-        // (restored pages, COW tails, chunk staging margins land after the plan
-        // snapshot), so the audit tolerates the structurally bounded transient:
-        // two chunk margins plus sink/slack/lead. Dense semantics stay exact.
-        constexpr std::uint32_t sparse_transient_pages = 32U;
         const bool kv_within_plan =
             actual.device.main_kv_pages <= expected.device.main_kv_pages &&
             actual.device.backend_kv_pages <= expected.device.backend_kv_pages;
-        const bool kv_within_sparse_plan =
-            kvmem_window_pages != 0 &&
-            actual.device.main_kv_pages <=
-                expected.device.main_kv_pages + sparse_transient_pages &&
-            actual.device.backend_kv_pages <=
-                expected.device.backend_kv_pages + sparse_transient_pages;
-        if (!structurally_equal || (!kv_within_plan && !kv_within_sparse_plan)) {
+        const bool valid_claim = kvmem_window_pages == 0 ? actual == expected
+                                                        : structurally_equal && kv_within_plan;
+        if (!valid_claim) {
             throw std::logic_error(
                 "materialized sequence does not match its active entitlement [lanes=" +
                 std::to_string(actual.device.active_lanes) + "/" +

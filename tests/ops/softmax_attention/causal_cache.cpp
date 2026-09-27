@@ -128,7 +128,7 @@ struct AttentionCase {
     bool graph_replay = false;
 };
 
-enum class MappingPattern { Identity, Offset, Fragmented, Holed };
+enum class MappingPattern { Identity, Offset, Fragmented, Holed, SparseTail };
 
 const char* mapping_name(MappingPattern pattern) {
     switch (pattern) {
@@ -140,6 +140,8 @@ const char* mapping_name(MappingPattern pattern) {
         return "fragmented";
     case MappingPattern::Holed:
         return "holed";
+    case MappingPattern::SparseTail:
+        return "sparse-tail";
     }
     return "unknown";
 }
@@ -170,6 +172,7 @@ std::int32_t physical_page_count(std::int32_t logical_pages, MappingPattern patt
     case MappingPattern::Fragmented:
         return 2 * logical_pages + 1;
     case MappingPattern::Holed:
+    case MappingPattern::SparseTail:
         return 2 * logical_pages + 1;
     }
     return 0;
@@ -188,9 +191,13 @@ std::vector<std::int32_t> make_block_table(std::int32_t logical_pages, MappingPa
         for (std::int32_t page = 0; page < logical_pages; ++page) { table[page] = 2 * page + 1; }
         break;
     case MappingPattern::Holed:
+    case MappingPattern::SparseTail:
         for (std::int32_t page = 0; page < logical_pages; ++page) {
+            const bool hole = pattern == MappingPattern::SparseTail
+                                  ? page >= 2 && page + 4 < logical_pages
+                                  : holed_page_is_hole(page);
             table[static_cast<std::size_t>(page)] =
-                holed_page_is_hole(page) ? kPagedKVPageHole : 2 * page + 1;
+                hole ? kPagedKVPageHole : 2 * page + 1;
         }
         break;
     }
@@ -1866,6 +1873,7 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
                                     attention_criterion(storage));
+    zero_hole_pages(expected, block_table);
     failures += verify_cache(label, cache.snapshot(), expected,
                              storage == KvCacheStorage::BFloat16 ||
                                  storage == KvCacheStorage::Nvfp4Group16 ||
@@ -1948,7 +1956,7 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
                                     attention_criterion(storage));
     HostCache cache_before = cache_host;
-    if (mapping == MappingPattern::Holed) { zero_hole_pages(cache_before, block_table); }
+    zero_hole_pages(cache_before, block_table);
     failures +=
         verify_cache(label + " cache unchanged", cache.snapshot(), cache_before, true);
     failures += verify_input(label + " q unchanged", dq, q_bits);
@@ -2573,6 +2581,16 @@ int run_softmax_attention_causal_cache_tests() {
     }
 
     int failures = verify_workspace_capacity_contract();
+    // Production-shaped sparse prompts and completely empty decode splits. Earlier
+    // "holed" append tests never passed page 4, so did not exercise a single hole.
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value}) {
+        failures += run_a1_case(kGeometries[0], storage, {128, 8192, 8320, 2701u},
+                                 MappingPattern::SparseTail);
+        failures += run_a3_case(kGeometries[0], storage, {7, 8192, 8199, 2702u},
+                                 MappingPattern::SparseTail);
+    }
     failures += run_nvfp4_cases();
     failures += run_quantized_batch_cases(KvCacheStorage::Nvfp4Group16, 720u);
     failures += report_quantization_quality(KvCacheStorage::Nvfp4Group16, 724u);

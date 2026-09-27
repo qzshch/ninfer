@@ -44,6 +44,9 @@ struct ExecutionCore {
     // Null keeps the attention path capture-free.
     float* kvmem_q_sum = nullptr;
     float* kvmem_k_sum = nullptr;
+    std::uint32_t kvmem_capture_slots = 0;
+    std::uint32_t kvmem_query_begin = 0;
+    std::uint32_t kvmem_query_end = 0;
 };
 
 struct PrefillContext {

@@ -99,11 +99,15 @@ public:
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
     // Working-set capture wiring (null disables): q_sum accumulates [query_width] per
-    // full-attention layer over every chunk column; k_sum holds [kv_width] per completed
-    // 128-token block slot per layer.
-    void set_kvmem_capture(float* q_sum, float* k_sum) noexcept {
+    // full-attention layer over [query_begin, query_end); k_sum holds [kv_width] per 128-token
+    // block ring slot per layer, including blocks split across prefill chunks.
+    void set_kvmem_capture(float* q_sum, float* k_sum, std::uint32_t slots,
+                           std::uint32_t query_begin, std::uint32_t query_end) noexcept {
         kvmem_q_sum_ = q_sum;
         kvmem_k_sum_ = k_sum;
+        kvmem_capture_slots_ = slots;
+        kvmem_query_begin_ = query_begin;
+        kvmem_query_end_ = query_end;
     }
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
@@ -171,6 +175,9 @@ private:
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     float* kvmem_q_sum_ = nullptr;
     float* kvmem_k_sum_ = nullptr;
+    std::uint32_t kvmem_capture_slots_ = 0;
+    std::uint32_t kvmem_query_begin_ = 0;
+    std::uint32_t kvmem_query_end_ = 0;
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);

@@ -70,6 +70,21 @@ std::size_t current_free_device_bytes() {
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    if (options.kvmem_window_pages != 0) {
+        const auto logical_pages = (static_cast<std::uint64_t>(options.max_context) + 63U) / 64U;
+        if (options.kvmem_window_pages < 8 || options.kvmem_window_pages > logical_pages) {
+            throw std::invalid_argument("kvmem_window_pages must be in [8,ceil(max_context/64)]");
+        }
+        if (options.max_concurrency != 1 || options.enable_vision ||
+            options.purpose != EnginePurpose::Generation ||
+            (options.speculative.backend != SpeculativeBackend::None &&
+             options.speculative.backend != SpeculativeBackend::Mtp)) {
+            throw std::invalid_argument("KVMem requires single-lane text generation with none or MTP speculation");
+        }
+        if (!options.context_cache.enabled || options.context_cache.host_kv_capacity_bytes == 0) {
+            throw std::invalid_argument("KVMem requires an enabled Host KV arena");
+        }
+    }
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
@@ -190,7 +205,8 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
             (std::min(options.prefill_chunk, options.max_context) + kPagedKVPageSize - 1U) /
             kPagedKVPageSize;
         effective_kv_capacity = KvCapacityPolicy::explicit_capacity(
-            (options.kvmem_window_pages + chunk_pages + 16U) *
+            std::min((options.max_context + kPagedKVPageSize - 1U) / kPagedKVPageSize,
+                     options.kvmem_window_pages + chunk_pages + 16U) *
             static_cast<std::uint32_t>(kPagedKVPageSize));
     }
     auto resolution = resolve_kv_capacity(effective_kv_capacity, planner.capacity_curve(),

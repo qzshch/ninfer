@@ -42,6 +42,9 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
+    std::optional<TensorLayout> kvmem_query_sum;
+    std::optional<TensorLayout> kvmem_key_sums;
+    std::optional<LinearAttentionStatePoolLayout> kvmem_query_checkpoint;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };

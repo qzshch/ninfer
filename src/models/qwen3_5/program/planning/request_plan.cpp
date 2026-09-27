@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
+#include "models/qwen3_5/program/retrieval/query_span.h"
 #include "models/qwen3_5/program/context.h"
 #include <algorithm>
 #include <cmath>
@@ -88,7 +89,9 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
                                      std::uint32_t reuse_base, std::uint32_t prefill_chunk,
                                      std::size_t prefill_splits,
                                      std::span<const CaptureGroup> captures,
-                                     std::span<const std::uint32_t> rewrite_frontiers) noexcept {
+                                     std::span<const std::uint32_t> rewrite_frontiers,
+                                     const std::optional<TokenSpan>& retrieval_query,
+                                     std::uint32_t window_tokens) {
     std::uint64_t prefill_units = 0;
     std::uint32_t segment_begin = reuse_base;
     std::size_t capture_index   = 0;
@@ -119,7 +122,10 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
     prefill_units += prefill_splits;
     const std::uint64_t decode_units =
         summary.effective_output_tokens == 0 ? 0ULL : summary.effective_output_tokens - 1ULL;
-    return prefill_units + decode_units;
+    const auto query = kvmem_query_span(summary.prompt_tokens, reuse_base, retrieval_query);
+    const auto replay_units = kvmem_replay_quanta(summary.prompt_tokens, query.begin, window_tokens,
+                                                 prefill_chunk, rewrite_frontiers);
+    return prefill_units + replay_units + decode_units;
 }
 
 std::uint32_t capture_identity_tag(SpeculativeBackend backend, ProposalHead proposal,
@@ -262,6 +268,9 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
          base->summary.prompt_tokens <=
              kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize));
     base->summary.publish_continuation = prefix_cache_participation;
+    // Long prompts need features for the entire history. The cache currently stores
+    // State/KV, not retrieval features, so a partial cached prefix cannot supply them.
+    base->allow_prefix_reuse = prefix_cache_participation;
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
@@ -288,6 +297,11 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                : 0U);
         main_demand_pages    = std::min(main_demand_pages, main_budget);
         backend_demand_pages = std::min(backend_demand_pages, backend_budget);
+        // Materialization and admission must use the same physical claim. Passing
+        // the logical context ceiling to retained-prefix forks reserves the entire
+        // future conversation before the rolling window can reclaim anything.
+        base->text_kv_page_entitlement = main_demand_pages;
+        base->backend_kv_page_entitlement = backend_demand_pages;
     }
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
@@ -440,11 +454,21 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         .physical_peak_additional = root_vector,
         .final_added              = root_vector,
     };
+    if (kvmem_window_pages != 0 && reserved_context_tokens > kvmem_window_pages * 64U) {
+        // A single active sparse request can eventually spill every historical page.
+        // Make admission reclaim Host cache before it starts, rather than discovering
+        // a full Host arena midway through inference. This is preparation headroom,
+        // not a fictitious Host allocation in the published owner inventory.
+        const auto pages = static_cast<std::size_t>(pages_for_tokens(reserved_context_tokens)) + 16U;
+        base->root_demand.physical_peak_additional.host.kv_bytes =
+            pages * (text_host_kv_page_stride + backend_host_kv_page_stride);
+    }
     const std::size_t cold_prefill_splits =
         base->vision_control_plan ? base->vision_control_plan->items.size() : 0ULL;
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits,
-                               base->capture_groups, prompt.identity.rewrite_execution_frontiers);
+                               base->capture_groups, prompt.identity.rewrite_execution_frontiers,
+                               prompt.retrieval_query, kvmem_window_pages * kPagedKVPageSize);
     base->root_rebuild_work =
         rebuild_work_at_frontier(prompt, base->summary.prompt_tokens, prefill_chunk,
                                  base->capture_groups, prompt.identity.rewrite_execution_frontiers);
@@ -748,7 +772,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     const std::size_t prefill_splits = plan->vision ? plan->vision->uses.size() : 0ULL;
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits,
-                               plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
+                               plan->capture_groups, prompt.identity.rewrite_execution_frontiers,
+                               prompt.retrieval_query, kvmem_window_pages * kPagedKVPageSize);
     std::uint64_t remaining_vision_items   = 0;
     std::uint64_t remaining_vision_patches = 0;
     if (plan->vision) {
@@ -1088,6 +1113,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             .final_removed            = removed,
             .final_added              = added,
         };
+        plan->demand.physical_peak_additional.host.kv_bytes +=
+            base.root_demand.physical_peak_additional.host.kv_bytes;
         return AdmissionCandidate(std::move(plan));
     }
     detail::PhysicalDeviceResources exclusive_active = active;
@@ -1236,6 +1263,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         .final_removed            = source_resources,
         .final_added              = final_added,
     };
+    plan->demand.physical_peak_additional.host.kv_bytes +=
+        base.root_demand.physical_peak_additional.host.kv_bytes;
     return AdmissionCandidate(std::move(plan));
 }
 
@@ -1279,7 +1308,8 @@ void ProgramImpl::select_shared_captures(AdmissionCandidate& candidate,
     const std::size_t prefill_splits = plan.vision ? plan.vision->uses.size() : 0ULL;
     plan.summary.service_work_quanta =
         projected_service_work(plan.summary, plan.reuse_base, prefill_chunk, prefill_splits,
-                               plan.capture_groups, prompt.identity.rewrite_execution_frontiers);
+                               plan.capture_groups, prompt.identity.rewrite_execution_frontiers,
+                               prompt.retrieval_query, kvmem_window_pages * kPagedKVPageSize);
     std::uint64_t vision_items   = 0;
     std::uint64_t vision_patches = 0;
     if (plan.vision) {
