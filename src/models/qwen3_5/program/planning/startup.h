@@ -45,6 +45,7 @@ struct PersistentLayout {
     std::optional<TensorLayout> kvmem_query_sum;
     std::optional<TensorLayout> kvmem_key_sums;
     std::optional<LinearAttentionStatePoolLayout> kvmem_query_checkpoint;
+    std::optional<CyclicKVCacheLayout> kvmem_draft_checkpoint;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };

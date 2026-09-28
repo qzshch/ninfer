@@ -6,7 +6,7 @@ on:
       profile:
         description: Test depth
         type: choice
-        options: [smoke, regression, long]
+        options: [smoke, regression, long, concurrency, vision, dflash2-vision]
         default: smoke
 
 permissions:

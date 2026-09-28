@@ -336,7 +336,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     // user-shaped serialization. An empty/unmapped last User leaves no exact query.
     for (std::size_t i = messages.size(); i > 0; --i) {
         if (messages[i - 1].role != ChatRole::User) continue;
-        if (!messages[i - 1].has_media() && message_blocks[i - 1]) {
+        if (message_blocks[i - 1]) {
             const auto index = *message_blocks[i - 1];
             const auto& block = layout.messages[index];
             if (block.role == ChatRole::User && block_users[index] == 1 &&

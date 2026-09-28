@@ -13,6 +13,7 @@ export NINFER_MODEL='/mnt/d/LLM Model/qwen3_8_27b_nvfp4.ninfer'
 bash tests/e2e/run_kvmem_pipeline.sh smoke
 bash tests/e2e/run_kvmem_pipeline.sh regression
 bash tests/e2e/run_kvmem_pipeline.sh long
+bash tests/e2e/run_kvmem_pipeline.sh concurrency
 ```
 
 `smoke` builds affected targets, runs numerical/storage/options tests and real
@@ -44,6 +45,34 @@ For a focused run against a freshly built binary:
 "$PYTHON" tests/e2e/kvmem_suite.py --model "$NINFER_MODEL" \
   --output /tmp/kvmem-check-unique --profile regression --window 64 --context 16384
 ```
+
+For two concurrent sparse lanes, run both decode backends:
+
+```bash
+port=8095
+for spec in none mtp; do
+  "$PYTHON" tests/e2e/kvmem_suite.py --model "$NINFER_MODEL" \
+    --output "out/kvmem-tests/dual-$spec-$(date -u +%Y%m%dT%H%M%SZ)" \
+    --profile concurrency --concurrency 2 --spec "$spec" \
+    --window 64 --context 16384 --chunk 1024 --host-mib 2048 --port "$port"
+  port=$((port + 1))
+done
+```
+
+This profile compares greedy output from isolated and simultaneous requests,
+requires two real decode lanes in the same GPU batch, and requires both lanes to
+restore scored historical pages from Host KV. Repeated pairs exercise lane reuse;
+disconnecting one active lane must leave the other generating and permit another
+request afterwards. HTTP overlap alone cannot pass this profile. These controlled
+output comparisons are regression checks, not broad model quality equivalence.
+
+To serve with this implementation, use `--max-concurrency 2 --kv-capacity auto`
+alongside your KVMem options. The window remains **per lane**: auto capacity is
+`lanes * min(ceil(context/64), window_pages + ceil(min(chunk,context)/64) + 16)`
+Main KV pages, plus the existing per-lane MTP lead when enabled. Model weights are
+shared, while recurrent state and retrieval capture storage grow with concurrency.
+`--host-kv-mib` is the shared Host budget; requests can queue if their combined
+reservations do not fit. Two lanes do not imply twice the tokens per second.
 
 Numerical oracle tests qualify attention mathematics. The model tests establish
 the listed inference behaviors, not LongMemEval quality parity or universal
@@ -297,3 +326,108 @@ the runner terminates only its owned server if MemAvailable + SwapFree falls bel
 capacity check. Windows system Commit is a separate host limit and still needs
 host-side monitoring. Recorded execution overrides are restricted to the CUDA
 Graph and allocator diagnostic flags; credentials are never recorded.
+
+## Two-lane window comparison
+
+`kvmem_window_bench.py` compares 36 Ki-token (`576` pages), 50 Ki-token (`800`
+pages) and 72 Ki-token (`1152` pages) selection windows, each with two lanes and
+262144-token logical contexts. Run the configurations sequentially with the same
+binary and model:
+
+```bash
+"$PYTHON" tests/e2e/kvmem_window_bench.py --model /path/model.ninfer \
+  --window 576 --port 8098 --output out/window-36k --active-file out/window-active.json
+"$PYTHON" tests/e2e/kvmem_window_bench.py --model /path/model.ninfer \
+  --window 800 --port 8098 --output out/window-50k --active-file out/window-active.json
+"$PYTHON" tests/e2e/kvmem_window_bench.py --model /path/model.ninfer \
+  --window 1152 --port 8099 --output out/window-72k --active-file out/window-active.json
+```
+
+Each run owns its server and requires a fresh output directory. Defaults use INT8
+KV, MTP3, a 1024-token prefill chunk and an 18 GiB shared Host KV arena. The GPU
+pool additionally reserves per-lane chunk/slack and MTP lead capacity. Cold paired
+inputs target 128K and 256K tokens; reports retain actual tokenizer counts, fixture
+hashes, two 2048-token output streams, engine timings and verified two-lane decode
+rounds. This repeated-filler/counting workload is a capacity and performance
+diagnostic, not a representative quality or general generation-speed benchmark.
+
+For an end-to-end throughput control, add `--concurrency 1` in a fresh output
+directory. Both clients still submit together; the one-lane server must queue
+them and execute two separate sparse retrievals with exclusively one-lane decode.
+Compare the complete pair wall time and total output tokens against concurrency
+two with identical prompts, window and output length. Per-request active decode
+rates exclude scheduler waiting and must not be summed as end-to-end throughput.
+
+### KVMem + vision regression
+
+Use a v3 artifact containing Vision weights. The `vision` pipeline profile runs both
+ordinary decoding and MTP with two lanes, including real sparse retrieval/replay:
+
+```bash
+NINFER_MODEL=/path/model.ninfer PYTHON=/path/python3.11 \
+  bash tests/e2e/run_kvmem_pipeline.sh vision
+
+"$PYTHON" tests/e2e/kvmem_vision_suite.py --model /path/model.ninfer \
+  --window 576 --context 262144 --host-mib 18432 --spec mtp \
+  --port 8099 --output out/vision-36k-c2
+```
+
+The runner checks exact image colors, multi-image order, cached-media text suffixes,
+query clipping inside a media item, tool tails longer than the window, cancellation
+at an observed media replay boundary, and oversized-group admission rejection.
+Two visual prompts generate 1,024 tokens independently and concurrently; the runner
+requires actual two-lane decode/retrieval and matching greedy outputs for these fixtures.
+A still image through the native video route checks temporal position plumbing only;
+it does not qualify motion understanding or all video codecs. `--window 0` provides
+a dense control for the small-window fixtures. Reports save raw completed responses
+before assertions, server diagnostics, GPU samples, Host memory and JUnit results.
+Each run needs a fresh output directory and a free port; use different ports for
+successive processes if accepted sockets remain in TIME_WAIT.
+
+Default tests use a 4K window/16K context/2GiB Host budget. The 36K configuration
+tests prompts just beyond its window, not two fully populated 256K visual contexts.
+Sparse selection can change answers; these controlled cases do not establish general
+quality equivalence to dense attention or reference KVMem. On Windows/WSL, monitor
+system commit independently; `active.json` in the output parent identifies only the
+owned test process for an external memory guard.
+
+All window benchmark runs enable the same diagnostic logging. `NINFER_KVMEM_TRANSFER_TRACE` emits
+actual KV placement payload bytes and existing copy submission/wait times, split
+by prefill, retrieval, replay and decode. Demoted pages with current Host replicas
+need no copy and are counted separately. The timings are CPU elapsed measurements,
+not GPU-only PCIe measurements; total placement time includes bookkeeping and
+table publication. Logging adds overhead. Windows Commit must be sampled outside
+WSL; Linux swap and application KV transfers do not establish Windows pagefile I/O.
+
+
+### DFlash2 seven-draft + Vision
+
+The artifact must contain matching `text`, `vision`, and `dflash2` components.
+An MTP-only artifact is insufficient. Run the dedicated pipeline (also available
+as the manual workflow profile `dflash2-vision`):
+
+```bash
+NINFER_MODEL=/absolute/qwen3_8_27b_nvfp4.ninfer \
+  bash tests/e2e/run_kvmem_pipeline.sh dflash2-vision
+```
+
+It runs dense DFlash2, sparse ordinary, and sparse DFlash2 on the same artifact.
+The DFlash2 runner requires real telemetry with `draft_window=7`, nonzero drafted
+and accepted counts, and zero/partial/full acceptance coverage in sparse mode.
+It also covers a 2304-token decode that wraps the 2048-token draft ring, true
+batched text/visual requests, long media query replay, cancellation and lane reuse.
+Cross-backend output quality still requires inspecting paired responses; passing
+these controlled fixtures is not general quality equivalence.
+
+To exercise two 36K windows with a 256K logical limit per lane:
+
+```bash
+python3.11 tests/e2e/kvmem_vision_suite.py \
+  --model /absolute/qwen3_8_27b_nvfp4.ninfer --spec dflash2 \
+  --window 576 --context 262144 --host-mib 18432 \
+  --output out/kvmem-dflash2-36k --port 8099
+```
+
+This profile actually prefills beyond the 36K window. It does not fill both 256K
+contexts. Check host commit and GPU memory externally on WSL; the runner's Linux
+headroom guard does not measure Windows commit.

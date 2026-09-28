@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/retrieval/window_capacity.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
@@ -166,8 +167,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.state_images = qwen3_5::plan_state_image_device_pool(builder, state_image_spec);
     if (plan.kvmem_window_pages != 0) {
         auto query_state = state_image_spec.linear;
-        query_state.slot_count = 1;
+        query_state.slot_count = dimension(plan.max_concurrency);
         out.kvmem_query_checkpoint = plan_linear_attention_state_pool(builder, query_state);
+        if (state_image_spec.dflash_local) {
+            const auto& local = *state_image_spec.dflash_local;
+            out.kvmem_draft_checkpoint = plan_cyclic_kv_cache(
+                builder, local.layers, local.capacity, local.kv_heads, local.head_dim,
+                dimension(plan.max_concurrency));
+        }
     }
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
@@ -253,9 +260,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         const auto layers = static_cast<std::uint64_t>(config.full_attention_layers);
         const auto slots = static_cast<std::uint64_t>((effective_prefill_chunk + 127) / 128 + 1);
         out.kvmem_query_sum = add_tensor(builder, DType::FP32,
-            {dimension(layers * config.attention->query_width())}, "KVMem query sum");
+            {dimension(layers * config.attention->query_width()), dimension(plan.max_concurrency)},
+            "KVMem per-lane query sums");
         out.kvmem_key_sums = add_tensor(builder, DType::FP32,
-            {dimension(layers * slots * config.attention->key_width())}, "KVMem key sums");
+            {dimension(layers * slots * config.attention->key_width()), dimension(plan.max_concurrency)},
+            "KVMem per-lane key sums");
     }
     if (plan.causal_scoring) {
         out.score_hidden =
@@ -767,8 +776,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = options.kvmem_window_pages != 0
-        ? std::min(logical_pages, options.kvmem_window_pages +
-              page_count(std::min(options.prefill_chunk, options.max_context)) + 16U)
+        ? kvmem_pool_page_budget(options.max_context, options.prefill_chunk,
+                                 options.kvmem_window_pages, options.max_concurrency)
         : std::max(logical_pages, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
@@ -819,6 +828,10 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
             throw std::invalid_argument("masked draft window must be in [1,15]");
+        }
+        if (options.kvmem_window_pages != 0 &&
+            parameters.model.config().draft->full_layer_count() != 0) {
+            throw std::invalid_argument("KVMem DFlash2 requires an all-local draft companion");
         }
         break;
     }
@@ -924,10 +937,12 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .context_cache       = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    // A sparse working set no longer guarantees the full logical prefix device-resident:
-    // its floor is the window itself (growth consumes the reservation beyond it).
-    const std::uint32_t resident_floor_pages =
-        inputs.kvmem_window_pages != 0 ? inputs.kvmem_window_pages : logical_pages;
+    // Reserve an independent window plus transient chunk growth for every lane.
+    // Logical context can exceed this resident pool because older pages spill to Host.
+    const std::uint32_t resident_floor_pages = inputs.kvmem_window_pages != 0
+        ? kvmem_pool_page_budget(inputs.capacity, inputs.prefill_chunk,
+                                 inputs.kvmem_window_pages, inputs.max_concurrency)
+        : logical_pages;
     const std::uint32_t minimum_pages = std::max(resident_floor_pages, inputs.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;

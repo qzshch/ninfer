@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/retrieval/window_capacity.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
 #include "core/device.h"
@@ -51,10 +52,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
-      kvmem_index_(ops::kKvmemCaptureBlockTokens,
-                    parameters.model.config().text.full_attention_layers,
-                    parameters.model.config().text.attention->num_key_value_heads,
-                    parameters.model.config().text.attention->head_dim),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
       round_host(plan.causal_scoring ? std::nullopt
@@ -91,11 +88,24 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
+    kvmem_lanes_.reserve(max_concurrency);
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        const auto& config = parameters.model.config().text;
+        kvmem_lanes_.push_back(KvmemLaneState{
+            .query_sum = plan.persistent.kvmem_query_sum
+                ? plan.persistent.kvmem_query_sum->bind(backing).slice(1, lane, 1) : Tensor{},
+            .key_sums = plan.persistent.kvmem_key_sums
+                ? plan.persistent.kvmem_key_sums->bind(backing).slice(1, lane, 1) : Tensor{},
+            .index = RetrievalIndex(ops::kKvmemCaptureBlockTokens, config.full_attention_layers,
+                                    config.attention->num_key_value_heads, config.attention->head_dim),
+        });
+    }
     if (plan.kvmem_window_pages != 0) {
-        kvmem_q_sum_ = plan.persistent.kvmem_query_sum->bind(backing);
-        kvmem_k_sum_ = plan.persistent.kvmem_key_sums->bind(backing);
         kvmem_capture_slots_ = (prefill_chunk + 127U) / 128U + 1U;
         kvmem_query_checkpoint_.emplace(backing, *plan.persistent.kvmem_query_checkpoint);
+        if (plan.persistent.kvmem_draft_checkpoint) {
+            kvmem_draft_checkpoint_.emplace(backing, *plan.persistent.kvmem_draft_checkpoint);
+        }
     }
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
@@ -193,13 +203,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // Window + chunk + sink/slack margins: the most a sparse activation may claim
         // from the device pool, even though its membership (entitlement) spans the
         // whole logical context.
-        const std::uint32_t chunk_pages =
-            (plan.prefill_chunk + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
-            static_cast<std::uint32_t>(kPagedKVPageSize);
-        const std::uint32_t budget = plan.kvmem_window_pages + chunk_pages + 16U;
+        const auto budget = kvmem_lane_page_budget(capacity, prefill_chunk, kvmem_window_pages);
         text_kv_addresses->set_sparse_activation_budget(budget);
         if (backend_kv_addresses) {
-            backend_kv_addresses->set_sparse_activation_budget(budget);
+            backend_kv_addresses->set_sparse_activation_budget(
+                budget + (speculative_backend == SpeculativeBackend::Mtp
+                              ? (draft_window - 1U + kPagedKVPageSize - 1U) / kPagedKVPageSize
+                              : 0U));
         }
     }
     pressure_text_page_scratch_.resize(text_kv_pages->capacity());

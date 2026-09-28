@@ -5,6 +5,7 @@
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/program/retrieval/window_capacity.h"
 
 #include <algorithm>
 #include <chrono>
@@ -75,11 +76,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         if (options.kvmem_window_pages < 8 || options.kvmem_window_pages > logical_pages) {
             throw std::invalid_argument("kvmem_window_pages must be in [8,ceil(max_context/64)]");
         }
-        if (options.max_concurrency != 1 || options.enable_vision ||
+        if (options.max_concurrency == 0 || options.max_concurrency > 2 ||
             options.purpose != EnginePurpose::Generation ||
             (options.speculative.backend != SpeculativeBackend::None &&
-             options.speculative.backend != SpeculativeBackend::Mtp)) {
-            throw std::invalid_argument("KVMem requires single-lane text generation with none or MTP speculation");
+             options.speculative.backend != SpeculativeBackend::Mtp &&
+             options.speculative.backend != SpeculativeBackend::DFlash2)) {
+            throw std::invalid_argument("KVMem requires one or two lanes with none, MTP or DFlash2 speculation");
         }
         if (!options.context_cache.enabled || options.context_cache.host_kv_capacity_bytes == 0) {
             throw std::invalid_argument("KVMem requires an enabled Host KV arena");
@@ -198,15 +200,13 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     KvCapacityPolicy effective_kv_capacity = options.kv_capacity;
     if (options.kvmem_window_pages != 0 &&
         effective_kv_capacity.mode == KvCapacityMode::Automatic) {
-        // The pool must also cover one prefill chunk of growth past the window plus the
+        // Each lane must also cover one prefill chunk of growth past its window plus the
         // sink/slack margins of the rolling placements (peak residency is window + chunk
         // + sink pages transiently before the demote runs).
-        const std::uint32_t chunk_pages =
-            (std::min(options.prefill_chunk, options.max_context) + kPagedKVPageSize - 1U) /
-            kPagedKVPageSize;
         effective_kv_capacity = KvCapacityPolicy::explicit_capacity(
-            std::min((options.max_context + kPagedKVPageSize - 1U) / kPagedKVPageSize,
-                     options.kvmem_window_pages + chunk_pages + 16U) *
+            models::qwen3_5::detail::kvmem_pool_page_budget(
+                options.max_context, options.prefill_chunk,
+                options.kvmem_window_pages, options.max_concurrency) *
             static_cast<std::uint32_t>(kPagedKVPageSize));
     }
     auto resolution = resolve_kv_capacity(effective_kv_capacity, planner.capacity_curve(),

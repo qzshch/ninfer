@@ -1,4 +1,6 @@
 #include "models/qwen3_5/program/retrieval/block_retrieval.h"
+#include "models/qwen3_5/program/retrieval/media_window.h"
+#include "models/qwen3_5/program/retrieval/query_span.h"
 
 #include <array>
 #include <cmath>
@@ -143,6 +145,54 @@ void test_window_helpers() {
            "blocks expand to their 64-token pages");
 }
 
+void test_media_windows() {
+    using ninfer::models::qwen3_5::VisionItem;
+    using ninfer::models::qwen3_5::TokenSpan;
+    VisionItem a, b, c;
+    a.token_spans = {{193, 128}}; // pages 3..5, including predecessor
+    b.token_spans = {{340, 80}};  // shares page 5; must merge
+    c.token_spans = {{641, 120}};
+    const auto groups = r::media_page_groups(std::array{a, b, c});
+    expect(groups.size() == 2 && groups[0].begin == 3 && groups[0].end == 7,
+           "media sharing a physical page cannot be selected independently");
+    r::validate_media_window(groups, 10);
+    const auto selected = r::media_window_page_set(20, 8, std::array{4U}, groups);
+    expect(selected == std::vector<std::uint32_t>({0, 1, 3, 4, 5, 6, 10, 11}),
+           "one scored page brings its full media group, with sink and latest image");
+    const auto tight = r::media_window_page_set(20, 6, std::array{4U}, groups);
+    expect(tight == std::vector<std::uint32_t>({0, 1, 10, 11, 18, 19}),
+           "a group that does not fit is omitted as a whole");
+    const auto partial = r::media_window_page_set(5, 8, {}, groups);
+    expect(partial == std::vector<std::uint32_t>({0, 1, 2, 3, 4}),
+           "in-progress image maps no future pages and a fitting prefix stays dense");
+    bool rejected = false;
+    try { r::validate_media_window(groups, 7); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "oversized media fails before execution rather than becoming partial");
+    // Independent all-or-none invariant across every materialized prefix/window.
+    for (std::uint32_t mapped = 0; mapped < 30; ++mapped) {
+        for (std::uint32_t budget = 8; budget <= 16; ++budget) {
+            const auto pages = r::media_window_page_set(mapped, budget, std::array{4U, 11U}, groups);
+            expect(pages.size() <= budget && std::is_sorted(pages.begin(), pages.end()),
+                   "media windows stay sorted and within capacity");
+            for (const auto& group : groups) {
+                std::size_t count = 0;
+                for (const auto p : pages) { count += p >= group.begin && p < group.end; }
+                const auto visible = std::min(mapped, group.end) > group.begin
+                    ? std::min(mapped, group.end) - group.begin : 0;
+                expect(count == 0 || count == visible, "execution never sees a partial visible media group");
+            }
+        }
+    }
+    VisionItem large;
+    large.token_spans = {{4500, 900}};
+    const auto query = r::kvmem_query_span(5500, 0, TokenSpan{4000, 1450}, std::array{large});
+    expect(query.begin == 4499 && query.end == 5450 && query.exact,
+           "512-token query clipping backs up to the complete media consumer span");
+    const auto after = r::kvmem_query_span(6500, 0, TokenSpan{6000, 450}, std::array{large});
+    expect(after.begin == 6000, "an older image does not expand a later text query");
+}
+
 } // namespace
 
 int main() {
@@ -151,6 +201,7 @@ int main() {
         test_scoring();
         test_selection();
         test_window_helpers();
+        test_media_windows();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
         return 1;

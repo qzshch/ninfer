@@ -1182,9 +1182,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if (multimodal->positions.size() != 3 * multimodal->token_ids.size()) {
             throw std::invalid_argument("multimodal positions must have shape [3,T]");
         }
-        if (multimodal->vision == nullptr) {
-            throw std::invalid_argument("multimodal prefill requires a Vision session");
-        }
         rope_delta_ = multimodal->rope_delta;
     } else if (text_kv_base_ == 0) {
         rope_delta_ = 0;
@@ -1216,10 +1213,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
         VisionChunk vision_chunk;
         const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
-        if (multimodal != nullptr) {
-            if (multimodal->vision == nullptr) {
-                throw std::logic_error("multimodal prefill has no Vision session");
-            }
+        if (multimodal != nullptr && multimodal->vision != nullptr) {
             vision_chunk =
                 multimodal->vision->prepare_chunk(prompt_t0, static_cast<std::uint32_t>(len));
             len = vision_chunk.length;
@@ -1455,13 +1449,20 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
-                                              VisionPrefillSession& vision, bool finalize_at_end) {
+                                              VisionPrefillSession* vision, bool finalize_at_end) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
     }
     const std::span<const int> tokens(input.token_ids);
-    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
+    if (vision == nullptr && std::any_of(input.vision_items.begin(), input.vision_items.end(),
+            [begin](const auto& item) {
+                const auto& last = item.token_spans.back();
+                return last.begin + last.count > begin;
+            })) {
+        throw std::logic_error("uncached media requires a Vision session");
+    }
+    const MultimodalPrefill multimodal{tokens, input.positions, vision, begin, input.rope_delta};
     NullTap tap;
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, tap,
                         finalize_at_end);
@@ -1469,14 +1470,21 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
-                                              VisionPrefillSession& vision, bool finalize_at_end,
+                                              VisionPrefillSession* vision, bool finalize_at_end,
                                               DFlashFeatureSink& sink) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
     }
     const std::span<const int> tokens(input.token_ids);
-    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
+    if (vision == nullptr && std::any_of(input.vision_items.begin(), input.vision_items.end(),
+            [begin](const auto& item) {
+                const auto& last = item.token_spans.back();
+                return last.begin + last.count > begin;
+            })) {
+        throw std::logic_error("uncached media requires a Vision session");
+    }
+    const MultimodalPrefill multimodal{tokens, input.positions, vision, begin, input.rope_delta};
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, sink,
                         finalize_at_end);
 }

@@ -17,13 +17,25 @@ struct KvMemQuerySpan {
 };
 
 inline KvMemQuerySpan kvmem_query_span(std::uint32_t prompt_tokens, std::uint32_t reuse_base,
-                                      const std::optional<TokenSpan>& query) {
+                                      const std::optional<TokenSpan>& query,
+                                      std::span<const VisionItem> media = {}) {
     if (reuse_base > prompt_tokens) { throw std::logic_error("query reuse base exceeds prompt"); }
     const bool exact = query && query->begin >= reuse_base && query->begin <= prompt_tokens &&
                        query->count > 0 && query->count <= prompt_tokens - query->begin;
     const auto end = exact ? static_cast<std::uint32_t>(query->begin + query->count) : prompt_tokens;
     const auto floor = exact ? static_cast<std::uint32_t>(query->begin) : reuse_base;
-    return {std::max(floor, end > 512U ? end - 512U : 0U), end, exact};
+    auto begin = std::max(floor, end > 512U ? end - 512U : 0U);
+    for (const auto& item : media) {
+        if (item.token_spans.empty()) { continue; }
+        const auto first = item.token_spans.front().begin;
+        const auto& last = item.token_spans.back();
+        const auto consumer_begin = first == 0 ? 0 : first - 1;
+        if (consumer_begin < begin && begin < last.begin + last.count) {
+            begin = std::max(reuse_base, static_cast<std::uint32_t>(consumer_begin));
+            break;
+        }
+    }
+    return {begin, end, exact};
 }
 
 // Replay returns to Scheduler after each chunk, including a chunk shortened by

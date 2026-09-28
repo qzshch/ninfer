@@ -7,21 +7,47 @@ MeanK、query capture、Host/Device placement 语义。历史会话只用于寻�
 
 ## 结论与适用边界
 
+2026-09-28 DFlash2 增量：全 local companion 的 KVMem + Vision + DFlash2 K7 已通过本机工程验证。
+同一官方27B NVFP4产物，dense DFlash2 14/14、稀疏none 15/15、稀疏DFlash2 20/20、
+36K×2 DFlash2+Vision 17/17；CTest6/6、Python合同48/48。每lane逻辑上限256K，
+实际视觉输入各38923、输出各1024，87轮真实双lane decode；显存采样峰值31151MiB，
+Windows commit94.58/95.92GiB、最小余量1.34GiB。覆盖真实零/部分/全部接受及草稿ring跨界。
+当前huihui产物没有DFlash2权重，不与下方huihui/MTP结果混用。公共受控响应与none/dense对照一致，
+但未测试两路实际满256K视觉或多轮统计质量。汇总：`out/dflash2-vision-20260928/qualification.json`。
+
+
+2026-09-28 Vision 增量：补齐媒体 query 边界、整组 KV placement、GDN/Main/MTP replay、
+可回放媒体 payload 生命周期，以及缓存媒体后的 MRoPE 文本后缀。当前用户 huihui 27B NVFP4
+产物上，4K×2 MTP 13/13、none 15/15、dense MTP对照13/13、36K×2 MTP+Vision 14/14；
+相关 CTest4/4，Linux工具合同45/45。36K组合配置各256K，实际视觉输入各38923token，
+214轮真实双lane解码，显存采样峰值28873MiB、commit91.53/95.92GiB。没有测满两路256K视觉。
+视频用例仅覆盖单帧经视频入口，未资格化真实多帧运动任务。详见
+`out/vision-adaptation-20260928/qualification.json`；原始失败报告保留。本段为先前 none/MTP + Vision 资格化，DFlash2 增量单独列于下方。
+
 原合并不能仅凭 HTTP 200 或一次长 prompt 成功判定可靠：检索 capture 没有接到实际执行路径，
 而且缓存后的工具对话可触发 KV 恢复错误。已修复下表列出的执行、容量和生命周期问题，并提供
 [可重复运行的测试管线](../../tests/e2e/README.md)。测试状态和具体配置以生成的报告为准。
 
-当前交付范围是单 GPU、单 active lane、文本生成，支持普通解码及 MTP。
-`--kvmem-window-pages 0` 保持密集模式。KVMem 模式明确拒绝 Vision、DFlash、scoring 和多 lane。
+当前代码范围是单 GPU、1–2 条 active lane、文本/视觉生成，支持普通解码、MTP 及全 local DFlash2 companion。
+`--kvmem-window-pages 0` 保持密集模式。KVMem 模式支持 `--vision` 的媒体回放，明确拒绝第一代 DFlash、含 full-attention 层的 draft companion、scoring 和超过 2 条 lane。媒体按完整页组保留，最新可见媒体与 sink 为必留项；超窗口媒体在 admission 拒绝。文本单独请求沿用原选页规则。
+每条 lane 独立持有 MeanK 索引、Q/K capture、已选历史页及 query replay 的 GDN 快照；DFlash2 另有独立 cyclic KV 快照（本机 companion 为每 lane 40 MiB）。
+`--kvmem-window-pages` 是每条 lane 的窗口；`--kv-capacity auto` 为每条 lane 预留窗口、chunk
+增长和原有 slack，上限为各自 logical context。Host KV arena 仍由所有请求共享。
+2026-09-28 双 lane 增量验证：普通解码和 MTP 共 **16/16 E2E、9/9 CTest、42/42 Python 工具测试**。
+配置为官方 Qwen3.8-27B NVFP4、INT8 KV、每 lane 4096-token 窗口、16K context、1024 chunk、
+2 GiB 共享 Host KV。两种后端各两轮，两条 lane 均实际检索回 Host 历史页并进入同一解码批次；
+8 份并发回复与各自独立执行的贪心文本完全一致。取消一条 lane 后，空槽在另一条仍生成时成功复用。
+两组报告的二进制 SHA256 一致，汇总为 `out/kvmem-tests/dual-lane-qualification-20260928.json`。
+这不覆盖所有窗口/上下文/模型组合，也不代表统计质量等价；历史单 lane 测试数字单独列于下方。
 超过 Device window 的 prompt 从头计算；缓存尚未持有检索特征，因此不发布或恢复稀疏长上下文
 continuation。窗口内仍可复用前缀，长请求后的小请求继续可用。
 
-当前修正二进制的稳定性矩阵为 **95/95 E2E、9/9 CTest**，Python 工具合同 **41/41**。
+2026-09-23 单 lane 修正二进制的历史稳定性矩阵为 **95/95 E2E、9/9 CTest**，Python 工具合同 **41/41**。
 其中完整 long profile 为 **30/30**；其余五组使用同一二进制的已通过报告。
 原 long 报告的夹具未跨窗失败保留，修正夹具后重跑全部 long 检查，未修改失败标签。
 证据汇总在 `out/kvmem-tests/service-projection-long-corrected-20260923/qualification.json`。
-这不构成质量等价：语义裁决和 1pp/95% 验收仍未完成。用户随后要求不跑完整
-500 题、先给阶段性结论；已停止刚启动的全量任务，开发模型服务全部退出，不自动重启全量。
+这不构成质量等价。原 1pp/95% 单一验收口径已被后续多轮配对 A/B 与 A/A 波动评估要求替代，
+质量等价仍未验收。用户要求不自动运行完整 500 题；此前全量任务已停止。
 
 当前实现使用 pre-RoPE block MeanK 与最后一条真实 user 消息中最多 512 token 的 Q 均值选择历史，
 模板无法证明 token 边界时才回退至新 prefill 尾部。超窗请求在 query 前保存 GDN 状态，选页后
@@ -35,6 +61,8 @@ runner 要求最后一行答案正确，另用 `exact_answer_format` 记录是�
 
 | 严重性 | 原问题及影响 | 修复和证据 |
 |---|---|---|
+| P1 | query replay 原先只恢复 GDN，DFlash2 local cyclic KV 会保留 probe 状态；回放没有 draft feature sink。 | 保存/恢复每 lane 完整 local KV 与 query frontier，清空无效 pending features，回放时按原生 target 轴重新捕获 features，沿用 draft scalar logical positions。快照纳入 startup；拒绝尚未实现的 full draft KV。 |
+| P1 | 草稿 prefill 控制只在请求开始时发布，decode/另一 lane 可以覆盖共享状态槽和 KV row。 | 每个 feature append 按当前 chunk 的实际 state slot/KV row 发布，涵盖普通 prefill、query replay 和 forced append。未新增数值内核。 |
 | P1 | `TextContext::set_kvmem_capture` 没有调用方。Q/K capture 恒空，所谓检索实际上只剩结构选择/平分。 | 在 prefill 配置 execution card 时连接 capture；真实运行检查 Q norm 非零、历史块有分数且确实从 Host promoted。 |
 | P1 | capture 固定 16 层、Q=6144、K=1024、8 slots；更换模型维度或 chunk 可能越界，raw `cudaMalloc` 也不属于启动容量计划。 | 从模型配置计算维度和 chunk slots，在 persistent arena 内规划。2048 chunk 的真模型回归覆盖扩展容量。 |
 | P1 | 每个 chunk 只累计完整块，跨 chunk 的 128-token 块丢失；Q 平均整个 prompt，历史内容淹没查询。 | 全局 block ID 选择 ring slot，保留未完成块，仅清空已发布 slot；Q 限定尾部查询范围。 |

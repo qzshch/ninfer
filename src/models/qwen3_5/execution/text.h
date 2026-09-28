@@ -131,11 +131,11 @@ public:
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_5::PreparedPromptData& input, std::uint32_t begin,
-                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
+                  std::uint32_t nominal_length, VisionPrefillSession* vision, bool finalize_at_end);
     [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen3_5::PreparedPromptData& input,
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
-                                                   VisionPrefillSession& vision,
+                                                   VisionPrefillSession* vision,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,

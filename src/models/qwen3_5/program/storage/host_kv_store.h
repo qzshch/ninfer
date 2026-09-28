@@ -4,6 +4,9 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -764,8 +767,14 @@ inline void KVAddressSpaceStore::truncate_for_replay(
 inline KVAddressSpaceStore::KVPlacementCounts KVAddressSpaceStore::apply_device_placement(KVAddressSpaceHandle handle,
 HostKVExtentStore& host_kv_extents,
 std::span<const std::uint32_t> selected_pages,
-cudaStream_t transfer_stream)
+cudaStream_t transfer_stream, const char* trace_phase)
 {
+        const bool trace = std::getenv("NINFER_KVMEM_TRANSFER_TRACE") != nullptr;
+        using TraceClock = std::chrono::steady_clock;
+        const auto trace_begin = trace ? TraceClock::now() : TraceClock::time_point{};
+        std::uint64_t d2h_bytes = 0, h2d_bytes = 0;
+        std::size_t d2h_pages = 0;
+        double d2h_ms = 0, h2d_ms = 0;
         Address& address = require_active(handle);
         for (std::size_t index = 0; index < selected_pages.size(); ++index) {
             if (selected_pages[index] >= address.page_count ||
@@ -803,12 +812,21 @@ cudaStream_t transfer_stream)
                 for (const LogicalKVPageHandle logical : stale) {
                     placement_scratch_.push_back(pages_->physical(logical));
                 }
+                const auto destination = host_kv_extents.writable_view(*backup);
+                if (trace) {
+                    d2h_pages = stale.size();
+                    d2h_bytes = plan_host_kv_transfer_work(
+                        destination.layout(), static_cast<std::uint32_t>(stale.size()), 1).payload_bytes;
+                }
+                const auto copy_begin = trace ? TraceClock::now() : TraceClock::time_point{};
                 pages_->physical_pool().copy_to_host(
-                    placement_scratch_, host_kv_extents.writable_view(*backup),
+                    placement_scratch_, destination,
                     transfer_stream);
                 if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
                     throw std::runtime_error("KV device placement stage-out transfer failed");
                 }
+                if (trace) d2h_ms = std::chrono::duration<double, std::milli>(
+                    TraceClock::now() - copy_begin).count();
                 (void)host_kv_extents.publish(std::move(*backup));
             }
             for (const std::uint32_t page : outgoing) {
@@ -845,6 +863,7 @@ cudaStream_t transfer_stream)
                 placement_scratch_.push_back(
                     pages_->reserve_device_replica(logical, address.reservation));
             }
+            const auto copy_begin = trace ? TraceClock::now() : TraceClock::time_point{};
             std::size_t begin = 0;
             while (begin < sources.size()) {
                 std::size_t end = begin + 1;
@@ -856,6 +875,8 @@ cudaStream_t transfer_stream)
                     host_kv_extents.view(sources[begin].extent)
                         .subview(sources[begin].page_offset,
                                  static_cast<std::uint32_t>(end - begin));
+                if (trace) h2d_bytes += plan_host_kv_transfer_work(
+                    source.layout(), static_cast<std::uint32_t>(end - begin), 1).payload_bytes;
                 pages_->physical_pool().copy_from_host(
                     source,
                     std::span<const DeviceKVPageHandle>(placement_scratch_.data() + begin,
@@ -866,6 +887,8 @@ cudaStream_t transfer_stream)
             if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
                 throw std::runtime_error("KV device placement stage-in transfer failed");
             }
+            if (trace) h2d_ms = std::chrono::duration<double, std::milli>(
+                TraceClock::now() - copy_begin).count();
             for (const std::uint32_t page : incoming) {
                 pages_->publish_device_replica(membership(address, page));
                 ++counts.promoted;
@@ -915,6 +938,18 @@ cudaStream_t transfer_stream)
         // block-table reads must observe this placement's final publication.
         if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
             throw std::runtime_error("KV device placement table publication failed");
+        }
+        if (trace) {
+            // Payload excludes Host arena padding. Copy times include submission and
+            // the existing stream wait; total also includes planning/table publication.
+            std::fprintf(stderr, "KVPLACEMENT phase=%s row=%d planes=%zu mapped=%u selected=%zu "
+                "demoted=%u promoted=%u d2h_pages=%zu d2h_bytes=%llu h2d_bytes=%llu "
+                "d2h_submit_wait_ms=%.6f h2d_submit_wait_ms=%.6f total_ms=%.6f\n",
+                trace_phase, bound_row(handle), pages_->physical_pool().geometry().planes.size(),
+                address.page_count, selected_pages.size(), counts.demoted, counts.promoted,
+                d2h_pages, static_cast<unsigned long long>(d2h_bytes),
+                static_cast<unsigned long long>(h2d_bytes), d2h_ms, h2d_ms,
+                std::chrono::duration<double, std::milli>(TraceClock::now() - trace_begin).count());
         }
         return counts;
     }

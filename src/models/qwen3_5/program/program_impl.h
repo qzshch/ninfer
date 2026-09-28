@@ -11,6 +11,7 @@
 
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/retrieval/block_retrieval.h"
+#include "models/qwen3_5/program/retrieval/media_window.h"
 #include "ninfer/ops/span_accumulate.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
@@ -373,6 +374,23 @@ struct SequenceState {
     std::uint32_t rebuild_tail_begin = 0;
 };
 
+// Request-local retrieval state. A second admission/prefill must never overwrite
+// the first lane's selected history, partial capture or query replay checkpoint.
+// Long sparse continuations are not published; reset this state at every admission.
+struct KvmemLaneState {
+    Tensor query_sum;
+    Tensor key_sums;
+    RetrievalIndex index;
+    std::uint32_t capture_begin = 0;
+    std::uint32_t query_begin = 0;
+    std::uint32_t query_end = 0;
+    bool query_checkpoint_valid = false;
+    std::vector<float> query;
+    std::vector<std::uint32_t> query_count;
+    std::vector<std::uint32_t> retrieved_pages;
+    std::vector<MediaPageGroup> media_groups;
+};
+
 struct SharedPrefixState {
     std::optional<SequenceKVBundle> kv;
     StateImageHandle state;
@@ -590,21 +608,10 @@ public:
     std::unique_ptr<qwen3_5::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
-    // Sparse working-set capture state: per-layer FP32 sums on the device (q single-slot
-    // across the turn, k one slot per completed 128-token block of the current chunk) and
-    // the host retrieval index they publish into at chunk and turn boundaries.
-    Tensor kvmem_q_sum_;
-    Tensor kvmem_k_sum_;
-    detail::RetrievalIndex kvmem_index_;
-    std::uint32_t kvmem_capture_begin_ = 0;
-    std::uint32_t kvmem_query_begin_ = 0;
-    std::uint32_t kvmem_query_end_ = 0;
+    std::vector<KvmemLaneState> kvmem_lanes_;
     std::optional<LinearAttentionStatePool> kvmem_query_checkpoint_;
-    bool kvmem_query_checkpoint_valid_ = false;
+    std::optional<CyclicKVCache> kvmem_draft_checkpoint_;
     std::uint32_t kvmem_capture_slots_ = 0;
-    std::vector<float> kvmem_query_;
-    std::vector<std::uint32_t> kvmem_query_count_;
-    std::vector<std::uint32_t> kvmem_retrieved_pages_;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
@@ -1191,8 +1198,9 @@ private:
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void roll_sparse_decode_window(SequenceState& sequence);
-    void consume_kvmem_chunk_capture(std::uint32_t chunk_begin, std::uint32_t chunk_end);
-    void finalize_kvmem_query(std::uint32_t prompt_tokens);
+    void consume_kvmem_chunk_capture(SequenceState& sequence, std::uint32_t chunk_begin,
+                                     std::uint32_t chunk_end);
+    void finalize_kvmem_query(SequenceState& sequence, std::uint32_t prompt_tokens);
     void copy_kvmem_query_state(SequenceState& sequence, bool restore);
     std::uint32_t advance_kvmem_query_replay(SequenceState& sequence,
                                             RequestControl::Prefill& staged,

@@ -1578,7 +1578,8 @@ public:
     KVPlacementCounts apply_device_placement(KVAddressSpaceHandle handle,
                                              HostKVExtentStore& host_kv_extents,
                                              std::span<const std::uint32_t> selected_pages,
-                                             cudaStream_t transfer_stream);
+                                             cudaStream_t transfer_stream,
+                                             const char* trace_phase = "other");
 
     // Rewind a private active sequence for replay. Unlike dense rollback, removed
     // pages may be Host-only. The retained partial tail must be Device-resident.

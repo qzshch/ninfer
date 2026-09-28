@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
 #include "models/qwen3_5/program/retrieval/query_span.h"
+#include "models/qwen3_5/program/retrieval/window_capacity.h"
 #include "models/qwen3_5/program/context.h"
 #include <algorithm>
 #include <cmath>
@@ -90,7 +91,7 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
                                      std::size_t prefill_splits,
                                      std::span<const CaptureGroup> captures,
                                      std::span<const std::uint32_t> rewrite_frontiers,
-                                     const std::optional<TokenSpan>& retrieval_query,
+                                     const PreparedPromptData& prompt,
                                      std::uint32_t window_tokens) {
     std::uint64_t prefill_units = 0;
     std::uint32_t segment_begin = reuse_base;
@@ -122,10 +123,16 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
     prefill_units += prefill_splits;
     const std::uint64_t decode_units =
         summary.effective_output_tokens == 0 ? 0ULL : summary.effective_output_tokens - 1ULL;
-    const auto query = kvmem_query_span(summary.prompt_tokens, reuse_base, retrieval_query);
+    const auto query = kvmem_query_span(summary.prompt_tokens, reuse_base, prompt.retrieval_query,
+                                       prompt.vision_items);
     const auto replay_units = kvmem_replay_quanta(summary.prompt_tokens, query.begin, window_tokens,
                                                  prefill_chunk, rewrite_frontiers);
-    return prefill_units + replay_units + decode_units;
+    const auto replay_media_splits = replay_units == 0 ? 0 : std::count_if(
+        prompt.vision_items.begin(), prompt.vision_items.end(), [&](const VisionItem& item) {
+            const auto& last = item.token_spans.back();
+            return last.begin + last.count > query.begin;
+        });
+    return prefill_units + replay_units + replay_media_splits + decode_units;
 }
 
 std::uint32_t capture_identity_tag(SpeculativeBackend backend, ProposalHead proposal,
@@ -290,10 +297,10 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     std::uint32_t backend_demand_pages = base->backend_kv_page_entitlement;
     if (kvmem_window_pages != 0) {
         const std::uint32_t main_budget =
-            kvmem_window_pages + pages_for_tokens(prefill_chunk) + 16U;
+            kvmem_lane_page_budget(capacity, prefill_chunk, kvmem_window_pages);
         const std::uint32_t backend_budget =
             main_budget + (speculative_backend == SpeculativeBackend::Mtp
-                               ? pages_for_tokens(draft_window)
+                               ? pages_for_tokens(draft_window - 1U)
                                : 0U);
         main_demand_pages    = std::min(main_demand_pages, main_budget);
         backend_demand_pages = std::min(backend_demand_pages, backend_budget);
@@ -335,6 +342,9 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
             previous_end = item.token_end;
         }
         base->vision_control_plan = std::move(vision);
+        if (kvmem_window_pages != 0) {
+            validate_media_window(media_page_groups(prompt.vision_items), kvmem_window_pages);
+        }
     }
 
     if (prompt.identity.rewrite_checkpoint) {
@@ -468,7 +478,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits,
                                base->capture_groups, prompt.identity.rewrite_execution_frontiers,
-                               prompt.retrieval_query, kvmem_window_pages * kPagedKVPageSize);
+                               prompt, kvmem_window_pages * kPagedKVPageSize);
     base->root_rebuild_work =
         rebuild_work_at_frontier(prompt, base->summary.prompt_tokens, prefill_chunk,
                                  base->capture_groups, prompt.identity.rewrite_execution_frontiers);
@@ -773,7 +783,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits,
                                plan->capture_groups, prompt.identity.rewrite_execution_frontiers,
-                               prompt.retrieval_query, kvmem_window_pages * kPagedKVPageSize);
+                               prompt, kvmem_window_pages * kPagedKVPageSize);
     std::uint64_t remaining_vision_items   = 0;
     std::uint64_t remaining_vision_patches = 0;
     if (plan->vision) {
@@ -1309,7 +1319,7 @@ void ProgramImpl::select_shared_captures(AdmissionCandidate& candidate,
     plan.summary.service_work_quanta =
         projected_service_work(plan.summary, plan.reuse_base, prefill_chunk, prefill_splits,
                                plan.capture_groups, prompt.identity.rewrite_execution_frontiers,
-                               prompt.retrieval_query, kvmem_window_pages * kPagedKVPageSize);
+                               prompt, kvmem_window_pages * kPagedKVPageSize);
     std::uint64_t vision_items   = 0;
     std::uint64_t vision_patches = 0;
     if (plan.vision) {

@@ -4,10 +4,20 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from kvmem_suite import Suite, parse_sse, validate_answer, validate_json
+from kvmem_suite import Suite, parse_sse, validate_answer, validate_json, validate_dual_lane_trace
 
 
 class ResponseContractTests(unittest.TestCase):
+    def test_two_http_requests_are_not_proof_of_parallel_sparse_execution(self):
+        placements = ("KVMEM retrieval scored=12 selected=20 promoted=3 demoted=2 lane=0\n"
+                      "KVMEM retrieval scored=11 selected=20 promoted=4 demoted=1 lane=1\n")
+        with self.assertRaisesRegex(AssertionError, 'no verified'):
+            validate_dual_lane_trace(placements, 'mtp')
+        with self.assertRaisesRegex(AssertionError, 'no verified'):
+            validate_dual_lane_trace('KVMEM decode backend=mtp lanes=2\n', 'mtp')
+        result = validate_dual_lane_trace(placements + 'KVMEM decode backend=mtp lanes=2\n', 'mtp')
+        self.assertEqual(result['retrieved_lanes'], [0, 1])
+
     def test_memory_guard_stops_only_owned_server_and_fails_report(self):
         with TemporaryDirectory() as directory:
             suite = Suite(SimpleNamespace(output=Path(directory), port=8120, profile='smoke'))

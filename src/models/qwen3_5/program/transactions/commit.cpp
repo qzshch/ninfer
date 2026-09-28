@@ -382,7 +382,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     selectors.source,
                     selectors.destination,
                     0,
-                    dflash_host_ingress};
+                    dflash_host_ingress,
+                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0};
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
                                          : workspace_plan.text_prefill);

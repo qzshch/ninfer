@@ -63,6 +63,7 @@ struct PrefillContext {
     std::int32_t state_destination_slot                     = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    std::int32_t dflash_kv_table_row = 0;
 };
 
 struct OrdinaryBatchContext {
@@ -152,7 +153,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
-                         VisionPrefillSession& vision, std::uint32_t nominal_length,
+                         VisionPrefillSession* vision, std::uint32_t nominal_length,
                          std::optional<std::uint32_t> split_frontier, bool finalize_at_end);
 
 struct MtpBridgeInput {

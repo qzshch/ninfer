@@ -7,6 +7,7 @@ include failures, incomplete SSE, startup errors, and engine errors after HTTP 2
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import json
@@ -78,9 +79,22 @@ def validate_answer(result, expected):
     return result
 
 
+def validate_dual_lane_trace(text, backend):
+    batches = re.findall(rf"KVMEM decode backend={re.escape(backend)} lanes=2\b", text)
+    retrieved = {int(lane) for scored, promoted, lane in re.findall(
+        r"KVMEM retrieval scored=(\d+) selected=\d+ promoted=(\d+) demoted=\d+ lane=(\d+)", text)
+        if int(scored) > 0 and int(promoted) > 0}
+    if not batches or retrieved != {0, 1}:
+        raise AssertionError(f"no verified sparse dual-lane execution: batches={len(batches)}, "
+                             f"retrieved_lanes={sorted(retrieved)}")
+    return {"dual_lane_rounds": len(batches), "retrieved_lanes": sorted(retrieved)}
+
+
 class Suite:
     def __init__(self, args):
         self.args = args
+        # Quality runners share this server owner and retain their single-lane default.
+        self.args.concurrency = getattr(args, "concurrency", 1)
         self.url = f"http://127.0.0.1:{args.port}"
         self.results = []
         self.proc = None
@@ -181,11 +195,14 @@ class Suite:
                    "--host", "127.0.0.1", "--port", str(self.args.port),
                    "--model-id", "kvmem-test", "--max-context", str(self.args.context),
                    "--kv-dtype", self.args.dtype, "--kv-capacity", "auto",
-                   "--kvmem-window-pages", str(self.args.window), "--max-concurrency", "1",
+                   "--kvmem-window-pages", str(self.args.window),
+                   "--max-concurrency", str(self.args.concurrency),
                    "--prefill-chunk", str(self.args.chunk), "--host-kv-mib", str(self.args.host_mib),
                    "--pending-timeout-ms", "1800000"]
         if self.args.spec == "mtp":
             command += ["--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]
+        if self.args.spec == "dflash2":
+            command += ["--spec", "dflash2", "--draft-tokens", "7"]
         return command
 
     def start(self):
@@ -249,6 +266,96 @@ class Suite:
             raise AssertionError(f"server exited ({self.proc.returncode})")
         result = self.request([{"role": "user", "content": "Reply with exactly READY."}])
         return validate_answer(result, "READY")
+
+    def lane_messages(self, marker, extra=0):
+        messages = self.long_messages(self.args.window * 64 + 1024 + extra)
+        text = messages[-1]["content"]
+        pivot = len(text) // 4
+        # The answer is only in old history, outside the retained recency window.
+        # Distinct codes with the same query also expose cross-lane page selection.
+        messages[-1]["content"] = (text[:pivot] +
+            f"\nThe special recovery code for the Aurora gateway is {marker}.\n" + text[pivot:]).replace(
+            "Reply with exactly GATEWAY.",
+            "First print the special recovery code for the Aurora gateway on its own line. "
+            "Then print every integer from 1 to 2000 "
+            "in order, separated by commas. Do not abbreviate or add explanations.")
+        return messages
+
+    def parallel_pair(self, round_index):
+        # Compare the same greedy prompts alone and batched. Reuse the two slots
+        # with different queries next round to expose stale lane-local retrieval.
+        markers = [f"AMBER-{round_index}-7193", f"COBALT-{round_index}-8426"]
+        prompts = [self.lane_messages(marker, i * 512) for i, marker in enumerate(markers)]
+        baseline = [self.request(prompt, tokens=512, stream=True) for prompt in prompts]
+        begin = self.log.stat().st_size
+        barrier = threading.Barrier(2)
+        def generate(index):
+            barrier.wait(timeout=10)
+            return self.request(prompts[index], tokens=512, stream=True)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(generate, i) for i in range(2)]
+            paired = [future.result() for future in futures]
+        trace = self.log.read_text(encoding="utf-8", errors="replace")[begin:]
+        evidence = validate_dual_lane_trace(trace, self.args.spec)
+        for i, result in enumerate(paired):
+            if result["usage"]["prompt_tokens"] <= self.args.window * 64:
+                raise AssertionError("paired request did not cross the sparse window")
+            if result["usage"]["completion_tokens"] < 256:
+                raise AssertionError("paired decode did not exercise repeated page growth")
+            if markers[i] not in result["text"] or markers[1 - i] in result["text"]:
+                raise AssertionError(f"lane answer contaminated or incorrect: {result['text'][:200]}")
+            if result["text"] != baseline[i]["text"]:
+                raise AssertionError(f"greedy batch output differs from isolated output: "
+                                     f"lane={i}, isolated={baseline[i]['text'][:800]!r}, "
+                                     f"batched={result['text'][:800]!r}")
+        return {**evidence, "isolated": baseline, "concurrent": paired,
+                "exact_greedy_matches": 2}
+
+    def cancel_one_lane(self):
+        begin = self.log.stat().st_size
+        barrier = threading.Barrier(2)
+        def survivor():
+            barrier.wait(timeout=10)
+            return self.request(self.lane_messages("SURVIVOR-9281", 512), tokens=768, stream=True)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(survivor)
+            connection = http.client.HTTPConnection("127.0.0.1", self.args.port,
+                                                    timeout=self.args.request_timeout)
+            response = None
+            try:
+                barrier.wait(timeout=10)
+                body = {"model": "kvmem-test", "messages": self.lane_messages("CANCELLED-1467"),
+                        "temperature": 0, "stream": True, "max_tokens": 2048,
+                        "chat_template_kwargs": {"enable_thinking": False}}
+                connection.request("POST", "/v1/chat/completions", json.dumps(body),
+                                   {"Content-Type": "application/json"})
+                response = connection.getresponse()
+                if response.status != 200:
+                    raise AssertionError(f"cancellation request HTTP {response.status}")
+                deadline = time.monotonic() + self.args.request_timeout
+                while True:
+                    trace = self.log.read_text(encoding="utf-8", errors="replace")[begin:]
+                    if f"KVMEM decode backend={self.args.spec} lanes=2" in trace:
+                        break
+                    if future.done() or time.monotonic() >= deadline:
+                        raise AssertionError("requests did not overlap before cancellation")
+                    time.sleep(0.05)
+            finally:
+                if response is not None:
+                    response.close()
+                connection.close()
+            recovered = self.health()
+            if future.done():
+                raise AssertionError("cancelled slot was not reused while the other lane was active")
+            survivor_result = future.result()
+        if "SURVIVOR-9281" not in survivor_result["text"] or "CANCELLED-1467" in survivor_result["text"]:
+            raise AssertionError("surviving lane returned incorrect content")
+        if survivor_result["usage"]["completion_tokens"] < 512:
+            raise AssertionError("surviving lane stopped prematurely")
+        trace = self.log.read_text(encoding="utf-8", errors="replace")[begin:]
+        if not re.search(r"cancelled during transport.*HTTP 499", trace):
+            raise AssertionError("engine did not confirm cancellation of the disconnected request")
+        return {"survivor": survivor_result, "after_cancel": recovered}
 
     def disconnect(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.args.port, timeout=60)
@@ -470,6 +577,12 @@ class Suite:
         if self.results[-1]["status"] == "failed":
             return
         self.case("json-generation", self.health)
+        if self.args.profile == "concurrency":
+            for repeat in range(self.args.repeats):
+                self.case(f"parallel-sparse-pair-{repeat}", lambda r=repeat: self.parallel_pair(r))
+            self.case("cancel-one-lane-and-reuse", self.cancel_one_lane)
+            self.case("final-health", self.health)
+            return
         if self.args.profile == "replay-budget":
             self.case("query-replay-service-budget", self.replay_service_budget)
             self.case("generation-after-replay-budget", self.health)
@@ -523,12 +636,16 @@ def main():
     p.add_argument("--chunk", type=int, default=1024)
     p.add_argument("--host-mib", type=int, default=12288)
     p.add_argument("--dtype", choices=["bf16", "int8", "fp8", "nvfp4", "k8v4"], default="int8")
-    p.add_argument("--spec", choices=["none", "mtp"], default="mtp")
-    p.add_argument("--profile", choices=["smoke", "regression", "long", "capacity", "penalty", "replay-cancel", "replay-budget"], default="regression")
+    p.add_argument("--spec", choices=["none", "mtp", "dflash2"], default="mtp")
+    p.add_argument("--concurrency", type=int, choices=[1, 2], default=1)
+    p.add_argument("--profile", choices=["smoke", "regression", "long", "capacity", "penalty", "replay-cancel", "replay-budget", "concurrency"], default="regression")
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--startup-timeout", type=float, default=600)
     p.add_argument("--request-timeout", type=float, default=1800)
     args = p.parse_args()
+    if args.profile == "concurrency" and (args.concurrency != 2 or args.window == 0 or
+                                           args.context < args.window * 64 + 4096):
+        p.error("concurrency profile requires two lanes and context >= window * 64 + 4096")
     args.output.mkdir(parents=True, exist_ok=False)
     suite = Suite(args)
     def interrupted(signum, _frame):

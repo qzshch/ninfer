@@ -1574,14 +1574,17 @@ void ProgramImpl::ordered_reset(SequenceState& sequence) {
 // and the entitlement re-clamps, so unbounded generation rings the window instead of
 // exhausting it. Idempotent; runs at a decode GPU boundary before KV growth mapping.
 void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
+    const auto& sparse = kvmem_lanes_.at(sequence.lane);
     constexpr std::uint32_t slack_pages = 2U;
     const std::uint32_t mapped_pages = text_kv_addresses->mapped_pages(sequence.kv->text);
     if (mapped_pages > kvmem_window_pages) {
         requests[sequence.lane].publish_continuation = false;
         const auto window =
-            decode_window_page_set(mapped_pages, kvmem_window_pages, kvmem_retrieved_pages_);
+            media_window_page_set(mapped_pages, kvmem_window_pages, sparse.retrieved_pages,
+                                  sparse.media_groups);
         text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
-                                                  device.transfer_stream);
+            device.transfer_stream,
+            requests[sequence.lane].lifecycle == Lifecycle::Prefilling ? "prefill-ensure" : "decode");
         // Membership keeps growing with the conversation, so the clamp targets
         // mapped+slack (never a fixed page count): the reservation lands on the slack
         // margin regardless of how far the mapped prefix extends past the window.
@@ -1597,11 +1600,13 @@ void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
         const std::uint32_t backend_mapped =
             backend_kv_addresses->mapped_pages(*sequence.kv->backend);
         if (backend_mapped > kvmem_window_pages + lead_pages) {
-            const auto backend_window = decode_window_page_set(
-                backend_mapped, kvmem_window_pages + lead_pages, kvmem_retrieved_pages_);
+            const auto backend_window = media_window_page_set(
+                backend_mapped, kvmem_window_pages + lead_pages, sparse.retrieved_pages,
+                sparse.media_groups);
             backend_kv_addresses->apply_device_placement(*sequence.kv->backend,
                                                          *host_kv_extents, backend_window,
-                                                         device.transfer_stream);
+                device.transfer_stream,
+                requests[sequence.lane].lifecycle == Lifecycle::Prefilling ? "prefill-ensure" : "decode");
             const std::uint32_t backend_clamped = std::min(
                 (capacity + kPagedKVPageSize - 1U) / kPagedKVPageSize, backend_mapped + slack_pages);
             if (backend_kv_addresses->entitlement(*sequence.kv->backend) != backend_clamped) {
