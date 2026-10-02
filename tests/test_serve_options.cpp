@@ -30,17 +30,20 @@ int main() {
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
-    failures += check(defaults.allow_context_retention && context_cache_participation_enabled(defaults),
-                      "context retention is not enabled by default");
-    const auto no_retention = parse({"ninfer-serve", "model.ninfer", "--no-context-retention",
-                                    "--kvmem-window-pages", "576", "--host-kv-mib", "4096",
-                                    "--max-concurrency", "2"});
-    failures += check(!no_retention.allow_context_retention && no_retention.allow_prefix_reuse &&
-                          !context_cache_participation_enabled(no_retention) &&
-                          no_retention.context_cache.enabled &&
-                          no_retention.context_cache.host_kv_capacity_bytes == (4096ULL << 20) &&
-                          no_retention.kvmem_window_pages == 576 && no_retention.max_concurrency == 2,
-                      "no-context-retention changed sparse Host storage/admission or retained request participation");
+    failures +=
+        check(defaults.allow_context_retention && context_cache_participation_enabled(defaults),
+              "context retention is not enabled by default");
+    const auto no_retention =
+        parse({"ninfer-serve", "model.ninfer", "--no-context-retention", "--kvmem-window-pages",
+               "576", "--host-kv-mib", "4096", "--max-concurrency", "2"});
+    failures +=
+        check(!no_retention.allow_context_retention && no_retention.allow_prefix_reuse &&
+                  !context_cache_participation_enabled(no_retention) &&
+                  no_retention.context_cache.enabled &&
+                  no_retention.context_cache.host_kv_capacity_bytes == (4096ULL << 20) &&
+                  no_retention.kvmem_window_pages == 576 && no_retention.max_concurrency == 2,
+              "no-context-retention changed sparse Host storage/admission or retained request "
+              "participation");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
@@ -91,6 +94,25 @@ int main() {
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
                           kv_help.find("k8v4") != std::string::npos,
                       "serve help omits a production KV storage mode");
+
+    const ServeOptions dspark =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "7"});
+    failures += check(dspark.speculative.backend == ninfer::SpeculativeBackend::DSpark &&
+                          dspark.speculative.draft_tokens == 7 &&
+                          dspark.speculative.proposal_head == ninfer::ProposalHead::Full,
+                      "DSpark fixed-window options did not select the full head");
+    for (const auto& invalid : std::vector<std::vector<std::string>>{
+             {"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "8"},
+             {"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "7",
+              "--lm-head-draft"}}) {
+        bool rejected = false;
+        try {
+            (void)parse(invalid);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "DSpark accepted unsupported window or indexed head");
+    }
+    failures += check(serve_usage_text("ninfer-serve").find("dspark") != std::string::npos,
+                      "serve help omits DSpark");
 
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
@@ -251,10 +273,11 @@ int main() {
     GenerationRequest request;
     request.max_tokens   = 1;
     const auto semantics = resolve_prompt_semantics(request, defaults);
-    failures += check(!to_request_options(request, no_retention, semantics,
-                                         context_cache_participation_enabled(no_retention))
-                           .execution.allow_prefix_reuse,
-                      "no-context-retention did not reach Program's complete no-publication policy");
+    failures +=
+        check(!to_request_options(request, no_retention, semantics,
+                                  context_cache_participation_enabled(no_retention))
+                   .execution.allow_prefix_reuse,
+              "no-context-retention did not reach Program's complete no-publication policy");
     failures += check(!semantics.reasoning_effort && !semantics.enable_thinking &&
                           !semantics.reasoning_effort,
                       "omitted reasoning effort did not resolve to the template default");
@@ -302,8 +325,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
-    failures += check(serve_usage_text("ninfer-serve").find("--no-context-retention") != std::string::npos,
-                      "serve help omits no-context-retention");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--no-context-retention") != std::string::npos,
+              "serve help omits no-context-retention");
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
     failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=

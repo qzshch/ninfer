@@ -77,11 +77,12 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
+    DSpark,
 };
 
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
-    // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
+    // Startup-fixed K: MTP 1..5; DFlash/DFlash2 1..15; DSpark 1..7 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
 };
@@ -166,8 +167,8 @@ struct EngineOptions {
     // Sparse KV working-set window in 64-token pages for prefill rolling; 0 keeps the
     // dense full-residency semantics. Experimental sparse mode supports 1..3 active
     // lanes; higher concurrency is rejected. Device/Host headroom must cover all lanes.
-    std::uint32_t kvmem_window_pages   = 0;
-    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    std::uint32_t kvmem_window_pages = 0;
+    KvCacheStorage kv_cache          = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -647,18 +648,18 @@ struct PreparationControl {
 enum class KvmemPlacementPhase : std::uint8_t { Prefill, Retrieval, Replay, Decode };
 
 struct KvmemPlacementStats {
-    std::uint64_t calls = 0;
-    std::uint64_t no_copy_calls = 0;
-    std::uint64_t demoted_pages = 0;
+    std::uint64_t calls          = 0;
+    std::uint64_t no_copy_calls  = 0;
+    std::uint64_t demoted_pages  = 0;
     std::uint64_t promoted_pages = 0;
-    std::uint64_t d2h_pages = 0;
-    std::uint64_t d2h_bytes = 0;
-    std::uint64_t h2d_bytes = 0;
+    std::uint64_t d2h_pages      = 0;
+    std::uint64_t d2h_bytes      = 0;
+    std::uint64_t h2d_bytes      = 0;
     // Copy submit+existing wait and table-publication wait are subsets of total Host wall.
-    std::uint64_t d2h_submit_wait_ns = 0;
-    std::uint64_t h2d_submit_wait_ns = 0;
+    std::uint64_t d2h_submit_wait_ns  = 0;
+    std::uint64_t h2d_submit_wait_ns  = 0;
     std::uint64_t publication_wait_ns = 0;
-    std::uint64_t total_host_wall_ns = 0;
+    std::uint64_t total_host_wall_ns  = 0;
 };
 
 // Request-owned direct sparse-KV diagnostics. These are observed Host wall/blocked
@@ -667,22 +668,22 @@ struct KvmemDiagnostics {
     bool enabled = false;
     // [Prefill,Retrieval,Replay,Decode][Main,Backend]; physical rows do not identify requests.
     std::array<std::array<KvmemPlacementStats, 2>, 4> placement{};
-    std::uint64_t key_capture_calls = 0;
-    std::uint64_t key_capture_d2h_bytes = 0;
-    std::uint64_t key_capture_submit_wait_ns = 0;
-    std::uint64_t key_capture_host_wall_ns = 0;
-    std::uint64_t query_capture_calls = 0;
-    std::uint64_t query_capture_d2h_bytes = 0;
+    std::uint64_t key_capture_calls            = 0;
+    std::uint64_t key_capture_d2h_bytes        = 0;
+    std::uint64_t key_capture_submit_wait_ns   = 0;
+    std::uint64_t key_capture_host_wall_ns     = 0;
+    std::uint64_t query_capture_calls          = 0;
+    std::uint64_t query_capture_d2h_bytes      = 0;
     std::uint64_t query_capture_submit_wait_ns = 0;
-    std::uint64_t query_capture_host_wall_ns = 0;
-    std::uint64_t selection_calls = 0;
-    std::uint64_t scored_blocks = 0;
-    std::uint64_t selection_host_wall_ns = 0;
-    std::uint64_t replay_tokens = 0;
-    std::uint64_t replay_units = 0;
+    std::uint64_t query_capture_host_wall_ns   = 0;
+    std::uint64_t selection_calls              = 0;
+    std::uint64_t scored_blocks                = 0;
+    std::uint64_t selection_host_wall_ns       = 0;
+    std::uint64_t replay_tokens                = 0;
+    std::uint64_t replay_units                 = 0;
     // Entire scheduler replay step, including nested replay placement and existing waits.
-    std::uint64_t replay_step_host_wall_ns = 0;
-    std::uint64_t replay_execution_host_ns = 0;
+    std::uint64_t replay_step_host_wall_ns        = 0;
+    std::uint64_t replay_execution_host_ns        = 0;
     std::uint64_t replay_execution_device_wait_ns = 0;
 };
 
@@ -726,12 +727,12 @@ struct GenerationEngineTiming {
 };
 
 struct SpeculativeDiagnosticSample {
-    std::uint64_t round_index = 0; // includes zero-proposal fallback, scoped to one request
-    std::uint32_t lane = 0;
-    std::uint32_t frontier = 0;
-    std::uint32_t licensed_tokens = 0;
+    std::uint64_t round_index      = 0; // includes zero-proposal fallback, scoped to one request
+    std::uint32_t lane             = 0;
+    std::uint32_t frontier         = 0;
+    std::uint32_t licensed_tokens  = 0;
     std::uint32_t published_tokens = 0;
-    bool publication_recorded = false;
+    bool publication_recorded      = false;
     SpeculativeProposalDiagnostic first;
     SpeculativeProposalDiagnostic accepted;
     DFlashSupportFrontier first_support_frontier;
@@ -764,9 +765,9 @@ struct SpeculativeStats {
     std::uint64_t published_output_tokens   = 0;
     std::uint64_t published_accepted_tokens = 0;
     std::uint64_t discarded_licensed_tokens = 0;
-    std::uint32_t diagnostic_max_rounds = 0;
-    std::uint32_t diagnostic_every = 1;
-    bool support_frontier_enabled = false;
+    std::uint32_t diagnostic_max_rounds     = 0;
+    std::uint32_t diagnostic_every          = 1;
+    bool support_frontier_enabled           = false;
     std::vector<SpeculativeDiagnosticSample> diagnostic_samples;
 };
 
@@ -984,30 +985,39 @@ enum class RuntimeLaneState : std::uint8_t {
     TerminalPending,
 };
 
-[[nodiscard]] inline constexpr const char* runtime_lane_state_name(RuntimeLaneState state) noexcept {
+[[nodiscard]] inline constexpr const char*
+runtime_lane_state_name(RuntimeLaneState state) noexcept {
     switch (state) {
-    case RuntimeLaneState::Idle: return "idle";
-    case RuntimeLaneState::Materializing: return "materializing";
-    case RuntimeLaneState::Prefill: return "prefill";
-    case RuntimeLaneState::DecodeReady: return "decode_ready";
-    case RuntimeLaneState::ControlReady: return "control_ready";
-    case RuntimeLaneState::CapturePending: return "capture_pending";
-    case RuntimeLaneState::TerminalPending: return "terminal_pending";
+    case RuntimeLaneState::Idle:
+        return "idle";
+    case RuntimeLaneState::Materializing:
+        return "materializing";
+    case RuntimeLaneState::Prefill:
+        return "prefill";
+    case RuntimeLaneState::DecodeReady:
+        return "decode_ready";
+    case RuntimeLaneState::ControlReady:
+        return "control_ready";
+    case RuntimeLaneState::CapturePending:
+        return "capture_pending";
+    case RuntimeLaneState::TerminalPending:
+        return "terminal_pending";
     }
     return "idle";
 }
 
 using RuntimeDirectSparseLaneStats = RuntimeDirectSparseLaneObservation<KvmemDiagnostics>;
-using RuntimeDirectSparseSampling = RuntimeDirectSparseSamplingObservation<KvmemDiagnostics, kMaximumConcurrency>;
+using RuntimeDirectSparseSampling =
+    RuntimeDirectSparseSamplingObservation<KvmemDiagnostics, kMaximumConcurrency>;
 
 struct RuntimeLaneStats {
     // Lifetime counters of this physical lane, never reset when its request changes.
     std::uint64_t computed_prefill_tokens = 0;
     std::uint64_t committed_decode_tokens = 0;
-    std::uint64_t decode_rounds = 0;
+    std::uint64_t decode_rounds           = 0;
     // Current boundary gauges; zero means no current request. Engine and HTTP IDs differ.
     std::uint64_t engine_request_id = 0;
-    RuntimeLaneState state = RuntimeLaneState::Idle;
+    RuntimeLaneState state          = RuntimeLaneState::Idle;
 };
 
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last

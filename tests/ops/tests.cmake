@@ -140,3 +140,11 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 ninfer_add_op_test(ninfer_dflash_support_frontier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_support_frontier.cpp"
   LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_dspark_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dspark.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_dspark_q8_a16_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear/test_dspark_q8_a16.cpp"
+  LIBRARIES ninfer_linear_test_support ninfer_ops)

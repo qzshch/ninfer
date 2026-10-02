@@ -54,6 +54,9 @@ std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend back
     if (capacity == 0 || draft_window == 0 || draft_window > 15) {
         throw std::invalid_argument("invalid masked draft graph dimensions");
     }
+    if (backend == SpeculativeBackend::DSpark) {
+        return causal_resource_profiles(capacity, draft_window + 1U);
+    }
     if (backend == SpeculativeBackend::DFlash2) {
         auto profiles = graph_profiles_through(capacity - 1, {96, 511, 2047, 8191, 32767});
         for (std::size_t i = 0; i < profiles.size(); ++i) {

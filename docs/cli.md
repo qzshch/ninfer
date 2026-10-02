@@ -213,7 +213,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
+| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15`; DSpark `1..7` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
@@ -296,3 +296,5 @@ from this one-request interface; the persistent Engine and server routes own cro
 optional Host backing.
 
 All weight, sequence, workspace, and graph allocations are released when the Engine is destroyed.
+
+For the experimental full-head DSpark route, see [DSpark](dspark.md).

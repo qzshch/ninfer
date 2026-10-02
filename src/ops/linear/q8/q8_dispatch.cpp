@@ -20,6 +20,7 @@ constexpr ShapeEntry shape(ShapeSelector select) {
 }
 
 constexpr std::array kShapes{
+    shape<Q8N5120K5120>(select_q8_n5120_k5120),     shape<Q8N5120K40960>(select_q8_n5120_k40960),
     shape<Q8N1024K2048>(select_q8_n1024_k2048),     shape<Q8N1024K5120>(select_q8_n1024_k5120),
     shape<Q8N2048K4096>(select_q8_n2048_k4096),     shape<Q8N2048K4608>(select_q8_n2048_k4608),
     shape<Q8N2048K16384>(select_q8_n2048_k16384),   shape<Q8N4608K4608>(select_q8_n4608_k4608),

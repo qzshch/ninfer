@@ -32,7 +32,7 @@ def _optional(model, recipe):
             else:
                 format = Q5
             _assign(recipe, name, format)
-        elif name.startswith(("mtp/", "dflash/", "dflash2/")):
+        elif name.startswith(("mtp/", "dflash/", "dflash2/", "dspark/")):
             if name.endswith(
                 (
                     "/moe/router",
@@ -44,7 +44,7 @@ def _optional(model, recipe):
             ):
                 continue
             _assign(recipe, name, Q8)
-    for backend in ("dflash", "dflash2"):
+    for backend in ("dflash", "dflash2", "dspark"):
         if backend not in model.components:
             continue
         layers = model.components[backend]["config"]["num_hidden_layers"]

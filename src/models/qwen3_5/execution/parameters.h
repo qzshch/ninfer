@@ -7,6 +7,7 @@
 #include <memory>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <stdexcept>
 #include <variant>
 #include <vector>
@@ -102,6 +103,7 @@ struct DynamicConvParameters {
 struct DraftBlockParameters {
     Tensor input_norm, post_attention_norm;
     LinearParameters query_key_value, context_key, context_value;
+    std::optional<std::array<LinearParameters, 3>> separate_qkv;
     Tensor query_norm, key_norm;
     LinearParameters output;
     DenseParameters mlp;
@@ -118,6 +120,7 @@ struct DraftParameters {
     Tensor context_norm, final_norm;
     std::vector<DraftBlockParameters> layers;
     std::optional<SelectorParameters> selector;
+    std::optional<std::pair<Tensor, Tensor>> markov;
     LinearParameters output_head;
 };
 

@@ -377,3 +377,5 @@ support is checked by consumers during preparation, resource queries, warmup or 
 valid file may need additional Op support before its chosen combination can run. Exercise the
 phases and optional components you intend to use through the normal [CLI](cli.md) or
 [serving](serving.md) route.
+
+[DSpark](dspark.md) documents the official nested configuration and encoded-target attachment tool.

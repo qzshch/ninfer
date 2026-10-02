@@ -278,6 +278,10 @@ image/video Vision prompts. Qwen3.8-27B artifacts with the DFlash2 companion wei
 `--spec dflash2 --draft-tokens 7` for the same Text/Vision Engine path, with draft counts 1..15
 and either full or optimized proposal heads.
 
+An explicitly attached DSpark drafter supports experimental fixed K1..7 with the full
+proposal head and the same Text/Vision path; see [DSpark](docs/dspark.md) for geometry,
+conversion, mathematical contracts and qualification limits.
+
 The product boundary remains intentionally small:
 
 - one RTX 5090 and one resident model per Engine;

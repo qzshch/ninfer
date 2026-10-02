@@ -246,6 +246,10 @@ class ArtifactWriter:
             self.write_region(object_id, offset, chunk)
             offset += len(chunk)
 
+    def _publish_completed_file(self, source: Path, target: Path) -> None:
+        """Atomically publish a complete file, failing if target already exists."""
+        os.link(source, target)
+
     def finish(self) -> Directory:
         if self._finished:
             return self.directory
@@ -267,10 +271,10 @@ class ArtifactWriter:
                 os.close(self._fds.pop())
             for index in [*range(1, len(self._temporary)), 0]:
                 target = self._destinations[index]
-                os.link(self._temporary[index], target)
+                self._publish_completed_file(self._temporary[index], target)
                 self._published.append(target)
             for temporary in self._temporary:
-                temporary.unlink()
+                temporary.unlink(missing_ok=True)
             self._temporary.clear()
             self._finished = True
             return self.directory

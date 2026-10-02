@@ -228,8 +228,13 @@ public:
                     DraftBlockParameters result;
                     result.input_norm          = tensor(layer.input_norm);
                     result.post_attention_norm = tensor(layer.post_attention_norm);
-                    result.query_key_value     = ops::prepare_attn_input_proj_weights(
-                        model_.input(a.query), model_.input(a.key), model_.input(a.value));
+                    if (model_.config().draft->dspark) {
+                        result.separate_qkv =
+                            std::array{linear(a.query), linear(a.key), linear(a.value)};
+                    } else {
+                        result.query_key_value = ops::prepare_attn_input_proj_weights(
+                            model_.input(a.query), model_.input(a.key), model_.input(a.value));
+                    }
                     result.context_key   = linear(a.context_key);
                     result.context_value = linear(a.context_value);
                     result.query_norm    = tensor(a.query_norm);
@@ -248,6 +253,7 @@ public:
                                               tensor(w.selector->predecessor_codebook),
                                               tensor(w.selector->successor_codebook)};
         }
+        if (w.markov) { out.markov = std::pair{tensor(w.markov->first), tensor(w.markov->second)}; }
         return out;
     }
 

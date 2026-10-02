@@ -7,6 +7,8 @@
 
 #include "core/nvtx.h"
 #include "ninfer/ops/argmax.h"
+#include "ninfer/ops/dspark.h"
+#include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/rmsnorm_rope.h"
@@ -218,7 +220,12 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                                                     dimension(config.attention.num_key_value_heads),
                                                     layer_width, batch});
                 Tensor position_batch = layer_positions.view({layer_width, batch});
-                if (local_layer) {
+                if (config.dspark) {
+                    ops::dspark_context_append(
+                        key_batch, value_batch, position_batch, local_counts, lanes,
+                        dflash_state(state).local_layer(config.compact_layer_index(layer)),
+                        state.execution.device.stream);
+                } else if (local_layer) {
                     ops::kv_cache_append_prefix(
                         key_batch, value_batch, position_batch, local_counts, lanes, local_envelope,
                         dflash_state(state).local_layer(config.compact_layer_index(layer)),
@@ -442,8 +449,18 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     query_raw.view({dimension(config.attention.query_width()), columns});
                 Tensor key_flat = key_raw.view({dimension(config.attention.key_width()), columns});
                 Tensor value_flat = value.view({dimension(config.attention.key_width()), columns});
-                ops::attn_input_proj(roots.hidden, weight.query_key_value.weight, query_flat,
-                                     key_flat, value_flat, state.execution.device.stream);
+                if (config.dspark) {
+                    const auto& projections = weight.separate_qkv.value();
+                    project(roots.hidden, projections[0], query_flat, state.execution.work,
+                            state.execution.device.stream);
+                    project(roots.hidden, projections[1], key_flat, state.execution.work,
+                            state.execution.device.stream);
+                    project(roots.hidden, projections[2], value_flat, state.execution.work,
+                            state.execution.device.stream);
+                } else {
+                    ops::attn_input_proj(roots.hidden, weight.query_key_value.weight, query_flat,
+                                         key_flat, value_flat, state.execution.device.stream);
+                }
                 Tensor query =
                     roots.query.view({dimension(config.attention.head_dim),
                                       dimension(config.attention.num_attention_heads), columns});
@@ -468,7 +485,13 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 Tensor attention_batch = roots.attention.view(
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads), width, batch_size});
-                if (config.layer_types[layer] == DraftAttentionKind::SlidingAttention) {
+                if (config.dspark) {
+                    ops::dspark_sliding_attention(
+                        query_batch, key_batch, value_batch, positions, valid_columns,
+                        state_destinations,
+                        dflash_state(state).local_layer(config.compact_layer_index(layer)),
+                        attention_batch, state.execution.device.stream);
+                } else if (config.layer_types[layer] == DraftAttentionKind::SlidingAttention) {
                     ops::sliding_window_attention(
                         query_batch, key_batch, value_batch, positions, valid_columns,
                         state_destinations,
@@ -491,9 +514,18 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                         envelopes.full, state.execution.work, attention_batch,
                         state.execution.device.stream);
                 }
-                project_add(
-                    roots.attention.view({dimension(config.attention.query_width()), columns}),
-                    weight.output, residual, state.execution.work, state.execution.device.stream);
+                auto attention_flat =
+                    roots.attention.view({dimension(config.attention.query_width()), columns});
+                if (config.dspark) {
+                    auto projected = state.execution.work.alloc(
+                        DType::BF16, {dimension(target.hidden_size), columns});
+                    project(attention_flat, weight.output, projected, state.execution.work,
+                            state.execution.device.stream);
+                    ops::residual_add(projected, residual, state.execution.device.stream);
+                } else {
+                    project_add(attention_flat, weight.output, residual, state.execution.work,
+                                state.execution.device.stream);
+                }
             }
             {
                 nvtx::ScopedRange mlp_range(nvtx::Name::DFlashMlp, nvtx::Category::PostMixer,
@@ -504,8 +536,16 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                              roots.hidden, state.execution.device.stream);
                 project_swiglu(roots.hidden, weight.mlp.gate_up, roots.intermediate,
                                state.execution.work, state.execution.device.stream);
-                project_add(roots.intermediate, weight.mlp.down, residual, state.execution.work,
+                if (config.dspark) {
+                    auto projected = state.execution.work.alloc(
+                        DType::BF16, {dimension(target.hidden_size), columns});
+                    project(roots.intermediate, weight.mlp.down, projected, state.execution.work,
                             state.execution.device.stream);
+                    ops::residual_add(projected, residual, state.execution.device.stream);
+                } else {
+                    project_add(roots.intermediate, weight.mlp.down, residual, state.execution.work,
+                                state.execution.device.stream);
+                }
             }
         }
 
@@ -519,7 +559,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
             static_cast<std::size_t>(dimension(target.hidden_size)) * width * element_bytes;
         const auto* source =
             static_cast<const std::byte*>(residual.data) +
-            static_cast<std::size_t>(dimension(target.hidden_size)) * element_bytes;
+            (config.dspark
+                 ? 0U
+                 : static_cast<std::size_t>(dimension(target.hidden_size)) * element_bytes);
         CUDA_CHECK(cudaMemcpy2DAsync(packed.data, row_bytes, source, source_pitch, row_bytes,
                                      static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
                                      state.execution.device.stream));
@@ -535,9 +577,20 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 {dimension(target.vocab_size), static_cast<std::int32_t>(k) * batch_size});
             project(proposal_hidden, state.execution.parameters.draft->output_head, logits,
                     state.execution.work, state.execution.device.stream);
-            ops::argmax(logits, flat_drafts,
-                        dimension(state.execution.parameters.model.resources().public_token_count),
-                        state.execution.device.stream);
+            if (config.dspark) {
+                const auto& markov = state.execution.parameters.draft->markov.value();
+                auto logits_batch  = logits.view(
+                    {dimension(target.vocab_size), static_cast<std::int32_t>(k), batch_size});
+                ops::dspark_markov_greedy(
+                    logits_batch, markov.first, markov.second, anchors,
+                    dimension(state.execution.parameters.model.resources().public_token_count),
+                    state.execution.work, drafts, state.execution.device.stream);
+            } else {
+                ops::argmax(
+                    logits, flat_drafts,
+                    dimension(state.execution.parameters.model.resources().public_token_count),
+                    state.execution.device.stream);
+            }
         } else {
             if (!state.execution.parameters.proposal.has_value()) {
                 throw std::logic_error("optimized DFlash proposal head is unavailable");
@@ -643,21 +696,24 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                                    : Tensor{},
                     .proposal_q =
                         frame.proposal_q.data ? frame.proposal_q.slice(2, 0, batch_size) : Tensor{},
-                    .frontiers       = frontiers,
-                    .anchors         = anchors,
-                    .licensed_tokens = licensed_tokens,
-                    .licensed_counts = licensed_counts,
-                    .accepted_drafts = accepted,
-                    .selected_hidden = selected_hidden,
-                    .replay_records  = state.execution.replay_records,
-                    .sampling        = frame.sampling,
-                    .feature_sink    = &sink,
-                    .diagnostic_mask = state.diagnostic_mask.data
-                                           ? state.diagnostic_mask.slice(0, 0, batch_size) : Tensor{},
+                    .frontiers          = frontiers,
+                    .anchors            = anchors,
+                    .licensed_tokens    = licensed_tokens,
+                    .licensed_counts    = licensed_counts,
+                    .accepted_drafts    = accepted,
+                    .selected_hidden    = selected_hidden,
+                    .replay_records     = state.execution.replay_records,
+                    .sampling           = frame.sampling,
+                    .feature_sink       = &sink,
+                    .diagnostic_mask    = state.diagnostic_mask.data
+                                              ? state.diagnostic_mask.slice(0, 0, batch_size)
+                                              : Tensor{},
                     .diagnostic_packets = state.diagnostic_packets.data
-                                              ? state.diagnostic_packets.slice(2, 0, batch_size) : Tensor{},
-                    .support_frontiers = state.support_frontiers.data
-                        ? state.support_frontiers.slice(2, 0, batch_size) : Tensor{},
+                                              ? state.diagnostic_packets.slice(2, 0, batch_size)
+                                              : Tensor{},
+                    .support_frontiers  = state.support_frontiers.data
+                                              ? state.support_frontiers.slice(2, 0, batch_size)
+                                              : Tensor{},
                 },
                 target_envelope);
         }

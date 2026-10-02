@@ -219,6 +219,9 @@ def vision_config(source: dict, text: dict) -> dict:
 
 
 def draft_config(raw: dict, target: dict, backend: str) -> dict:
+    if backend == "dspark":
+        from .dspark import dspark_config
+        return dspark_config(raw, target)
     architecture = "DFlash2DraftModel" if backend == "dflash2" else "DFlashDraftModel"
     _fixed(raw, "architectures", [architecture], backend)
     _fixed(raw, "model_type", "qwen3", backend)
@@ -886,6 +889,10 @@ class _Builder:
                         (2 * taps * groups, h),
                         inputs=(p + branch + "_input",),
                     )
+        if backend == "dspark":
+            for role, field in (("predecessor", "markov_w1"), ("successor", "markov_w2")):
+                self.add(backend + "/markov/" + role, store,
+                         "markov_head." + field + ".weight", (target["vocab_size"], 256))
         if backend == "dflash2":
             rank = draft["selector_rank"]
             self.add(
@@ -918,6 +925,7 @@ def build_model(
         "mtp",
         "dflash",
         "dflash2",
+        "dspark",
     }:
         raise ValueError("select text and supported optional components")
     companions = {} if companions is None else companions
@@ -931,7 +939,7 @@ def build_model(
     if "mtp" in selected:
         architecture = "Qwen3_5MoeMTP" if "num_experts" in config else "Qwen3_5MTP"
         records["mtp"] = {"config": {"architectures": [architecture]}, "target": "text"}
-    for backend in ("dflash", "dflash2"):
+    for backend in ("dflash", "dflash2", "dspark"):
         if backend in selected:
             if backend not in companions:
                 raise ValueError(f"selected {backend} requires its source")
@@ -962,7 +970,7 @@ def build_model(
         else "lm_head.weight"
     )
     head_inputs = ("text/final_hidden",) + tuple(
-        c + "/final_hidden" for c in ("mtp", "dflash", "dflash2") if c in selected
+        c + "/final_hidden" for c in ("mtp", "dflash", "dflash2", "dspark") if c in selected
     )
     builder.add("text/output_head", base, head_source, (r, h), inputs=head_inputs)
     builder.add("text/final_norm", base, text_prefix + "norm.weight", (h,))
@@ -987,7 +995,7 @@ def build_model(
         builder.block("mtp/layers/0/", "mtp.layers.0.", base, config, "full_attention")
     if "vision" in selected:
         builder.vision(base, records["vision"]["config"], h)
-    for backend in ("dflash", "dflash2"):
+    for backend in ("dflash", "dflash2", "dspark"):
         if backend in selected:
             if (
                 backend == "dflash2"

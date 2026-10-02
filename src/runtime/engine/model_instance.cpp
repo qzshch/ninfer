@@ -80,8 +80,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             options.purpose != EnginePurpose::Generation ||
             (options.speculative.backend != SpeculativeBackend::None &&
              options.speculative.backend != SpeculativeBackend::Mtp &&
-             options.speculative.backend != SpeculativeBackend::DFlash2)) {
-            throw std::invalid_argument("KVMem requires one to three lanes with none, MTP or DFlash2 speculation");
+             options.speculative.backend != SpeculativeBackend::DFlash2 &&
+             options.speculative.backend != SpeculativeBackend::DSpark)) {
+            throw std::invalid_argument(
+                "KVMem requires one to three lanes with none, MTP, DFlash2 or DSpark speculation");
         }
         if (!options.context_cache.enabled || options.context_cache.host_kv_capacity_bytes == 0) {
             throw std::invalid_argument("KVMem requires an enabled Host KV arena");
@@ -205,8 +207,8 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
         // + sink pages transiently before the demote runs).
         effective_kv_capacity = KvCapacityPolicy::explicit_capacity(
             models::qwen3_5::detail::kvmem_pool_page_budget(
-                options.max_context, options.prefill_chunk,
-                options.kvmem_window_pages, options.max_concurrency) *
+                options.max_context, options.prefill_chunk, options.kvmem_window_pages,
+                options.max_concurrency) *
             static_cast<std::uint32_t>(kPagedKVPageSize));
     }
     auto resolution = resolve_kv_capacity(effective_kv_capacity, planner.capacity_curve(),

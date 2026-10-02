@@ -103,12 +103,12 @@ def main(argv=None):
         action="append",
         default=[],
         metavar="NAME=PATH",
-        help="named source such as quantized, dflash or dflash2",
+        help="named source such as quantized, dflash, dflash2 or dspark",
     )
     parser.add_argument(
         "--components",
         default="text",
-        help="comma-separated text,vision,mtp,dflash,dflash2",
+        help="comma-separated text,vision,mtp,dflash,dflash2,dspark",
     )
     parser.add_argument(
         "--resource",
@@ -141,7 +141,7 @@ def main(argv=None):
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
         companions = {
-            key: sources[key] for key in ("dflash", "dflash2") if key in components
+            key: sources[key] for key in ("dflash", "dflash2", "dspark") if key in components
         }
         model = build_model(
             base,

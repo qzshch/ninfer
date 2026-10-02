@@ -41,6 +41,11 @@ DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig
         out.layers.push_back(std::move(layer));
     }
     if (config.dflash2) { bind_dflash2(b, out, config, target); }
+    if (config.dspark) {
+        out.markov =
+            std::pair{b.direct(component + "/markov/predecessor", {target.vocab_size, 256}),
+                      b.direct(component + "/markov/successor", {target.vocab_size, 256})};
+    }
     return out;
 }
 

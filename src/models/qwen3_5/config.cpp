@@ -207,18 +207,21 @@ VisionConfig vision(const Json& value) {
     return out;
 }
 
-DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
+DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2, bool dspark) {
     require_members(value,
                     {"architectures", "model_type", "intermediate_size", "num_attention_heads",
                      "num_key_value_heads", "head_dim", "num_hidden_layers",
                      "max_position_embeddings", "rms_norm_eps", "rope_parameters", "layer_types",
                      "dflash_config"},
-                    {"sliding_window"}, "draft config");
-    if (architecture(value) != (dflash2 ? "DFlash2DraftModel" : "DFlashDraftModel") ||
+                    {"sliding_window", "dspark_config"}, "draft config");
+    if (architecture(value) != (dspark    ? "DSparkDraftModel"
+                                : dflash2 ? "DFlash2DraftModel"
+                                          : "DFlashDraftModel") ||
         value.at("model_type") != "qwen3") {
         throw ArtifactError("draft architecture/model_type mismatch");
     }
     DraftConfig out;
+    out.dspark    = dspark;
     out.attention = attention(value);
     if (out.attention.head_dim % 2) { throw ArtifactError("draft head dimension must be even"); }
     out.intermediate_size       = dimension(value, "intermediate_size");
@@ -279,6 +282,22 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
         }
         out.dflash2 = extra;
     }
+    if (dspark) {
+        const auto& extra = value.at("dspark_config");
+        require_members(extra,
+                        {"markov_rank", "markov_head_type", "sample_from_anchor", "block_size",
+                         "sliding_window_non_causal"},
+                        {}, "DSpark config");
+        if (extra.at("markov_rank") != 256 || extra.at("markov_head_type") != "vanilla" ||
+            extra.at("sample_from_anchor") != true || extra.at("block_size") != 8 ||
+            extra.at("sliding_window_non_causal") != false || out.attention.head_dim != 256 ||
+            out.attention.num_attention_heads != 20 || out.attention.num_key_value_heads != 4 ||
+            out.sliding_window != 2048 || out.full_layer_count() != 0) {
+            throw ArtifactError("unsupported DSpark anchor/Markov/attention profile");
+        }
+    } else if (value.contains("dspark_config")) {
+        throw ArtifactError("DSpark config attached to another backend");
+    }
     return out;
 }
 
@@ -330,10 +349,9 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
                 throw ArtifactError("MTP architecture differs from target mathematics");
             }
         }
-        if (options.speculative == SpeculativeBackend::DFlash ||
-            options.speculative == SpeculativeBackend::DFlash2) {
+        if (options.masked_draft()) {
             out.draft = draft(companion(directory, options.speculative_component()).config,
-                              out.text, options.speculative == SpeculativeBackend::DFlash2);
+                              out.text, options.dflash2(), options.dspark());
         }
         return out;
     } catch (const std::exception& error) {

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <string>
 #include <variant>
 #include <vector>
@@ -118,6 +119,7 @@ struct DraftWeights {
     WeightId feature_projection, context_norm, final_norm;
     std::vector<DraftBlockWeights> layers;
     std::optional<SelectorWeights> selector;
+    std::optional<std::pair<WeightId, WeightId>> markov;
     WeightId token_embedding, output_head;
     WeightUseId output_head_use;
 };
