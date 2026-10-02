@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # Usage: NINFER_MODEL=/absolute/model.ninfer PYTHON=/path/to/python3.11 \
-#          bash tests/e2e/run_kvmem_pipeline.sh [smoke|regression|long|concurrency|vision|dflash2-vision]
+#          bash tests/e2e/run_kvmem_pipeline.sh [smoke|regression|long|concurrency|vision|dflash2-vision|cache-lifecycle]
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 : "${NINFER_MODEL:?Set NINFER_MODEL to an explicit official v3 .ninfer artifact}"
 PYTHON=${PYTHON:-python3.11}
 PROFILE=${1:-smoke}
-case "$PROFILE" in smoke|regression|long|concurrency|vision|dflash2-vision) ;; *) echo 'invalid profile' >&2; exit 2 ;; esac
+case "$PROFILE" in smoke|regression|long|concurrency|vision|dflash2-vision|cache-lifecycle) ;; *) echo 'invalid profile' >&2; exit 2 ;; esac
 "$PYTHON" -c 'import sys; assert sys.version_info[:2] == (3, 11), "Python 3.11 required"'
 test -f "$NINFER_MODEL"
 exec 9>"${TMPDIR:-/tmp}/ninfer-kvmem-e2e.lock"
@@ -28,8 +28,10 @@ cmake --build "$BUILD" -j --target ninfer-serve ninfer_kvmem_options_test \
     ninfer_qwen3_5_retrieval_test ninfer_qwen3_5_context_store_test ninfer_qwen3_5_frontend_test \
     ninfer_span_accumulate_test ninfer_softmax_attention_test ninfer_serve_options_test \
     ninfer_resource_manager_test ninfer_qwen3_5_runtime_mechanisms_test \
-    ninfer_qwen3_5_state_image_test ninfer_qwen3_5_state_image_layout_test
+    ninfer_qwen3_5_state_image_test ninfer_qwen3_5_state_image_layout_test \
+    ninfer_qwen3_5_kvmem_prefix_real_test
 "$PYTHON" -m unittest discover -s tests/e2e -p 'test_kvmem*.py'
+"$PYTHON" -m unittest discover -s tests/e2e -p 'test_cache_lifecycle.py'
 ctest --test-dir "$BUILD" --output-on-failure --no-tests=error \
     --output-junit "$OUTPUT/unit.xml" \
     -R '^ninfer_(kvmem_options|qwen3_5_retrieval|qwen3_5_context_store|qwen3_5_frontend|qwen3_5_runtime_mechanisms|qwen3_5_state_image|qwen3_5_state_image_layout|span_accumulate|softmax_attention|serve_options|resource_manager)_test$'
@@ -42,6 +44,35 @@ PY
 COMMON=(--binary "$BUILD/apps/ninfer-serve" --model "$NINFER_MODEL")
 # Fresh ports per process avoid inheriting accepted sockets' TIME_WAIT state.
 PORT=${NINFER_TEST_PORT:-8095}
+if [[ "$PROFILE" == cache-lifecycle ]]; then
+    # This profile requires an artifact containing both MTP and DFlash2. It is
+    # intentionally fail-closed: a skipped native regression is not acceptance.
+    for DTYPE in int8 fp8; do
+        for SPEC in none mtp dflash2; do
+            if [[ "$DTYPE" == fp8 ]]; then export NINFER_TEST_FP8=1; else unset NINFER_TEST_FP8; fi
+            export NINFER_TEST_ARTIFACT="$NINFER_MODEL" NINFER_TEST_SPEC="$SPEC"
+            ctest --test-dir "$BUILD" --output-on-failure --no-tests=error \
+                --output-junit "$OUTPUT/prefix-$DTYPE-$SPEC.xml" \
+                -R '^ninfer_qwen3_5_kvmem_prefix_real_test$'
+            "$PYTHON" - "$OUTPUT/prefix-$DTYPE-$SPEC.xml" <<'PY'
+import sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+assert len(root.findall('testcase')) == 1 and not root.findall('.//skipped'), 'native cache regression skipped'
+PY
+            for LANES in 1 2 3; do
+                "$PYTHON" tests/e2e/kvmem_suite.py "${COMMON[@]}" \
+                    --output "$OUTPUT/cache-$DTYPE-$SPEC-c$LANES" --profile cache-lifecycle \
+                    --dtype "$DTYPE" --spec "$SPEC" --concurrency "$LANES" \
+                    --window 32 --context 16384 --host-mib 1024 --chunk 256 \
+                    --repeats "${NINFER_CACHE_REPEATS:-2}" --seed "${NINFER_CACHE_SEED:-20261003}" --port "$PORT"
+                PORT=$((PORT + 1))
+            done
+        done
+    done
+    unset NINFER_TEST_FP8 NINFER_TEST_ARTIFACT NINFER_TEST_SPEC
+    echo "KVMem retained cache lifecycle matrix passed: $OUTPUT"
+    exit 0
+fi
 if [[ "$PROFILE" == dflash2-vision ]]; then
     # The artifact must include the matching DFlash2 companion and Vision weights.
     "$PYTHON" tests/e2e/kvmem_vision_suite.py "${COMMON[@]}" --output "$OUTPUT/dense-dflash2" \
@@ -76,6 +107,14 @@ if [[ "$PROFILE" == concurrency ]]; then
 fi
 "$PYTHON" tests/e2e/kvmem_suite.py "${COMMON[@]}" --output "$OUTPUT/smoke" --profile smoke --port "$PORT"
 if [[ "$PROFILE" != smoke ]]; then
+    NINFER_TEST_ARTIFACT="$NINFER_MODEL" NINFER_TEST_SPEC=none \
+        ctest --test-dir "$BUILD" --output-on-failure --no-tests=error \
+        --output-junit "$OUTPUT/prefix-required.xml" -R '^ninfer_qwen3_5_kvmem_prefix_real_test$'
+    "$PYTHON" - "$OUTPUT/prefix-required.xml" <<'PY'
+import sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+assert len(root.findall('testcase')) == 1 and not root.findall('.//skipped'), 'native cache regression skipped'
+PY
     "$PYTHON" tests/e2e/kvmem_suite.py "${COMMON[@]}" --output "$OUTPUT/mtp-regression" \
         --profile regression --chunk 2048 --port "$((PORT + 1))"
     "$PYTHON" tests/e2e/kvmem_suite.py "${COMMON[@]}" --output "$OUTPUT/ordinary-regression" \

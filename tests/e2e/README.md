@@ -1,6 +1,6 @@
 # KVMem inference regression pipeline
 
-Run from the NInfer checkout on the CUDA 13.1 / sm_120a machine. Python 3.11,
+Run from the NInfer checkout on the qualified CUDA / sm_120a machine. Python 3.11,
 CMake, Ninja, idle test ports (8095 through 8100), and an explicit v3 model are required.
 The runner owns only its child process; it fails if another server owns the port.
 It does not stop services, retry failed requests, or treat HTTP 200 as successful
@@ -443,3 +443,31 @@ python3.11 tests/e2e/kvmem_vision_suite.py \
 This profile actually prefills beyond the 36K window. It does not fill both 256K
 contexts. Check host commit and GPU memory externally on WSL; the runner's Linux
 headroom guard does not measure Windows commit.
+
+## Cache lifecycle gate
+
+`bash tests/e2e/run_kvmem_pipeline.sh cache-lifecycle` requires a model with MTP and
+DFlash2 and runs INT8/FP8 × ordinary/MTP3/DFlash2 K7 × 1/2/3 configured lanes.
+Each configuration compares 18 seeded history transitions against a separate
+no-retention server: a long shared prefix, repeated incremental growth and cache
+publication, earlier-prefix return, branching, root rewrite, pressure from six
+other roots, and return after eviction. It requires actual cached tokens beyond
+the rolling window, complete SSE/usage, matching cold/hot greedy output, and a
+healthy worker after every transition. Journals retain inputs' digests, seed,
+cache-hit counts, outputs and timings. A missing cache hit fails the intended
+coverage; HTTP success alone does not satisfy the gate.
+
+The fixture uses a small window and an explicit KV pool larger than the active
+windows to guarantee publication headroom, including at C1. Automatic sparse
+sizing can legally skip optional captures; test results with forced headroom do
+not promise production cache hits. Configured lane count in this matrix is not
+simultaneous active lane count. Use `concurrency` for actual overlapping GPU
+batches, cancellation, lane reuse and Host restore; use `dflash2-vision` for
+multimodal paths, and `long` for capacity. Together these are functional gates,
+not a proof of model-wide quality equivalence or indefinite soak stability.
+
+The six real-model native cache regressions are mandatory and a skip fails this
+profile. Preserve failed runs and resource interruptions. The cold control port
+is the selected test port plus 1000; both must be free. Set `--seed` on the Python
+runner to reproduce a history. The optional `--spec dspark` runner route requires
+a compatible DSpark artifact and uses fixed K7 with the full proposal head.

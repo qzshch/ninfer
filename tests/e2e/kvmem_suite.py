@@ -20,9 +20,12 @@ import subprocess
 import threading
 import time
 import traceback
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+
+from cache_lifecycle import run_lifecycle
 
 
 def parse_sse(lines):
@@ -193,18 +196,29 @@ class Suite:
         ET.ElementTree(root).write(self.args.output / "junit.xml", encoding="utf-8", xml_declaration=True)
 
     def server_command(self):
+        # Automatic sparse sizing reserves active windows, not guaranteed cache
+        # publication headroom. This profile must exercise captures at C=1 too.
+        kv_capacity = str(self.args.context) if self.args.profile == 'cache-lifecycle' else 'auto'
         command = [str(self.args.binary.resolve()), str(self.args.model.resolve()),
                    "--host", "127.0.0.1", "--port", str(self.args.port),
                    "--model-id", "kvmem-test", "--max-context", str(self.args.context),
-                   "--kv-dtype", self.args.dtype, "--kv-capacity", "auto",
+                   "--kv-dtype", self.args.dtype, "--kv-capacity", kv_capacity,
                    "--kvmem-window-pages", str(self.args.window),
                    "--max-concurrency", str(self.args.concurrency),
                    "--prefill-chunk", str(self.args.chunk), "--host-kv-mib", str(self.args.host_mib),
                    "--pending-timeout-ms", "1800000"]
         if self.args.spec == "mtp":
             command += ["--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]
-        if self.args.spec == "dflash2":
-            command += ["--spec", "dflash2", "--draft-tokens", "7"]
+        if self.args.spec in ("dflash2", "dspark"):
+            command += ["--spec", self.args.spec, "--draft-tokens", "7"]
+        if self.args.profile == "cache-lifecycle":
+            command += ["--host-state-slots", "4", "--device-state-slots",
+                        str(self.args.concurrency), "--request-log-jsonl",
+                        str(self.args.output / "requests.jsonl")]
+        if getattr(self.args, 'vision', False):
+            command += ['--vision']
+        if getattr(self.args, 'no_context_retention', False):
+            command += ['--no-context-retention']
         return command
 
     def start(self):
@@ -268,6 +282,13 @@ class Suite:
             raise AssertionError(f"server exited ({self.proc.returncode})")
         result = self.request([{"role": "user", "content": "Reply with exactly READY."}])
         return validate_answer(result, "READY")
+
+    def liveness(self):
+        if self.proc.poll() is not None:
+            raise AssertionError(f"server exited ({self.proc.returncode})")
+        with urllib.request.urlopen(self.url + '/health', timeout=5) as response:
+            if response.status != 200:
+                raise AssertionError(f'health returned {response.status}')
 
     def lane_messages(self, marker, extra=0):
         messages = self.long_messages(self.args.window * 64 + 1024 + extra)
@@ -582,9 +603,50 @@ class Suite:
             raise AssertionError("engine diagnostics:\n" + "\n".join(bad[-30:]))
         return {"bytes": len(text)}
 
+    def cache_references(self):
+        settings = vars(self.args).copy()
+        settings.update(output=self.args.output / 'cold-reference', no_context_retention=True,
+                        port=self.args.port + 1000)
+        settings['output'].mkdir(exist_ok=False)
+        control = self.control_suite = Suite(SimpleNamespace(**settings))
+        references = {}
+        try:
+            control.case('startup', control.start)
+            if control.results[-1]['status'] == 'failed':
+                raise AssertionError('cold reference startup failed')
+            for repeat in range(self.args.repeats):
+                seed = self.args.seed + repeat
+                control.case(f'cold-lifecycle-{seed}', lambda s=seed: run_lifecycle(control, s, control=True))
+                record = control.results[-1]
+                if record['status'] == 'failed':
+                    raise AssertionError(f'cold reference failed: {record["error"]}')
+                references[str(seed)] = {r['action']: r['text'] for r in record['details']['transitions']}
+        finally:
+            control.case('shutdown', control.stop)
+            if control.log.exists():
+                control.case('no-engine-errors', control.check_log)
+            control.save()
+        if any(r['status'] == 'failed' for r in control.results):
+            raise AssertionError('cold reference did not finish cleanly')
+        self.args.reference_outputs = references
+        return {'seeds': sorted(references), 'reference_output': str(settings['output'])}
+
     def run(self):
+        if self.args.profile == 'cache-lifecycle':
+            self.case('same-input-cold-reference', self.cache_references)
+            if self.results[-1]['status'] == 'failed':
+                return
         self.case("startup", self.start)
         if self.results[-1]["status"] == "failed":
+            return
+        if self.args.profile == "cache-lifecycle":
+            self.case("read-only-health", self.liveness)
+            for repeat in range(self.args.repeats):
+                self.case(f"cache-lifecycle-seed-{self.args.seed + repeat}",
+                          lambda seed=self.args.seed + repeat: run_lifecycle(self, seed))
+                if self.results[-1]["status"] == "failed":
+                    break
+            self.case("final-health", self.health)
             return
         self.case("json-generation", self.health)
         if self.args.profile == "concurrency":
@@ -646,13 +708,16 @@ def main():
     p.add_argument("--chunk", type=int, default=1024)
     p.add_argument("--host-mib", type=int, default=12288)
     p.add_argument("--dtype", choices=["bf16", "int8", "fp8", "nvfp4", "k8v4"], default="int8")
-    p.add_argument("--spec", choices=["none", "mtp", "dflash2"], default="mtp")
+    p.add_argument("--spec", choices=["none", "mtp", "dflash2", "dspark"], default="mtp")
     p.add_argument("--concurrency", type=int, choices=[1, 2, 3], default=1)
-    p.add_argument("--profile", choices=["smoke", "regression", "long", "capacity", "penalty", "replay-cancel", "replay-budget", "concurrency"], default="regression")
+    p.add_argument("--profile", choices=["smoke", "regression", "long", "capacity", "penalty", "replay-cancel", "replay-budget", "concurrency", "cache-lifecycle"], default="regression")
+    p.add_argument("--seed", type=int, default=20261003)
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--startup-timeout", type=float, default=600)
     p.add_argument("--request-timeout", type=float, default=1800)
     args = p.parse_args()
+    if args.profile == "cache-lifecycle" and (args.window <= 0 or args.context < 4 * args.window * 64 + 4096):
+        p.error("cache-lifecycle requires a sparse window and context >= 4 * window * 64 + 4096")
     if args.profile == "concurrency" and (args.concurrency < 2 or args.window == 0 or
                                            args.context < args.window * 64 + 4096):
         p.error("concurrency profile requires two or three lanes and context >= window * 64 + 4096")
