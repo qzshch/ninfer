@@ -8,7 +8,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -284,6 +287,89 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"handoff_peak_bytes", vision->handoff_peak_bytes}};
 }
 
+Json speculative_packet_json(const ninfer::SpeculativeProposalDiagnostic& packet) {
+    if (packet.valid == 0) { return nullptr; }
+    const bool proposal = packet.position >= 0;
+    const bool stochastic = packet.stochastic != 0;
+    return Json{{"mode", stochastic ? "stochastic" : "greedy"},
+        {"kind", packet.kind == 0 ? "first_rejection" : packet.kind == 1 ? "accepted" :
+                 packet.kind == 2 ? "full_acceptance" : "fallback"},
+        {"position", proposal ? Json(packet.position) : Json(nullptr)},
+        {"live_extent", packet.extent}, {"accepted", packet.accepted},
+        {"proposal_id", proposal ? Json(packet.proposal_id) : Json(nullptr)},
+        {"target_top1", packet.target_top1}, {"target_support_size", packet.target_support_size},
+        {"draft_in_target_support", proposal ? Json(packet.draft_in_target_support != 0) : Json(nullptr)},
+        {"target_top1_in_proposal_support", proposal ? Json(packet.target_top1_in_proposal_support != 0) : Json(nullptr)},
+        {"pd", stochastic && proposal ? Json(packet.pd) : Json(nullptr)},
+        {"qd", proposal ? Json(packet.qd) : Json(nullptr)},
+        {"u", stochastic && proposal ? Json(packet.u) : Json(nullptr)},
+        {"acceptance_probability", stochastic && proposal ? Json(packet.acceptance_probability) : Json(nullptr)}};
+}
+
+Json support_frontier_json(const ninfer::DFlashSupportFrontier& frontier,
+                           const ninfer::SpeculativeProposalDiagnostic& packet) {
+    if (frontier.valid == 0) return nullptr;
+    const char* reason = "unknown";
+    switch (frontier.stage) {
+    case ninfer::DFlashSupportStage::None: reason = "unavailable"; break;
+    case ninfer::DFlashSupportStage::TopK: reason = "target_top20_or_top_k_exclusion"; break;
+    case ninfer::DFlashSupportStage::TopP: reason = "target_top_p_exclusion"; break;
+    case ninfer::DFlashSupportStage::AfterTopKUnresolved: reason = "target_after_top_k_min_p_or_top_p_unresolved"; break;
+    case ninfer::DFlashSupportStage::PositiveProbability: reason = packet.kind == 0 ? "ratio_rng" : "accepted"; break;
+    case ninfer::DFlashSupportStage::Greedy: reason = packet.kind == 0 ? "greedy_mismatch" : "greedy_accepted"; break;
+    case ninfer::DFlashSupportStage::Invalid: reason = "invalid_q_or_probability"; break;
+    case ninfer::DFlashSupportStage::ZeroProbability: reason = "retained_target_zero_probability"; break;
+    }
+    const char* coverage = !frontier.target_top1_in_raw_candidates ? "raw_top16_absent" :
+        frontier.target_top1_q > 0 && frontier.target_top1_q <= 1 ? "raw_top16_positive_q" :
+        frontier.target_top1_q != 0 ? "raw_top16_invalid_q" :
+        packet.stochastic ? "raw_top16_q_zero" : "raw_top16_greedy_one_hot_zero";
+    return Json{{"decision_reason", reason}, {"target_top1_proposal_coverage", coverage},
+        {"raw_rank", frontier.raw_rank}, {"after_penalty_rank", frontier.adjusted_rank},
+        {"effective_top_k_cap", frontier.effective_top_k},
+        {"raw_logit", frontier.raw_logit}, {"after_penalty_logit", frontier.adjusted_logit},
+        {"committed_count", frontier.committed_count}, {"proposal_prefix_count", frontier.overlay_count},
+        {"penalty_crossed_top_k", frontier.penalty_crossed_top_k != 0},
+        {"proposal_in_raw_top16", frontier.proposal_in_raw_candidates != 0},
+        {"target_top1_in_raw_top16", frontier.target_top1_in_raw_candidates != 0},
+        {"target_top1_raw_candidate_slot", frontier.target_top1_candidate_rank >= 0
+            ? Json(frontier.target_top1_candidate_rank) : Json(nullptr)},
+        {"target_top1_q", frontier.target_top1_q}, {"proposal_q", frontier.proposal_q},
+        {"round_anchor_id", frontier.round_anchor_id},
+        {"scope", "same_reached_prefix_readonly_rank_observer"}};
+}
+
+Json speculative_diagnostics_json(const GenerationMetrics& metrics) {
+    if (metrics.speculative_diagnostic_max_rounds == 0) { return nullptr; }
+    Json samples = Json::array();
+    for (const auto& sample : metrics.speculative_diagnostic_samples) {
+        samples.push_back(Json{{"round_index", sample.round_index}, {"lane_id", sample.lane},
+            {"frontier", sample.frontier}, {"licensed_tokens", sample.licensed_tokens},
+            {"published_tokens", sample.publication_recorded ? Json(sample.published_tokens) : Json(nullptr)},
+            {"first", speculative_packet_json(sample.first)},
+            {"accepted_sample", speculative_packet_json(sample.accepted)},
+            {"first_support_frontier", support_frontier_json(sample.first_support_frontier, sample.first)},
+            {"accepted_support_frontier", support_frontier_json(sample.accepted_support_frontier, sample.accepted)},
+            {"round_anchor_id", sample.round_anchor_id >= 0 ? Json(sample.round_anchor_id) : Json(nullptr)},
+            {"first_reached_prefix_token_ids", sample.first_reached_prefix_token_ids.empty()
+                ? Json(nullptr) : Json(sample.first_reached_prefix_token_ids)},
+            {"accepted_reached_prefix_token_ids", sample.accepted_reached_prefix_token_ids.empty()
+                ? Json(nullptr) : Json(sample.accepted_reached_prefix_token_ids)},
+            {"first_proposal_absolute_position_0based", sample.first.position >= 0 && sample.round_anchor_id >= 0
+                ? Json(static_cast<std::uint64_t>(sample.frontier) + 1 + sample.first.position) : Json(nullptr)},
+            {"accepted_proposal_absolute_position_0based", sample.accepted.position >= 0 && sample.round_anchor_id >= 0
+                ? Json(static_cast<std::uint64_t>(sample.frontier) + 1 + sample.accepted.position) : Json(nullptr)},
+            {"prefix_binding_scope", "round_anchor_plus_prior_accepted_drafts_full_prompt_identity_separate"}});
+    }
+    return Json{{"max_sampled_rounds", metrics.speculative_diagnostic_max_rounds},
+        {"sample_every", metrics.speculative_diagnostic_every},
+        {"support_frontier_enabled", metrics.speculative_support_frontier_enabled},
+        {"top_k_zero_semantics", "bounded_cap20"},
+        {"collected_rounds", samples.size()}, {"samples", std::move(samples)},
+        {"coverage", "bounded_reached_positions"},
+        {"rng", "same_stateless_accept_counter"}};
+}
+
 Json speculative_json(const GenerationMetrics& metrics) {
     return Json{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
                 {"draft_window", metrics.speculative_draft_window},
@@ -291,7 +377,18 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"drafted_tokens", metrics.speculative_draft_tokens},
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
-                {"accepted_per_position", metrics.speculative_accepted_per_position}};
+                {"accepted_per_position", metrics.speculative_accepted_per_position},
+                {"attempted_per_position", metrics.speculative_attempted_per_position},
+                {"reached_per_position", metrics.speculative_reached_per_position},
+                {"rejected_per_position", metrics.speculative_rejected_per_position},
+                {"zero_accept_rounds", metrics.speculative_zero_accept_rounds},
+                {"partial_accept_rounds", metrics.speculative_partial_accept_rounds},
+                {"full_accept_rounds", metrics.speculative_full_accept_rounds},
+                {"licensed_output_tokens", metrics.speculative_licensed_output_tokens},
+                {"published_output_tokens", metrics.speculative_published_output_tokens},
+                {"published_accepted_tokens", metrics.speculative_published_accepted_tokens},
+                {"discarded_licensed_tokens", metrics.speculative_discarded_licensed_tokens},
+                {"diagnostics", speculative_diagnostics_json(metrics)}};
 }
 
 Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
@@ -321,6 +418,47 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
          ninfer::materialization_search_phase_name(diagnostics.search_stop_phase)},
         {"search_boundary_limited", diagnostics.search_boundary_limited},
     };
+}
+
+Json kvmem_placement_json(const ninfer::KvmemPlacementStats& stats) {
+    return Json{{"calls", stats.calls}, {"no_copy_calls", stats.no_copy_calls},
+                {"demoted_pages", stats.demoted_pages}, {"promoted_pages", stats.promoted_pages},
+                {"d2h_pages", stats.d2h_pages}, {"d2h_bytes", stats.d2h_bytes},
+                {"h2d_bytes", stats.h2d_bytes},
+                {"d2h_submit_wait_ns", stats.d2h_submit_wait_ns},
+                {"h2d_submit_wait_ns", stats.h2d_submit_wait_ns},
+                {"publication_wait_ns", stats.publication_wait_ns},
+                {"total_host_wall_ns", stats.total_host_wall_ns}};
+}
+
+Json kvmem_json(const ninfer::KvmemDiagnostics& diagnostics) {
+    if (!diagnostics.enabled) { return nullptr; }
+    Json placement = Json::object();
+    constexpr std::array<const char*, 4> phases{"prefill", "retrieval", "replay", "decode"};
+    for (std::size_t phase = 0; phase < phases.size(); ++phase) {
+        placement[phases[phase]] = Json{
+            {"main", kvmem_placement_json(diagnostics.placement[phase][0])},
+            {"backend", kvmem_placement_json(diagnostics.placement[phase][1])}};
+    }
+    return Json{
+        {"timing_basis", "host_observed_wall_and_existing_waits"},
+        {"placement", std::move(placement)},
+        {"key_capture", Json{{"calls", diagnostics.key_capture_calls},
+            {"d2h_bytes", diagnostics.key_capture_d2h_bytes},
+            {"submit_wait_ns", diagnostics.key_capture_submit_wait_ns},
+            {"host_wall_ns", diagnostics.key_capture_host_wall_ns}}},
+        {"query_capture", Json{{"calls", diagnostics.query_capture_calls},
+            {"d2h_bytes", diagnostics.query_capture_d2h_bytes},
+            {"submit_wait_ns", diagnostics.query_capture_submit_wait_ns},
+            {"host_wall_ns", diagnostics.query_capture_host_wall_ns}}},
+        {"selection", Json{{"calls", diagnostics.selection_calls},
+            {"scored_blocks", diagnostics.scored_blocks},
+            {"host_wall_ns", diagnostics.selection_host_wall_ns}}},
+        {"replay", Json{{"tokens", diagnostics.replay_tokens},
+            {"units", diagnostics.replay_units},
+            {"step_host_wall_ns", diagnostics.replay_step_host_wall_ns},
+            {"execution_host_ns", diagnostics.replay_execution_host_ns},
+            {"execution_device_wait_ns", diagnostics.replay_execution_device_wait_ns}}}};
 }
 
 double nanoseconds_to_seconds(std::uint64_t value) noexcept {
@@ -470,7 +608,8 @@ std::string format_server_start_json(
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
-             {"prefix_reuse", options.allow_prefix_reuse},
+             {"prefix_reuse", context_cache_participation_enabled(options)},
+             {"context_retention", options.allow_context_retention},
              {"speculative_backend",
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
@@ -526,6 +665,14 @@ std::string format_server_start_json(
              {"cuda_compile_version", environment.cuda_compile_version},
              {"cuda_runtime_version", environment.cuda_runtime_version},
              {"cuda_driver_version", environment.cuda_driver_version}};
+    record["diagnostic_environment_requested"] = Json{
+        {"dflash_sampled_rounds", environment.dflash_diagnostic_rounds_env
+            ? Json(*environment.dflash_diagnostic_rounds_env) : Json(nullptr)},
+        {"dflash_sample_every", environment.dflash_diagnostic_every_env
+            ? Json(*environment.dflash_diagnostic_every_env) : Json(nullptr)},
+        {"dflash_support_frontier", environment.dflash_support_frontier_env
+            ? Json(*environment.dflash_support_frontier_env) : Json(nullptr)},
+        {"scope", "requested_environment_effective_flag_recorded_per_request"}};
     record["argv"] = options.startup_argv;
     return record.dump();
 }
@@ -556,6 +703,12 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
     record["execution"] = Json{
         {"engine_request_id", outcome.metrics.engine_request_id},
         {"lane_id", outcome.metrics.lane_id ? Json(*outcome.metrics.lane_id) : Json(nullptr)}};
+    record["diagnostic_prompt_input"] = Json{
+        {"token_count", outcome.prompt_tokens},
+        {"token_ids", outcome.diagnostic_input_token_ids.empty()
+            ? Json(nullptr) : Json(outcome.diagnostic_input_token_ids)},
+        {"maximum_exact_tokens", ninfer::kDFlashPromptBindingMaximumTokens},
+        {"scope", "actual_frontend_prepared_input_only_observer_on_text_at_most512"}};
     record["result"] =
         Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
              {"prompt_tokens", outcome.prompt_tokens},
@@ -579,6 +732,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
     record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
     record["speculative"]     = speculative_json(outcome.metrics);
+    record["kvmem"]           = kvmem_json(outcome.metrics.kvmem);
     record["materialization"] = materialization_json(outcome.metrics.materialization);
     return record.dump();
 }
@@ -618,10 +772,20 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                            {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
+    record["direct_sparse_sampling"] = current.direct_sparse_sampling.supported
+        ? Json{{"scope", "program_direct_sparse_latest_request_cumulative"},
+               {"sampling_interval_ms", 1000},
+               {"sample_revision", current.direct_sparse_sampling.sample_revision},
+               {"sampled_steady_ns", current.direct_sparse_sampling.sampled_steady_ns},
+               {"age_at_engine_publication_ns", current.direct_sparse_sampling.sample_age_ns},
+               {"counter_reset_identity", "server_instance_id,lane_id,request_epoch,engine_request_id"},
+               {"catalog_transfer_counters_include_direct_sparse", false}}
+        : Json(nullptr);
     record["lanes"] = Json::array();
     for (std::uint32_t lane = 0; lane < current.lane_count; ++lane) {
         const auto& before = previous.lanes[lane];
         const auto& after = current.lanes[lane];
+        const auto& sparse = current.direct_sparse_sampling.lanes[lane];
         const auto prefill = after.computed_prefill_tokens - before.computed_prefill_tokens;
         const auto decode = after.committed_decode_tokens - before.committed_decode_tokens;
         record["lanes"].push_back(Json{
@@ -633,7 +797,17 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
             {"throughput_tokens_per_second",
              Json{{"prefill", report.interval_seconds > 0.0 ? prefill / report.interval_seconds : 0.0},
                   {"decode", report.interval_seconds > 0.0 ? decode / report.interval_seconds : 0.0}}},
-            {"decode_rounds", after.decode_rounds - before.decode_rounds}});
+            {"decode_rounds", after.decode_rounds - before.decode_rounds},
+            {"kvmem", sparse.available
+                ? Json{{"scope", "latest_request_cumulative_not_lifetime"},
+                       {"request_epoch", sparse.request_epoch},
+                       {"engine_request_id", sparse.engine_request_id != 0
+                            ? Json(sparse.engine_request_id) : Json(nullptr)},
+                       {"identity_status", sparse.engine_request_id == 0 ? "unbound"
+                            : (sparse.current_request ? "current_request" : "latest_request")},
+                       {"counters", kvmem_json(sparse.request_counters)},
+                       {"d2d_bytes", nullptr}}
+                : Json(nullptr)}});
     }
     record["scheduler"]    = Json{{"running", current.running_requests},
                                   {"prefilling", current.prefilling_requests},
@@ -802,6 +976,12 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
 ServerLogEnvironment query_server_log_environment(int device) {
     ServerLogEnvironment environment;
     environment.device               = device;
+    if (const char* value = std::getenv("NINFER_DFLASH_DIAGNOSTIC_ROUNDS"))
+        environment.dflash_diagnostic_rounds_env = value;
+    if (const char* value = std::getenv("NINFER_DFLASH_DIAGNOSTIC_EVERY"))
+        environment.dflash_diagnostic_every_env = value;
+    if (const char* value = std::getenv("NINFER_DFLASH_SUPPORT_FRONTIER"))
+        environment.dflash_support_frontier_env = value;
     environment.cuda_compile_version = cuda_version_string(CUDART_VERSION);
 
     int runtime_version = 0;

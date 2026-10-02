@@ -53,12 +53,19 @@ KV Store 可以在任意 token frontier 表示、truncate 或保护 prefix；这
 
 ## 3. Typed pool set 与容量
 
-本文下述容量公式默认 dense 模式。实验性的 `kvmem_window_pages > 0` 模式只支持单 lane 文本生成
-及普通/MTP backend；Main physical 最小需求为
-`min(L, window_pages + ceil(effective_prefill_chunk / 64) + 16)`，auto 使用该固定有界容量。
+本文下述容量公式默认 dense 模式。实验性的 `kvmem_window_pages > 0` 模式支持 1–3 个 lane，
+普通/MTP/DFlash2 backend，以及 Vision 输入。每个 lane 的 Main physical 最小需求为
+`min(L, window_pages + ceil(effective_prefill_chunk / 64) + 16)`，共享 pool 的最小需求是该值乘以
+`max_concurrency`；auto 使用这个固定有界容量。该计算由 `retrieval/window_capacity.h` 统一提供，
+同时涵盖每个 lane 的 chunk 临时增长与 sink/slack 额度。3 lane 属于实验边界，实际可运行的 lane 数
+还取决于 Device 与 Host headroom，配置被接受不代表足以装下所有请求；超过 3 lane 在启动时拒绝。
 逻辑地址仍覆盖 `L` 页，Device working set 以外的已提交页由 Host 副本持有，执行表发布 hole。
 Host 峰值 headroom 必须在请求 admission 中计入，shared resident pages 也必须扣除增长 reservation
-预算。Q/K capture 属于启动时规划的 persistent arena。长请求的稀疏 continuation 暂不进入前缀缓存。
+预算。Q/K capture 属于启动时规划的 persistent arena。长请求只缓存 query 之前、首遍 chunk
+对齐且带完整检索特征的 shared checkpoint；query 之后的 private continuation 仍不进入长前缀恢复。
+Host-only immutable 页可由事务 pin 并保留逻辑 membership；fork 的部分尾页必须驻 Device 后复制。
+每个 address 的 execution row 只发布其 working set 内的 Device 页。另一个 address 的共享页
+即使驻留也不自动可见；换页不得释放其他 active address 的可见共享页。
 产品边界和检索近似见 [serving](../serving.md#experimental-kvmem-window)，验证见
 [KVMem 审计](kvmem-audit.md)。
 
@@ -194,6 +201,19 @@ MTP 的额外 pages 只覆盖每条 active row 在一个 speculative round 中�
 Main 与 selected backend 的 Host replicas共用一个 startup-fixed pinned `HostKVArena`，但每个 allocation
 携带自己的 typed page layout。Host capacity 按实际 packed bytes 和 allocator extent geometry计费；
 它不扩大 Device active entitlement 或单 sequence context ceiling。
+
+Sparse 请求的 Host preparation peak 为完整 reserved context 的 packed Main/backend pages 加16页裕量；
+H2D promotion 后 Host replica 仍可保留，因此不能以“逻辑长度减 Device window”作为 Host 上界。
+Program 在请求启动时保留独立的 future Host peak planning claim，直到 Finish、Discard、cancel 或
+execution-error cleanup；catalogued continuation 不保留 active future claim，只计实际剩余副本。
+
+Admission/pressure 使用 `actual Host occupancy - unique claimed-active Host replicas + active full peaks`
+作为 Host budget occupancy，再加入新 candidate peak。unique credit 按 logical descriptor 去重，shared
+pages 即使同时被多个 active address 或 inactive catalog 引用也只减一次；没有 future claim 的短请求
+副本不获 credit。这个预算不能用 `max(actual, sum(peaks))` 替代，也不进入 published physical inventory、
+owner transition deltas 或 State/KV resident tests。Host allocator extent geometry 仍单独验证。
+逻辑 `max-context` 和启动允许的 lane 数不保证所有 lane 能同时占满 context；不足的 active future
+headroom 必须在 admission 排队，而不能让已获准的长请求在后续滚动 stage-out 才发现 arena 不足。
 
 ---
 

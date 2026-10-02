@@ -255,6 +255,8 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::uint32_t root_rebuild_tail_begin = 0;
     bool text_retained_tail_release       = false;
     bool backend_retained_tail_release    = false;
+    // Full future sparse Host peak; kept outside physical inventory/entitlements.
+    std::size_t sparse_host_peak_bytes = 0;
 };
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
@@ -376,7 +378,8 @@ struct SequenceState {
 
 // Request-local retrieval state. A second admission/prefill must never overwrite
 // the first lane's selected history, partial capture or query replay checkpoint.
-// Long sparse continuations are not published; reset this state at every admission.
+// Query/replay state is rebuilt for each request, while safe shared prefix
+// checkpoints retain the history features and partial key accumulator below.
 struct KvmemLaneState {
     Tensor query_sum;
     Tensor key_sums;
@@ -391,6 +394,11 @@ struct KvmemLaneState {
     std::vector<MediaPageGroup> media_groups;
 };
 
+struct KvmemPrefixFeatures {
+    RetrievalIndex index;
+    std::vector<float> key_sums;
+};
+
 struct SharedPrefixState {
     std::optional<SequenceKVBundle> kv;
     StateImageHandle state;
@@ -401,6 +409,7 @@ struct SharedPrefixState {
     bool tail_hidden_valid         = false;
     runtime::PrefillWork rebuild_work;
     std::uint32_t active_references = 0;
+    std::shared_ptr<const KvmemPrefixFeatures> kvmem_features;
 };
 
 enum class SharedPrefixSlotRole : std::uint8_t {
@@ -426,6 +435,9 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    // Request-owned and released on every terminal/cleanup path. Catalogued
+    // continuations retain only real replicas, never an active future claim.
+    std::size_t sparse_host_peak_bytes = 0;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -520,6 +532,8 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    [[nodiscard]] bool can_plan_materialization() const noexcept;
+    [[nodiscard]] bool has_pending_kv_restore() const noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
@@ -573,6 +587,10 @@ public:
     }
 
     [[nodiscard]] qwen3_5::PhysicalUsageSnapshot physical_usage() const noexcept;
+    [[nodiscard]] qwen3_5::SparseKvmemSnapshot sparse_kvmem_snapshot() const noexcept;
+    [[nodiscard]] std::array<std::uint64_t, kMaximumConcurrency> sparse_kvmem_epochs() const noexcept {
+        return kvmem_observation_epochs_;
+    }
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -636,6 +654,8 @@ public:
     std::vector<SharedPrefixSlot> shared_prefix_slots;
     std::array<std::uint32_t, kMaximumConcurrency> active_continuations{};
     std::array<RequestControl, kMaximumConcurrency> requests;
+    // Observation identity only; never used for planning or resource revision.
+    std::array<std::uint64_t, kMaximumConcurrency> kvmem_observation_epochs_{};
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
 
     DecodeGraphFamily ordinary_graphs;
@@ -652,8 +672,23 @@ public:
     qwen3_5::MtpDecodeIngress* mtp_host_ingress = nullptr;
     qwen3_5::MtpDecodeEgress* mtp_host_egress   = nullptr;
     std::optional<PinnedHostBuffer> dflash_host;
-    qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
-    qwen3_5::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    qwen3_5::DFlashDecodeIngress* dflash_host_ingress          = nullptr;
+    qwen3_5::DFlashDecodeEgress* dflash_host_egress            = nullptr;
+    qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
+    // Opt-in observer storage. OFF allocates nothing and keeps the original kernels/copies.
+    std::uint32_t dflash_diagnostic_max_rounds = 0;
+    std::uint32_t dflash_diagnostic_every = 1;
+    std::optional<DeviceBuffer> dflash_diagnostic_device;
+    std::optional<PinnedHostBuffer> dflash_diagnostic_host;
+    Tensor dflash_diagnostic_mask;
+    Tensor dflash_diagnostic_packets;
+    std::int32_t* dflash_diagnostic_host_mask = nullptr;
+    SpeculativeProposalDiagnostic* dflash_diagnostic_host_packets = nullptr;
+    bool dflash_support_frontier_enabled = false;
+    std::optional<DeviceBuffer> dflash_support_frontier_device;
+    std::optional<PinnedHostBuffer> dflash_support_frontier_host;
+    Tensor dflash_support_frontiers;
+    DFlashSupportFrontier* dflash_support_frontier_host_packets = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
@@ -691,6 +726,8 @@ private:
     mutable std::uint32_t pressure_page_scratch_generation_ = 0;
     mutable std::vector<PressurePageScratchSlot> pressure_text_page_scratch_;
     mutable std::vector<PressurePageScratchSlot> pressure_backend_page_scratch_;
+    mutable std::vector<std::uint8_t> host_budget_text_seen_;
+    mutable std::vector<std::uint8_t> host_budget_backend_seen_;
     mutable std::vector<PressureSelectedPage> pressure_text_selected_pages_;
     mutable std::vector<PressureSelectedPage> pressure_backend_selected_pages_;
     mutable std::vector<std::uint8_t> pressure_private_owner_scratch_;
@@ -879,6 +916,7 @@ private:
         std::optional<KVAddressSpaceHandle> active_backend_destination;
         std::optional<KVActiveSnapshotReservation> text_snapshot;
         std::optional<KVActiveSnapshotReservation> backend_snapshot;
+        std::shared_ptr<const KvmemPrefixFeatures> kvmem_features;
         detail::PhysicalDelta resource_delta;
         detail::PhysicalDelta active_entitlement_delta;
         detail::PhysicalResources capacity_preparation_removed;
@@ -986,6 +1024,10 @@ private:
     [[nodiscard]] detail::PhysicalResources
     owner_exclusive_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
+    // Admission/pressure only. Returns nullopt on stale inventory/overflow;
+    // callers must fail closed. Published physical_usage stays unchanged.
+    [[nodiscard]] std::optional<detail::PhysicalResources>
+    admission_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
@@ -1198,6 +1240,8 @@ private:
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void roll_sparse_decode_window(SequenceState& sequence);
+    void record_kvmem_placement(SequenceState& sequence, KvmemPlacementPhase phase, bool backend,
+                               const KVAddressSpaceStore::KVPlacementCounts& counts) noexcept;
     void consume_kvmem_chunk_capture(SequenceState& sequence, std::uint32_t chunk_begin,
                                      std::uint32_t chunk_end);
     void finalize_kvmem_query(SequenceState& sequence, std::uint32_t prompt_tokens);

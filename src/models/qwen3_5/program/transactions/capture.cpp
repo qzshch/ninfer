@@ -602,6 +602,25 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
     }
     SequenceState& sequence = active_sequence(transaction.lane);
     if (transaction.publish_shared) {
+        if (kvmem_window_pages != 0) {
+            const auto& sparse = kvmem_lanes_.at(transaction.lane);
+            auto features = std::make_shared<KvmemPrefixFeatures>(
+                KvmemPrefixFeatures{.index = sparse.index, .key_sums = {}});
+            if (features->index.total_tokens() != transaction.group.frontier) {
+                throw std::logic_error("KVMem capture feature frontier is incomplete");
+            }
+            features->key_sums.resize(sparse.key_sums.bytes() / sizeof(float));
+            const auto copy_begin = Clock::now();
+            CUDA_CHECK(cudaMemcpyAsync(features->key_sums.data(), sparse.key_sums.data,
+                                        sparse.key_sums.bytes(), cudaMemcpyDeviceToHost,
+                                        device.stream));
+            device.synchronize();
+            requests[transaction.lane].timings.kvmem.key_capture_d2h_bytes += sparse.key_sums.bytes();
+            requests[transaction.lane].timings.kvmem.key_capture_submit_wait_ns +=
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now() - copy_begin).count());
+            transaction.kvmem_features = std::move(features);
+        }
         if (!transaction.shared_index || *transaction.shared_index >= shared_prefix_capacity) {
             throw std::logic_error("shared capture has no reserved descriptor");
         }
@@ -868,7 +887,26 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
                                                         : prefill.initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prefill.prompt_tokens
                                                                 : 0U;
-        ensure_sequence_kv_mapped(sequence, prefill.prompt_tokens, backend_materialized);
+        const std::uint32_t main_materialized = kvmem_window_pages != 0
+            ? std::min(prefill.prompt_tokens, prefill.cursor + prefill_chunk)
+            : prefill.prompt_tokens;
+        const std::uint32_t backend_growth =
+            kvmem_window_pages != 0 && backend_materialized != 0
+                ? std::min(backend_materialized, main_materialized +
+                    (speculative_backend == SpeculativeBackend::Mtp ? draft_window - 1U : 0U))
+                : backend_materialized;
+        if (kvmem_window_pages != 0) {
+            // Snapshot publication preserves the prefill working set and its
+            // growth claim; do not run the decode window policy at this boundary.
+            text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_materialized,
+                                                       device.stream);
+            if (backend_growth != 0) {
+                backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend,
+                                                               backend_growth, device.stream);
+            }
+        } else {
+            ensure_sequence_kv_mapped(sequence, main_materialized, backend_growth);
+        }
     }
 
     detail::PhysicalResources removed = transaction.capacity_preparation_removed;
@@ -956,6 +994,7 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         shared.rebuild_work      = validated_rebuild_work(transaction.group.identity->rebuild_work,
                                                           transaction.group.frontier);
         shared.active_references = 1;
+        shared.kvmem_features = std::move(transaction.kvmem_features);
         sequence.shared_prefix_references.push_back(index);
         slot.role = SharedPrefixSlotRole::Catalogued;
         out.shared.emplace(SharedPrefixPublication{

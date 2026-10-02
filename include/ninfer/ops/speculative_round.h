@@ -1,7 +1,10 @@
 #pragma once
 
+#include "ninfer/dflash_support_frontier.h"
+
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/speculative_diagnostics.h"
 
 #include <cuda_runtime.h>
 
@@ -160,6 +163,18 @@ void speculative_accept_sparse_drafts(
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
     SpeculativeAcceptExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream);
 
+// Opt-in observer. Runs the original acceptance kernels unchanged, then reads their
+// retained normalized support before workspace reuse. mask is I32[B], packets is
+// I32[16,2,B] (two 64-byte SpeculativeProposalDiagnostic packets). Unselected rows
+// are invalidated. Adds one observer kernel and no waits; caller owns sampled readback.
+void speculative_accept_sparse_drafts_diagnostic(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
+    Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
+    SpeculativeAcceptExecutionEnvelope envelope, const Tensor& mask, Tensor& packets,
+    WorkspaceArena& workspace, cudaStream_t stream);
+
 /**
  * Op: speculative_select_accepted_hidden
  *
@@ -171,6 +186,19 @@ void speculative_accept_sparse_drafts(
  *   and out is distinct contiguous BF16 [D,B]. The Op exactly copies BF16 bits, writes all of out,
  *   and uses no workspace or other state.
  */
+// Optional read-only rank observer. Disabled returns without allocation or launch.
+// Caller must run it after sparse acceptance and before token_counts publication.
+// Two bounded64B packets per sampled row; no sync and no probability mutation.
+enum class SpeculativeSupportFrontierMode { Disabled, ReadRanks };
+struct SpeculativeSupportFrontierOptions {
+    SpeculativeSupportFrontierMode mode = SpeculativeSupportFrontierMode::Disabled;
+};
+void speculative_collect_support_frontier(
+    const Tensor& logits, const Tensor& verify_ids, const Tensor& drafts, const Tensor& candidate_ids,
+    const Tensor& proposal_q, std::int32_t token_domain, const SamplingConfig* configs,
+    const Tensor& packets, Tensor& support_frontiers,
+    SpeculativeSupportFrontierOptions options, cudaStream_t stream = nullptr);
+
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,
                                         cudaStream_t stream);
 

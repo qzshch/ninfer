@@ -254,6 +254,17 @@ std::vector<qb::TestResult> sample_results() {
     tg.test = {qb::TestKind::Decode, 0, 3, "tg3"};
     tg.reps = {{timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4},
                {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4}};
+    auto& full = tg.reps[0].speculative;
+    full.attempted_per_position = {1, 1, 1, 1, 1};
+    full.reached_per_position = {1, 1, 1, 1, 1};
+    full.rejected_per_position = {0, 0, 0, 0, 0};
+    full.full_accept_rounds = 1;
+    full.licensed_output_tokens = 6;
+    full.published_output_tokens = 3;
+    full.published_accepted_tokens = 3;
+    full.discarded_licensed_tokens = 3;
+    tg.reps[1].speculative.licensed_output_tokens = 3;
+    tg.reps[1].speculative.published_output_tokens = 3;
     tg.workspace_peak_bytes           = 1024ULL * 1024ULL;
     tg.workspace_allocator_peak_bytes = 512ULL * 1024ULL;
     return {std::move(pp), std::move(tg)};
@@ -324,7 +335,7 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 15, "report schema v15");
+    failures += expect(report.at("schema_version") == 16, "report schema v16");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");
@@ -370,6 +381,14 @@ int test_report_contract() {
                             "decode engine throughput");
     failures += expect(tg.at("speculative").at("rounds") == 1, "speculative rounds");
     failures += expect(tg.at("speculative").at("fallback_steps") == 3, "speculative fallbacks");
+    failures += expect(tg.at("speculative").at("licensed_output_tokens") == 9 &&
+                           tg.at("speculative").at("published_output_tokens") == 6 &&
+                           tg.at("speculative").at("published_accepted_tokens") == 3 &&
+                           tg.at("speculative").at("discarded_licensed_tokens") == 3 &&
+                           tg.at("speculative").at("full_accept_rounds") == 1 &&
+                           tg.at("speculative").at("attempted_per_position") ==
+                               Json::array({1, 1, 1, 1, 1}),
+                       "aggregate speculative publication and live-extent diagnostics");
     failures += expect_near(tg.at("speculative").at("acceptance_rate").get<double>(), 1.0,
                             "speculative acceptance");
     failures += expect(tg.at("speculative").at("accepted_per_position").size() == 5,

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -20,6 +21,10 @@ using namespace ninfer;
 using namespace ninfer::test;
 
 namespace {
+
+// Enabled only by the dedicated observer oracle TU. Default suite stays unchanged.
+bool test_proposal_diagnostics = false;
+bool test_support_frontier = false;
 
 template <typename T>
 void initialize(GuardedDeviceBuffer& buffer, const std::vector<T>& values) {
@@ -452,6 +457,183 @@ struct SparseAcceptSuite {
             return checks;
         };
         int failures = check_result(expected, " eager");
+        std::vector<int> diagnostic_masks(kSparseBatch, 1);
+        std::optional<DeviceBuffer> d_diagnostic_masks;
+        std::optional<GuardedDeviceBuffer> d_diagnostic_packets;
+        Tensor diagnostic_mask_tensor, diagnostic_packets_tensor, support_frontier_tensor, support_verify_ids_tensor;
+        std::optional<GuardedDeviceBuffer> d_support_frontier, d_support_verify_ids;
+        std::vector<int> support_verify_ids;
+        bool observe = false;
+        if (test_proposal_diagnostics) {
+            for (int row = 0; row < kSparseBatch; ++row) diagnostic_masks[row] = row + 3;
+            if (kSparseBatch > 1) diagnostic_masks.back() = 0;
+            d_diagnostic_masks.emplace(to_device(diagnostic_masks));
+            d_diagnostic_packets.emplace(kSparseBatch * 2 * sizeof(SpeculativeProposalDiagnostic));
+            diagnostic_mask_tensor = Tensor(d_diagnostic_masks->p, DType::I32, {kSparseBatch});
+            diagnostic_packets_tensor = Tensor(d_diagnostic_packets->data(), DType::I32, {16, 2, kSparseBatch});
+            if (test_support_frontier) {
+                support_verify_ids.resize(static_cast<std::size_t>(kSparseBatch) * (kSparseDrafts + 1));
+                for (int row = 0; row < kSparseBatch; ++row) {
+                    support_verify_ids[row * (kSparseDrafts + 1)] = initial_anchors[row];
+                    for (int j = 1; j <= kSparseDrafts; ++j)
+                        support_verify_ids[row * (kSparseDrafts + 1) + j] = drafts[row * kSparseDrafts + j - 1];
+                }
+                d_support_verify_ids.emplace(support_verify_ids.size() * sizeof(int));
+                initialize(*d_support_verify_ids, support_verify_ids);
+                support_verify_ids_tensor = Tensor(d_support_verify_ids->data(), DType::I32, {kSparseDrafts + 1, kSparseBatch});
+                d_support_frontier.emplace(kSparseBatch * 2 * sizeof(DFlashSupportFrontier));
+                support_frontier_tensor = Tensor(d_support_frontier->data(), DType::I32, {16, 2, kSparseBatch});
+            }
+        }
+        const auto diagnostic_launch = [&](cudaStream_t stream) {
+            ops::speculative_accept_sparse_drafts_diagnostic(
+                target_tensor, logits_tensor, drafts_tensor, candidate_tensor, q_tensor,
+                extent_tensor, lengths_tensor, anchors_tensor, licensed_tensor,
+                licensed_counts_tensor, accepted_tensor, kSparseTokenDomain,
+                static_cast<const ops::SamplingConfig*>(d_configs.p), envelope,
+                diagnostic_mask_tensor, diagnostic_packets_tensor, workspace, stream);
+            if (test_support_frontier)
+                ops::speculative_collect_support_frontier(
+                    logits_tensor, support_verify_ids_tensor, drafts_tensor, candidate_tensor, q_tensor, kSparseTokenDomain,
+                    static_cast<const ops::SamplingConfig*>(d_configs.p), diagnostic_packets_tensor,
+                    support_frontier_tensor, {ops::SpeculativeSupportFrontierMode::ReadRanks}, stream);
+        };
+        const auto check_packets = [&](const SparseExpected& wanted,
+            const std::vector<std::uint16_t>& current_logits, const std::vector<float>& current_q,
+            const std::vector<int>& current_extents, const std::vector<int>& current_lengths) {
+            int checks = 0;
+            const auto packets = read<SpeculativeProposalDiagnostic>(*d_diagnostic_packets, kSparseBatch * 2);
+            const auto frontiers = test_support_frontier
+                ? read<DFlashSupportFrontier>(*d_support_frontier, kSparseBatch * 2)
+                : std::vector<DFlashSupportFrontier>{};
+            for (int row = 0; row < kSparseBatch; ++row) {
+                const int a = wanted.accepted[row];
+                const int live_extent = std::clamp(current_extents[row], 0, kSparseDrafts);
+                for (int which = 0; which < 2; ++which) {
+                    const auto& packet = packets[row * 2 + which];
+                    if (diagnostic_masks[row] == 0 || (which == 1 && a == 0)) {
+                        checks += packet.valid != 0;
+                        continue;
+                    }
+                    const int position = which == 0 ? (a < live_extent ? a : -1)
+                                                    : (diagnostic_masks[row] - 1) % a;
+                    const int column = position < 0 ? live_extent : position;
+                    const auto dist = sparse_target_distribution(current_logits, row, column,
+                                                                  host_configs[row], token_counts, drafts);
+                    const int proposal = position < 0 ? -1 : drafts[row * kSparseDrafts + position];
+                    double pd = 0;
+                    bool membership = false;
+                    for (std::size_t j = 0; j < dist.ids.size(); ++j)
+                        if (dist.ids[j] == proposal) { pd = dist.probabilities[j]; membership = true; }
+                    float qd = 0;
+                    bool top1_in_q = false;
+                    if (position >= 0) {
+                        for (int j = 0; j < kSparseCandidates; ++j) {
+                            const auto at = sparse_candidate_index(row, position, j);
+                            if (candidate_ids[at] == proposal) qd = current_q[at];
+                            if (candidate_ids[at] == dist.ids[0] && current_q[at] > 0) top1_in_q = true;
+                        }
+                    }
+                    const bool stochastic = host_configs[row].temperature > 0;
+                    const float u = stochastic && position >= 0
+                        ? oracle_uniform(host_configs[row].seed, current_lengths[row] + position + 1,
+                                         ops::kSamplePurposeSpeculativeAccept) : 0;
+                    bool bad = packet.valid != 1 || packet.stochastic != stochastic ||
+                        packet.position != position || packet.proposal_id != proposal ||
+                        packet.extent != live_extent || packet.accepted != a ||
+                        packet.kind != (which == 1 ? 1 : live_extent == 0 ? 3 : position < 0 ? 2 : 0) ||
+                        packet.target_top1 != dist.ids[0] || packet.target_support_size != static_cast<int>(dist.ids.size());
+                    if (position >= 0) {
+                        bad |= packet.draft_in_target_support != membership ||
+                               packet.target_top1_in_proposal_support != top1_in_q || packet.qd != qd || packet.u != u;
+                        if (stochastic) {
+                            const double probability = pd >= qd ? 1 : pd / qd;
+                            bad |= std::abs(packet.pd - pd) > 2e-5 ||
+                                   std::abs(packet.acceptance_probability - probability) > 2e-5;
+                            const bool accepted_by_rng = packet.pd >= packet.qd || packet.u * packet.qd < packet.pd;
+                            bad |= accepted_by_rng != (which == 1);
+                        }
+                    }
+                    if (bad) {
+                        ++checks;
+                        std::cerr << label << " diagnostic row=" << row << " which=" << which
+                                  << " pos=" << position << " pd=" << packet.pd << "/" << pd
+                                  << " qd=" << packet.qd << "/" << qd << '\n';
+                    }
+                }
+            }
+            if (test_support_frontier) {
+                for (int row = 0; row < kSparseBatch; ++row) {
+                    const auto& config = host_configs[row];
+                    for (int which = 0; which < 2; ++which) {
+                        const auto& packet = packets[row * 2 + which];
+                        const auto& actual = frontiers[row * 2 + which];
+                        if (packet.valid == 0 || packet.position < 0) {
+                            checks += actual.valid != 0;
+                            checks += actual.round_anchor_id != (packet.valid ? initial_anchors[row] : -1);
+                            continue;
+                        }
+                        const int pos = packet.position, proposal = packet.proposal_id;
+                        const auto raw = [&](int token) {
+                            return static_cast<double>(bf16_to_f32(current_logits[sparse_logit_index(row, pos, token)]));
+                        };
+                        const auto count = [&](int token) {
+                            int n = token_counts[static_cast<std::size_t>(row) * kSparseTokenDomain + token];
+                            for (int j = 0; j < pos; ++j) n += drafts[row * kSparseDrafts + j] == token;
+                            return n;
+                        };
+                        const auto adjusted = [&](int token) {
+                            double value = raw(token);
+                            const int n = count(token);
+                            if (n > 0) value -= config.presence_penalty;
+                            value -= static_cast<double>(config.frequency_penalty) * n;
+                            return value;
+                        };
+                        int raw_rank = 1, adjusted_rank = 1;
+                        for (int token = 0; token < kSparseTokenDomain; ++token) {
+                            raw_rank += raw(token) > raw(proposal) || (raw(token) == raw(proposal) && token < proposal);
+                            adjusted_rank += adjusted(token) > adjusted(proposal) ||
+                                (adjusted(token) == adjusted(proposal) && token < proposal);
+                        }
+                        const int cap = config.temperature > 0
+                            ? (config.top_k > 0 ? std::min(config.top_k, 20) : 20) : 1;
+                        int membership = 0, top1_slot = -1;
+                        float top1_q = 0;
+                        for (int slot = 0; slot < kSparseCandidates; ++slot) {
+                            const auto at = sparse_candidate_index(row, pos, slot);
+                            membership |= candidate_ids[at] == proposal;
+                            if (candidate_ids[at] == packet.target_top1) { top1_slot = slot; top1_q = current_q[at]; }
+                        }
+                        const auto stage = classify_dflash_support_frontier(
+                            packet.stochastic != 0, adjusted_rank, cap,
+                            packet.draft_in_target_support != 0, config.min_p, packet.pd, packet.qd);
+                        bool bad = actual.valid != 1 || actual.round_anchor_id != initial_anchors[row] || actual.raw_rank != raw_rank || actual.adjusted_rank != adjusted_rank ||
+                            actual.effective_top_k != cap || actual.proposal_in_raw_candidates != membership ||
+                            actual.target_top1_in_raw_candidates != (top1_slot >= 0) ||
+                            actual.target_top1_candidate_rank != top1_slot || actual.target_top1_q != top1_q ||
+                            actual.committed_count != token_counts[static_cast<std::size_t>(row) * kSparseTokenDomain + proposal] ||
+                            actual.committed_count + actual.overlay_count != count(proposal) ||
+                            std::abs(actual.raw_logit - raw(proposal)) > 1e-6 ||
+                            std::abs(actual.adjusted_logit - adjusted(proposal)) > 2e-5 || actual.stage != stage;
+                        if (bad) { ++checks; std::cerr << label << " support frontier row=" << row << " pos=" << pos << "\n"; }
+                    }
+                }
+                checks += d_support_frontier->verify_guards(label + " support frontier guards");
+                checks += d_support_verify_ids->verify_guards(label + " support verify-input guards");
+                checks += verify_exact("support verify-input readonly", read<int>(*d_support_verify_ids, support_verify_ids.size()), support_verify_ids);
+            }
+            checks += d_diagnostic_packets->verify_guards(label + " diagnostic guards");
+            return checks;
+        };
+        if (test_proposal_diagnostics) {
+            initialize(d_lengths, initial_lengths);
+            initialize(d_anchors, initial_anchors);
+            diagnostic_launch(nullptr);
+            cuda_synchronize();
+            failures += check_result(expected, " diagnosed eager versus original");
+            failures += check_packets(expected, logits, proposal_q, extents, initial_lengths);
+            observe = true;
+        }
         if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) ++failures;
         failures += scratch.verify_guards(label + " workspace");
         observed_workspace = std::max(observed_workspace, workspace.peak_used());
@@ -462,9 +644,15 @@ struct SparseAcceptSuite {
             {
                 DecodeGraphDefinition definition;
                 DecodeGraphExecutable executable;
-                definition.capture(stream, [&] { launch(stream); });
+                definition.capture(stream, [&] { if (observe) diagnostic_launch(stream); else launch(stream); });
                 executable.instantiate(definition);
                 for (int pass = 0; pass < 3; ++pass) {
+                    if (observe) {
+                        for (int row = 0; row < kSparseBatch; ++row)
+                            diagnostic_masks[row] = pass == 1 && row % 2 == 0 ? 0 : row + 3;
+                        d_diagnostic_masks->copy_from_host(diagnostic_masks.data(),
+                                                           diagnostic_masks.size() * sizeof(int));
+                    }
                     auto next_extents = extents;
                     auto next_lengths = initial_lengths;
                     if (pass == 1)
@@ -517,6 +705,8 @@ struct SparseAcceptSuite {
                                                              current_q, next_extents, next_lengths,
                                                              host_configs, token_counts);
                     failures += check_result(wanted, " replay " + std::to_string(pass));
+                    if (observe) failures += check_packets(wanted, current_logits, current_q,
+                                                          next_extents, next_lengths);
                     if (change_inputs) {
                         failures += verify_exact(
                             "replay logits readonly",

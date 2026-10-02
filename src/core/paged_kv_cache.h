@@ -351,16 +351,16 @@ public:
     [[nodiscard]] KVExecutionRowLease acquire(std::int32_t row);
 
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
-                 std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr);
+                 std::span<const DeviceKVPageHandle> pages, cudaStream_t stream);
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
-                 std::span<const DeviceKVPageLease> pages, cudaStream_t stream = nullptr);
+                 std::span<const DeviceKVPageLease> pages, cudaStream_t stream);
     void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
-                          cudaStream_t stream = nullptr);
+                          cudaStream_t stream);
     // Publishes kPagedKVPageHole for [logical_begin, logical_begin + count): the pages of this
     // range are not materialized in the device pool, and attention consumers must treat every
     // key of those pages as invisible.
     void publish_holes(KVExecutionRowHandle row, std::uint32_t logical_begin,
-                       std::uint32_t count, cudaStream_t stream = nullptr);
+                       std::uint32_t count, cudaStream_t stream);
 
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
 

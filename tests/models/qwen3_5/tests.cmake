@@ -19,6 +19,19 @@ ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
+ninfer_add_test(ninfer_qwen3_5_speculative_diagnostics_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_diagnostics.cpp")
+
+
+ninfer_add_test(ninfer_qwen3_5_proposal_diagnostics_host_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_proposal_diagnostics_host.cpp")
+
+ninfer_add_test(ninfer_qwen3_5_host_future_budget_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_future_budget.cpp")
+
+ninfer_add_test(ninfer_qwen3_5_kvmem_diagnostics_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kvmem_diagnostics.cpp")
+
 ninfer_add_test(ninfer_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"
   LIBRARIES ninfer_engine ninfer_core)
@@ -79,6 +92,14 @@ set_tests_properties(
   ninfer_qwen3_5_dflash2_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_qwen3_5_dflash_prefill_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
+
+set_tests_properties(
+  ninfer_qwen3_5_dflash_prefill_real_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_qwen3_5_moe_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_moe_real.cpp"
   LIBRARIES ninfer_engine)
@@ -106,3 +127,11 @@ ninfer_add_test(ninfer_qwen3_5_visual_scatter_test
 set_tests_properties(
   ninfer_qwen3_5_visual_scatter_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_support_frontier_host_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_support_frontier_host.cpp")
+
+ninfer_add_test(ninfer_qwen3_5_kvmem_prefix_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kvmem_prefix_real.cpp"
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_5_kvmem_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)

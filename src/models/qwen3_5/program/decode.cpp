@@ -2,6 +2,8 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/graph_execution.h"
+#include "models/qwen3_5/program/speculative/diagnostics.h"
+#include "models/qwen3_5/program/speculative/diagnostic_sampling.h"
 #include "core/nvtx.h"
 #include "core/device.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
@@ -143,7 +145,16 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .attempted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .reached_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .rejected_per_position = std::vector<std::uint64_t>(draft_window, 0),
     };
+    request.speculative_stats.diagnostic_max_rounds = dflash_diagnostic_max_rounds;
+    request.speculative_stats.diagnostic_every = dflash_diagnostic_every;
+    request.speculative_stats.support_frontier_enabled = dflash_support_frontier_enabled;
+    if (dflash_diagnostic_max_rounds != 0) {
+        request.speculative_stats.diagnostic_samples.reserve(dflash_diagnostic_max_rounds);
+    }
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
     if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream)); }
@@ -542,17 +553,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             validate_licensed_tokens(row_tokens);
             const std::uint32_t pcur =
                 static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
-            if (pcur == 0) {
-                request.speculative_stats.fallback_steps += 1;
-            } else {
-                request.speculative_stats.rounds += 1;
-                request.speculative_stats.drafted_tokens += pcur;
-                request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                for (std::int32_t i = 0; i < accepted_i; ++i) {
-                    request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
-                        1;
-                }
-            }
+            record_speculative_verification(request.speculative_stats, pcur,
+                                              static_cast<std::uint32_t>(accepted_i));
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,
                 .base_E        = base_E,
@@ -695,6 +697,21 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       backend_kv_cache() ? frontier : 0U);
         }
 
+        bool any_diagnostic_sample = false;
+        if (dflash_diagnostic_max_rounds != 0) {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const auto& stats = requests[lanes[row]].speculative_stats;
+                const auto round = stats.rounds + stats.fallback_steps;
+                const bool sample = sample_dflash_diagnostic_round(
+                    round, stats.diagnostic_samples.size(), dflash_diagnostic_max_rounds,
+                    dflash_diagnostic_every);
+                dflash_diagnostic_host_mask[row] = sample ? checked_i32(round + 1U, "diagnostic round") : 0;
+                any_diagnostic_sample |= sample;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(dflash_diagnostic_mask.data, dflash_diagnostic_host_mask,
+                                       lanes.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                       device.stream));
+        }
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -704,11 +721,24 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             *io.dflash_decode,
             *dflash_host_ingress,
             *dflash_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            dflash_diagnostic_mask, dflash_diagnostic_packets, dflash_support_frontiers};
 
         mark_workspace_usage(workspace_plan.dflash_round);
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                        draft_window, envelopes, target_envelope, executable);
+        if (any_diagnostic_sample) {
+            // The original egress copy stays unchanged. This bounded optional readback
+            // joins the same required completion wait, including graph execution.
+            CUDA_CHECK(cudaMemcpyAsync(dflash_diagnostic_host_packets, dflash_diagnostic_packets.data,
+                                       lanes.size() * 2 * sizeof(SpeculativeProposalDiagnostic),
+                                       cudaMemcpyDeviceToHost, device.stream));
+            if (dflash_support_frontier_enabled) {
+                CUDA_CHECK(cudaMemcpyAsync(dflash_support_frontier_host_packets,
+                    dflash_support_frontiers.data, lanes.size() * 2 * sizeof(DFlashSupportFrontier),
+                    cudaMemcpyDeviceToHost, device.stream));
+            }
+        }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -743,16 +773,43 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 std::fprintf(stderr, "KVMEM draft lane=%u extent=%u accepted=%d\n",
                              sequence.lane, extent, accepted_i);
             }
-            if (extent == 0) {
-                request.speculative_stats.fallback_steps += 1;
-            } else {
-                request.speculative_stats.rounds += 1;
-                request.speculative_stats.drafted_tokens += extent;
-                request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                for (std::int32_t i = 0; i < accepted_i; ++i) {
-                    request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
-                        1;
+            record_speculative_verification(request.speculative_stats, extent,
+                                              static_cast<std::uint32_t>(accepted_i));
+            if (dflash_diagnostic_max_rounds != 0 && dflash_diagnostic_host_mask[row] != 0) {
+                auto& stats = request.speculative_stats;
+                const auto first = dflash_diagnostic_host_packets[row * 2];
+                const auto accepted = dflash_diagnostic_host_packets[row * 2 + 1];
+                if (first.valid == 0 || first.extent != static_cast<std::int32_t>(extent) ||
+                    first.accepted != accepted_i ||
+                    (accepted_i > 0 && (accepted.valid == 0 || accepted.kind != 1 ||
+                                       accepted.position < 0 || accepted.position >= accepted_i))) {
+                    throw std::runtime_error("DFlash diagnostic packet does not match its licensed row");
                 }
+                const auto anchor_id = dflash_support_frontier_enabled
+                    ? dflash_support_frontier_host_packets[row * 2].round_anchor_id : -1;
+                const auto reached_prefix = [&](const SpeculativeProposalDiagnostic& packet) {
+                    std::vector<TokenId> ids;
+                    if (!dflash_support_frontier_enabled || packet.valid == 0 || packet.position < 0)
+                        return ids;
+                    if (anchor_id < 0 || packet.position > accepted_i)
+                        throw std::runtime_error("DFlash diagnostic prefix binding invalid");
+                    ids.reserve(static_cast<std::size_t>(packet.position) + 1);
+                    ids.push_back(anchor_id);
+                    ids.insert(ids.end(), row_tokens.begin(), row_tokens.begin() + packet.position);
+                    return ids;
+                };
+                stats.diagnostic_samples.push_back(SpeculativeDiagnosticSample{
+                    .round_index = stats.rounds + stats.fallback_steps - 1,
+                    .lane = sequence.lane, .frontier = base_E,
+                    .licensed_tokens = static_cast<std::uint32_t>(count_i),
+                    .first = first, .accepted = accepted,
+                    .first_support_frontier = dflash_support_frontier_enabled
+                        ? dflash_support_frontier_host_packets[row * 2] : DFlashSupportFrontier{},
+                    .accepted_support_frontier = dflash_support_frontier_enabled
+                        ? dflash_support_frontier_host_packets[row * 2 + 1] : DFlashSupportFrontier{},
+                    .round_anchor_id = anchor_id,
+                    .first_reached_prefix_token_ids = reached_prefix(first),
+                    .accepted_reached_prefix_token_ids = reached_prefix(accepted)});
             }
             sequence.dflash_context_frontier = base_E;
             request.pending                  = PendingCandidate{

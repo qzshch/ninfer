@@ -8,8 +8,8 @@ generation. An engine error, missing SSE terminator, missing usage, incorrect
 recall, or silent retrieval capture fails the run.
 
 ```bash
-export PYTHON=/home/druid/.local/bin/python3.11
-export NINFER_MODEL='/mnt/d/LLM Model/qwen3_8_27b_nvfp4.ninfer'
+export PYTHON=python3.11
+export NINFER_MODEL='/path/to/model.ninfer'
 bash tests/e2e/run_kvmem_pipeline.sh smoke
 bash tests/e2e/run_kvmem_pipeline.sh regression
 bash tests/e2e/run_kvmem_pipeline.sh long
@@ -28,7 +28,7 @@ runs that request and verifies subsequent inference; use the default 16K context
 64-page window and a chunk no larger than 2048 for this fixture.
 It also constrains Host KV to 32 MiB, requires an over-budget request to fail
 with HTTP 400 before execution, and verifies subsequent inference stays healthy.
-`long` adds the production 96K-device-window / 256K-logical-context ladder through
+`long` adds a 96K-device-window / 256K-logical-context test ladder through
 250K nominal tokens, twice on the same engine after cache-producing requests.
 Actual token counts and inference latency are recorded, not inferred from bytes.
 
@@ -46,33 +46,41 @@ For a focused run against a freshly built binary:
   --output /tmp/kvmem-check-unique --profile regression --window 64 --context 16384
 ```
 
-For two concurrent sparse lanes, run both decode backends:
+For two or three concurrent sparse lanes, run every supported decode backend:
+The artifact must contain a compatible DFlash2 companion for the `dflash2` case.
+The pipeline's `concurrency` profile tests ordinary/MTP and accepts
+`NINFER_TEST_CONCURRENCY=3`; its default remains two lanes.
 
 ```bash
 port=8095
-for spec in none mtp; do
+for lanes in 2 3; do
+for spec in none mtp dflash2; do
   "$PYTHON" tests/e2e/kvmem_suite.py --model "$NINFER_MODEL" \
-    --output "out/kvmem-tests/dual-$spec-$(date -u +%Y%m%dT%H%M%SZ)" \
-    --profile concurrency --concurrency 2 --spec "$spec" \
+    --output "out/kvmem-tests/c$lanes-$spec-$(date -u +%Y%m%dT%H%M%SZ)" \
+    --profile concurrency --concurrency "$lanes" --spec "$spec" \
     --window 64 --context 16384 --chunk 1024 --host-mib 2048 --port "$port"
   port=$((port + 1))
+done
 done
 ```
 
 This profile compares greedy output from isolated and simultaneous requests,
-requires two real decode lanes in the same GPU batch, and requires both lanes to
-restore scored historical pages from Host KV. Repeated pairs exercise lane reuse;
-disconnecting one active lane must leave the other generating and permit another
+requires every configured lane in the same GPU batch, and requires every lane to
+restore scored historical pages from Host KV. Repeated batches exercise lane reuse;
+disconnecting one active lane must leave every other lane generating and permit another
 request afterwards. HTTP overlap alone cannot pass this profile. These controlled
 output comparisons are regression checks, not broad model quality equivalence.
 
 To serve with this implementation, use `--max-concurrency 2 --kv-capacity auto`
+or the experimental `--max-concurrency 3` when sufficient headroom remains
 alongside your KVMem options. The window remains **per lane**: auto capacity is
 `lanes * min(ceil(context/64), window_pages + ceil(min(chunk,context)/64) + 16)`
 Main KV pages, plus the existing per-lane MTP lead when enabled. Model weights are
 shared, while recurrent state and retrieval capture storage grow with concurrency.
 `--host-kv-mib` is the shared Host budget; requests can queue if their combined
-reservations do not fit. Two lanes do not imply twice the tokens per second.
+reservations do not fit. More lanes do not guarantee higher tokens per second;
+four or more KVMem lanes are rejected until independently qualified. Stop before
+Device allocation failure or Host/Windows commit headroom is exhausted.
 
 Numerical oracle tests qualify attention mathematics. The model tests establish
 the listed inference behaviors, not LongMemEval quality parity or universal
@@ -81,11 +89,11 @@ Recall requires the correct final answer line, not a substring appearing anywher
 `exact_answer_format` separately records whether the model omitted all extra prose;
 format compliance is reported rather than used as a storage-stability gate.
 
-The manual GitHub Actions workflow requires a self-hosted Linux x64 runner with
-the `ninfer-sm120a` label and a repository variable `NINFER_E2E_MODEL` pointing to
-the model on that runner. Optionally set `NINFER_E2E_PYTHON`. It uploads reports
-even after failure. Workflow installation and remote execution are separate from
-a passing local run.
+For self-hosted GPU CI, supply an idle Linux x64 worker, an explicit model path
+and the Python 3.11 interpreter, and invoke the same local runner shown above.
+Serialize jobs using the GPU and preserve reports after both success and failure.
+This test tooling does not install or start a remote workflow; configuring remote
+execution is separate from a passing local run.
 
 ## Diagnostic quality comparisons
 
@@ -176,10 +184,14 @@ Even zero disagreements has nonzero uncertainty, and 500 questions do not guaran
 enough power to certify a 1pp margin. Statistics do not establish
 comparability of model weights, budgets or grading, and never auto-certify parity.
 
-For this integration the agreed overall noninferiority margin is **1 percentage
-point**, supported by a paired **95%** interval; task families are reported separately.
-The comparison emits an interval-only indicator against that fixed margin, while
-`equivalence_established` stays false until the dataset, execution and comparability
+The comparison reports a paired **95%** interval and an interval-only indicator
+against a **1 percentage point** margin. That diagnostic threshold is not an
+upstream acceptance policy or proof of lossless output. Select representative
+workloads before comparing a change, repeat paired A/B runs, and include repeated
+A/A controls to characterize run-to-run variability. Inspect task-family
+regressions as well as aggregate results. These repeated-run controls must be
+planned and analyzed separately; the interval tool does not perform them.
+`equivalence_established` stays false until dataset, execution and comparability
 requirements have also been qualified. Small pilot intervals are insufficient.
 
 Whole-answer reviews can be attached without altering the raw predictions:

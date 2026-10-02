@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 #include "core/device.h"
+#include "core/decode_graph.h"
+#include "ops/linear/linear_test_common.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -12,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <numeric>
 #include <span>
 #include <string>
 #include <vector>
@@ -89,10 +92,25 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-    const std::int32_t first_a4 = k == 6144 ? 7 : 8;
+    const std::int32_t first_a4 = k == 6144 ? 17 : 8;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{5, ops::LinearPolicy::A16Only},
+        Invocation{8, ops::LinearPolicy::A16Only},
+        Invocation{16, ops::LinearPolicy::A16Only},
+        Invocation{17, ops::LinearPolicy::A16Only},
+        Invocation{24, ops::LinearPolicy::A16Only},
+        Invocation{25, ops::LinearPolicy::A16Only},
+        Invocation{32, ops::LinearPolicy::A16Only},
+        Invocation{33, ops::LinearPolicy::A16Only},
+        Invocation{48, ops::LinearPolicy::A16Only},
+        Invocation{49, ops::LinearPolicy::A16Only},
+        Invocation{64, ops::LinearPolicy::A16Only},
+        Invocation{65, ops::LinearPolicy::A16Only},
+        Invocation{128, ops::LinearPolicy::A16Only},
+        Invocation{129, ops::LinearPolicy::A16Only},
+        Invocation{1024, ops::LinearPolicy::A16Only},
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{8, ops::LinearPolicy::AllowA4},
@@ -214,6 +232,106 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     return failures;
 }
 
+
+int run_down_full_small() {
+    constexpr std::int32_t n = 5120, k = 17408, maximum_t = 65;
+    constexpr std::array cases{7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 63, 64, 65};
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor = 3.5F;
+    const auto packed = quantized_weight::make_patterned_weight(QType::NVFP4, n, k, 827U, options);
+    const auto activation = make_activation(k, maximum_t, 829U);
+    const auto residual = make_residual(n, maximum_t, 831U);
+    std::vector<double> dot_reference(static_cast<std::size_t>(n) * maximum_t);
+    {
+        std::vector<std::int32_t> rows(n);
+        std::iota(rows.begin(), rows.end(), 0);
+        const auto weight = quantized_weight::materialize_rows_fp32(packed, rows);
+        std::vector<float> x(activation.size());
+        std::transform(activation.begin(), activation.end(), x.begin(), bf16_to_f32);
+        // Independent naive FP64 GEMM on represented public operands. The fused
+        // formula adds the original BF16 residual without a private BF16 GEMM cast.
+        linear::cpu_linear_gemm_fp64(weight.data(), x.data(), dot_reference.data(), n, k, maximum_t);
+    }
+    GuardedDeviceBuffer dx(activation.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dw(packed.payload.size());
+    dw.copy_from_host(packed.payload.data(), dw.bytes());
+    const auto weight = packed.device_weight(dw.data());
+    int failures = 0;
+    for (const std::int32_t t : cases) {
+        for (const bool capture : {false, true}) {
+            const auto words = static_cast<std::size_t>(n) * t;
+            GuardedDeviceBuffer dr(words * sizeof(std::uint16_t));
+            DeviceContext context;
+            Tensor input(dx.data(), DType::BF16, {k, t});
+            Tensor output(dr.data(), DType::BF16, {n, t});
+            const auto capacity = ops::linear_add_workspace_capacity_bytes(
+                QType::NVFP4, n, k, ops::LinearPolicy::AllowA4, t, t);
+            WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+            // GuardedDeviceBuffer initialization and its initial weight upload use
+            // the default stream. Settle them before capture on a non-blocking stream.
+            cuda_check(cudaStreamSynchronize(nullptr), "settle full LinearAdd initialization");
+            const auto launch = [&] {
+                ops::linear_add(input, weight, output, ops::LinearPolicy::AllowA4, workspace,
+                                context.stream);
+            };
+            DecodeGraphDefinition definition;
+            DecodeGraphExecutable graph;
+            if (capture) {
+                definition.capture(context.stream, launch);
+                graph.instantiate(definition);
+            }
+            for (int replay = 0; replay < (capture ? 4 : 1); ++replay) {
+                auto current_x = activation;
+                std::vector<std::uint16_t> current_r(residual.begin(), residual.begin() + words);
+                if (replay == 1) {
+                    for (auto& bits : current_x) bits ^= 0x8000U;
+                    for (auto& bits : current_r) bits ^= 0x8000U;
+                } else if (replay == 2) {
+                    std::fill(current_x.begin(), current_x.end(), 0);
+                }
+                // Pageable cudaMemcpy H2D can return after staging, before DMA
+                // finishes. Order X/R uploads on the consumer's stream; both Host
+                // vectors remain alive through the stream synchronization below.
+                cuda_check(cudaMemcpyAsync(dx.data(), current_x.data(), dx.bytes(),
+                                           cudaMemcpyHostToDevice, context.stream), "upload full LinearAdd X");
+                cuda_check(cudaMemcpyAsync(dr.data(), current_r.data(), dr.bytes(),
+                                           cudaMemcpyHostToDevice, context.stream), "restore full LinearAdd R");
+                if (capture) graph.launch(context.stream);
+                else launch();
+                cuda_check(cudaStreamSynchronize(context.stream), "synchronize full NVFP4 LinearAdd");
+                const std::string label = "NVFP4 LinearAdd full [5120,17408] T=" +
+                    std::to_string(t) + (capture ? " Graph" : " direct") + " replay=" + std::to_string(replay);
+                std::vector<std::uint16_t> bits(words);
+                dr.copy_to_host(bits.data(), dr.bytes());
+                std::vector<double> actual(words), expected(words);
+                for (std::size_t index = 0; index < words; ++index) {
+                    actual[index] = bf16_to_f32(bits[index]);
+                    expected[index] = replay == 2 ? bf16_to_f32(current_r[index])
+                        : (replay == 1 ? -dot_reference[index] : dot_reference[index]) +
+                              static_cast<double>(bf16_to_f32(current_r[index]));
+                    if (replay == 2 && bf16_to_f32(bits[index]) != bf16_to_f32(current_r[index])) {
+                        std::cerr << label << ": zero input reused stale activation or residual at " << index << '\n';
+                        ++failures;
+                        break;
+                    }
+                }
+                failures += verify_reduction(label, actual, expected, t < 8 ? kA16Tolerance : kA4Tolerance);
+                failures += dr.verify_guards(label);
+                failures += dx.verify_guards(label);
+                failures += verify_preserved(dx, {reinterpret_cast<const std::uint8_t*>(current_x.data()), dx.bytes()}, label);
+                if (workspace.used() != 0 || workspace.peak_used() != capacity) {
+                    std::cerr << label << ": workspace interval/high-water mismatch\n";
+                    ++failures;
+                }
+            }
+        }
+    }
+    failures += dw.verify_guards("full NVFP4 LinearAdd weight");
+    failures += verify_preserved(dw, packed.payload, "full NVFP4 LinearAdd weight");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -224,6 +342,7 @@ int main() {
     int failures = 0;
     failures += run_shape(5120, 6144, 811U);
     failures += run_shape(5120, 17408, 821U);
+    failures += run_down_full_small();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

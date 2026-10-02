@@ -17,7 +17,7 @@ import threading
 import time
 import zlib
 
-from kvmem_suite import Suite, validate_answer, validate_dual_lane_trace
+from kvmem_suite import Suite, validate_answer, validate_lane_trace
 
 
 def color_image(color, size=800):
@@ -168,7 +168,7 @@ class VisionSuite(Suite):
             assert paired[i]['usage']['completion_tokens'] == 1024, 'Early output termination'
         trace = self.trace(offset)
         if self.args.window:
-            evidence = validate_dual_lane_trace(trace, self.args.spec)
+            evidence = validate_lane_trace(trace, self.args.spec, 2)
         else:
             evidence = {'dense_control': True}
         return {'baseline': baseline, 'parallel': paired, 'trace': evidence}
@@ -177,6 +177,8 @@ class VisionSuite(Suite):
         try:
             self.request(self.prompt('BLUE', size=2560), tokens=16)
         except AssertionError as exc:
+            assert str(exc).startswith('HTTP 400:'), str(exc)
+            assert 'media_budget_exceeded' in str(exc), str(exc)
             assert 'KVMem window cannot hold a complete media group' in str(exc), str(exc)
             return {'expected_capacity_rejection': str(exc)}
         raise AssertionError('Oversized image was not rejected')
@@ -284,7 +286,7 @@ class VisionSuite(Suite):
             if self.args.window:
                 self.case('draft-ring-rollover', self.draft_ring_rollover)
             if 0 < self.args.window <= 64:
-                self.case('text-two-lane-isolation', lambda: self.parallel_pair(0))
+                self.case('text-two-lane-isolation', lambda: self.parallel_lanes(0))
                 self.case('cancel-decode-lane-and-reuse', self.cancel_one_lane)
             if self.args.window:
                 self.case('draft-rejection-workload', self.draft_rejection_workload)

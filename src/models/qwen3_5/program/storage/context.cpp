@@ -1,4 +1,6 @@
 #include "models/qwen3_5/program/retrieval/block_retrieval.h"
+#include "models/qwen3_5/program/retrieval/diagnostics.h"
+#include "models/qwen3_5/program/retrieval/host_budget.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
@@ -469,12 +471,76 @@ detail::PhysicalResources ProgramImpl::physical_occupancy() const noexcept {
     return out;
 }
 
+std::optional<detail::PhysicalResources> ProgramImpl::admission_occupancy() const noexcept {
+    detail::PhysicalResources out = physical_occupancy();
+    if (kvmem_window_pages == 0) { return out; }
+    try {
+        std::fill(host_budget_text_seen_.begin(), host_budget_text_seen_.end(), 0);
+        std::fill(host_budget_backend_seen_.begin(), host_budget_backend_seen_.end(), 0);
+        std::array<std::size_t, kMaximumConcurrency> peaks{};
+        std::size_t peak_count = 0, main_pages = 0, backend_pages = 0;
+        const auto credit_address = [&](const KVAddressSpaceStore& addresses,
+                                        const LogicalKVPageStore& pages,
+                                        KVAddressSpaceHandle address,
+                                        std::span<std::uint8_t> seen,
+                                        std::size_t& count) {
+            if (!addresses.valid(address) || !addresses.active(address)) { return false; }
+            for (std::uint32_t page = 0; page < addresses.mapped_pages(address); ++page) {
+                if (!pages.mark_host_replica_once(addresses.logical_page(address, page),
+                                                  seen, count)) { return false; }
+            }
+            return true;
+        };
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const RequestControl& request = requests[lane];
+            if (request.lifecycle == Lifecycle::Empty || request.sparse_host_peak_bytes == 0) {
+                continue;
+            }
+            if (peak_count == peaks.size() || active_continuations[lane] >= continuation_capacity) {
+                return std::nullopt;
+            }
+            peaks[peak_count++] = request.sparse_host_peak_bytes;
+            const SequenceState& sequence = active_sequence(lane);
+            if (!sequence.kv || !credit_address(*text_kv_addresses, *text_kv_pages,
+                    sequence.kv->text, host_budget_text_seen_, main_pages)) {
+                return std::nullopt;
+            }
+            if (sequence.kv->backend && (!backend_kv_addresses || !backend_kv_pages ||
+                !credit_address(*backend_kv_addresses, *backend_kv_pages,
+                    *sequence.kv->backend, host_budget_backend_seen_, backend_pages))) {
+                return std::nullopt;
+            }
+        }
+        const auto multiply = [](std::size_t pages, std::size_t stride)
+            -> std::optional<std::size_t> {
+            if (stride != 0 && pages > std::numeric_limits<std::size_t>::max() / stride) {
+                return std::nullopt;
+            }
+            return pages * stride;
+        };
+        const auto main = multiply(main_pages, text_host_kv_page_stride);
+        const auto backend = multiply(backend_pages, backend_host_kv_page_stride);
+        if (!main || !backend || *backend > std::numeric_limits<std::size_t>::max() - *main) {
+            return std::nullopt;
+        }
+        const auto budget = sparse_host_budget_occupancy(out.host.kv_bytes, *main + *backend,
+            std::span<const std::size_t>(peaks.data(), peak_count));
+        if (!budget) { return std::nullopt; }
+        out.host.kv_bytes = *budget;
+        return out;
+    } catch (...) { return std::nullopt; }
+}
+
 detail::PhysicalResources
 ProgramImpl::materialization_deficit(const ResourceCandidateState& admission) const {
     // Pressure is relative to this candidate's real peak. Treating every dimension as scarce
     // would forbid Device-to-Host demotion even when Host capacity is available.
     const detail::PhysicalResources required =
-        checked_resource_sum(physical_occupancy(), admission.demand.physical_peak_additional);
+        checked_resource_sum([&] {
+            const auto occupied = admission_occupancy();
+            if (!occupied) { throw std::logic_error("invalid active sparse Host budget"); }
+            return *occupied;
+        }(), admission.demand.physical_peak_additional);
     return positive_resource_difference(required, admission_capacity());
 }
 
@@ -488,12 +554,18 @@ ProgramImpl::guided_materialization_deficit(const ResourceCandidateState& admiss
         checked_resource_sum(admission.demand.physical_peak_additional, pressure.added),
         pressure.removed);
     const detail::PhysicalResources required =
-        checked_resource_sum(physical_occupancy(), projected_peak);
+        checked_resource_sum([&] {
+            const auto occupied = admission_occupancy();
+            if (!occupied) { throw std::logic_error("invalid active sparse Host budget"); }
+            return *occupied;
+        }(), projected_peak);
     return positive_resource_difference(required, admission_capacity());
 }
 
 bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
-    const detail::PhysicalResources occupied = physical_occupancy();
+    const auto budget_occupied = admission_occupancy();
+    if (!budget_occupied) { return false; }
+    const detail::PhysicalResources occupied = *budget_occupied;
     const detail::PhysicalResources limits   = admission_capacity();
     const auto fits_u32 = [](std::uint32_t used, std::uint32_t added, std::uint32_t capacity) {
         return added <= capacity && used <= capacity - added;
@@ -1016,6 +1088,7 @@ bool ProgramImpl::clear_lane_strict(SequenceState& sequence, RequestControl& req
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
     request.active_resources     = {};
+    request.sparse_host_peak_bytes = 0;
     request.optional_resources   = {};
     request.publish_continuation = true;
     return true;
@@ -1040,6 +1113,7 @@ void ProgramImpl::clear_lane_best_effort(SequenceState& sequence,
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
     request.active_resources     = {};
+    request.sparse_host_peak_bytes = 0;
     request.optional_resources   = {};
     request.publish_continuation = true;
     const auto* begin            = continuation_states.data();
@@ -1124,6 +1198,16 @@ void ProgramImpl::settle_state_fork(SequenceState& sequence) {
         throw std::logic_error("unreferenced StateImage fork source could not be released");
     }
     refresh_state_views(sequence);
+}
+
+bool ProgramImpl::has_pending_kv_restore() const noexcept {
+    const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
+    return transaction != nullptr &&
+           (!transaction->text_restores.empty() || !transaction->backend_restores.empty());
+}
+
+bool ProgramImpl::can_plan_materialization() const noexcept {
+    return !has_context_transaction() && !pending_transaction_ && !has_unsettled_state_fork();
 }
 
 bool ProgramImpl::has_unsettled_state_fork() const noexcept {
@@ -1391,11 +1475,12 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
     try {
         if (!text_active) {
             text_kv_addresses->activate(sequence.kv->text,
-                                        text_kv_addresses->mapped_pages(sequence.kv->text), row);
+                                        text_kv_addresses->mapped_pages(sequence.kv->text), row,
+                                        device.stream);
             if (sequence.kv->backend) {
                 backend_kv_addresses->activate(
                     *sequence.kv->backend,
-                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
+                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row, device.stream);
             }
         }
         set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
@@ -1573,8 +1658,20 @@ void ProgramImpl::ordered_reset(SequenceState& sequence) {
 // plus slack, pages outside the sink prefix and newest window demote to Host replicas
 // and the entitlement re-clamps, so unbounded generation rings the window instead of
 // exhausting it. Idempotent; runs at a decode GPU boundary before KV growth mapping.
+void ProgramImpl::record_kvmem_placement(
+    SequenceState& sequence, KvmemPlacementPhase phase, bool backend,
+    const KVAddressSpaceStore::KVPlacementCounts& counts) noexcept {
+    auto& diagnostics = requests[sequence.lane].timings.kvmem;
+    diagnostics.enabled = true;
+    add_kvmem_placement(diagnostics.placement[static_cast<std::size_t>(phase)][backend ? 1 : 0],
+                       counts.telemetry);
+}
+
 void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
     const auto& sparse = kvmem_lanes_.at(sequence.lane);
+    const auto phase = requests[sequence.lane].lifecycle == Lifecycle::Prefilling ||
+                       (requests[sequence.lane].lifecycle == Lifecycle::Empty && requests[sequence.lane].prefill)
+                           ? KvmemPlacementPhase::Prefill : KvmemPlacementPhase::Decode;
     constexpr std::uint32_t slack_pages = 2U;
     const std::uint32_t mapped_pages = text_kv_addresses->mapped_pages(sequence.kv->text);
     if (mapped_pages > kvmem_window_pages) {
@@ -1582,9 +1679,10 @@ void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
         const auto window =
             media_window_page_set(mapped_pages, kvmem_window_pages, sparse.retrieved_pages,
                                   sparse.media_groups);
-        text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
+        const auto placement = text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
             device.transfer_stream,
             requests[sequence.lane].lifecycle == Lifecycle::Prefilling ? "prefill-ensure" : "decode");
+        record_kvmem_placement(sequence, phase, false, placement);
         // Membership keeps growing with the conversation, so the clamp targets
         // mapped+slack (never a fixed page count): the reservation lands on the slack
         // margin regardless of how far the mapped prefix extends past the window.
@@ -1603,10 +1701,11 @@ void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
             const auto backend_window = media_window_page_set(
                 backend_mapped, kvmem_window_pages + lead_pages, sparse.retrieved_pages,
                 sparse.media_groups);
-            backend_kv_addresses->apply_device_placement(*sequence.kv->backend,
+            const auto placement = backend_kv_addresses->apply_device_placement(*sequence.kv->backend,
                                                          *host_kv_extents, backend_window,
                 device.transfer_stream,
                 requests[sequence.lane].lifecycle == Lifecycle::Prefilling ? "prefill-ensure" : "decode");
+            record_kvmem_placement(sequence, phase, true, placement);
             const std::uint32_t backend_clamped = std::min(
                 (capacity + kPagedKVPageSize - 1U) / kPagedKVPageSize, backend_mapped + slack_pages);
             if (backend_kv_addresses->entitlement(*sequence.kv->backend) != backend_clamped) {

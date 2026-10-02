@@ -33,6 +33,7 @@ struct GenerationMetrics {
     double generation_wall_seconds = 0.0;
     double total_seconds           = 0.0;
     ninfer::GenerationEngineTiming engine_timing;
+    ninfer::KvmemDiagnostics kvmem;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
     std::uint32_t speculative_draft_window    = 0;
@@ -41,6 +42,20 @@ struct GenerationMetrics {
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
+    std::vector<std::uint64_t> speculative_attempted_per_position;
+    std::vector<std::uint64_t> speculative_reached_per_position;
+    std::vector<std::uint64_t> speculative_rejected_per_position;
+    std::uint64_t speculative_zero_accept_rounds = 0;
+    std::uint64_t speculative_partial_accept_rounds = 0;
+    std::uint64_t speculative_full_accept_rounds = 0;
+    std::uint64_t speculative_licensed_output_tokens = 0;
+    std::uint64_t speculative_published_output_tokens = 0;
+    std::uint64_t speculative_published_accepted_tokens = 0;
+    std::uint64_t speculative_discarded_licensed_tokens = 0;
+    std::uint32_t speculative_diagnostic_max_rounds = 0;
+    std::uint32_t speculative_diagnostic_every = 1;
+    bool speculative_support_frontier_enabled = false;
+    std::vector<ninfer::SpeculativeDiagnosticSample> speculative_diagnostic_samples;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
     ninfer::MaterializationDiagnostics materialization;
@@ -52,6 +67,7 @@ struct GenerationOutcome {
     std::vector<ninfer::GeneratedToolCall> tool_calls;
     ninfer::ToolCallParseDiagnostics tool_call_parse;
     int prompt_tokens     = 0;
+    std::vector<ninfer::TokenId> diagnostic_input_token_ids;
     int completion_tokens = 0;
     int reasoning_tokens  = 0;
     ninfer::ThinkingBudgetStats thinking;

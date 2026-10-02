@@ -45,6 +45,15 @@ int run_nvfp4_a4() {
                           {5120, 6144, 723U, Comparison::Sampled, true, invocations});
     failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
                           {5120, 17408, 725U, Comparison::Sampled, true, invocations});
+    // Cover every output row, the small-token route boundary, and fresh
+    // activation codes/scales on graph replay against the independent FP64 GEMM.
+    std::vector<Invocation> n5120_down_full;
+    for (int t : {7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 63, 64, 65}) {
+        n5120_down_full.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4});
+        n5120_down_full.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4, true});
+    }
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {5120, 17408, 727U, Comparison::Full, true, n5120_down_full});
     return failures;
 }
 

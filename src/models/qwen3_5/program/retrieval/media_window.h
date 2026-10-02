@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/types.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/retrieval/block_retrieval.h"
 
@@ -47,7 +48,8 @@ inline void validate_media_window(std::span<const MediaPageGroup> groups, std::u
         // admission rather than silently cutting a media group midway through prefill.
         const auto required = sink_extent + (group.begin < 2 ? 0 : group.end - group.begin) + 2;
         if (required > budget) {
-            throw std::invalid_argument("KVMem window cannot hold a complete media group plus sink and tail pages");
+            throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                "KVMem window cannot hold a complete media group plus sink and tail pages");
         }
     }
 }

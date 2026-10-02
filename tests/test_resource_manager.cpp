@@ -3203,6 +3203,42 @@ void test_terminal_fallback_releases_failed_retention() {
             "terminal fallback did not free every logical owner");
 }
 
+void test_released_finish_with_enabled_host_arena_has_no_catalog_retention() {
+    // Cache catalog/Host arena stay enabled. Program's no-participation plan returns Released,
+    // unlike disabling the Engine cache or simulating a failed catalog publication.
+    FakeManager manager = make_manager(2, 2, 0, true);
+    FakeProgram program;
+    program.finish_release = true;
+    auto base = make_base(4);
+    base.value.publish_continuation = false;
+    base.allow_shortlist = false;
+    std::uint64_t order = 1;
+    for (unsigned repeat = 0; repeat < 8; ++repeat) {
+        const ActiveRequest first = start_active(manager, program, 4, base, order++);
+        const ActiveRequest second = start_active(manager, program, 4, base, order++);
+        require(first.lane.value != second.lane.value,
+                "no-retention fixture did not occupy both lanes");
+        for (const auto& active : {first, second}) {
+            const auto result = finish_active(manager, program, active);
+            require(result.status == ConsumeStatus::Consumed &&
+                        result.disposition == FinishDisposition::Released && !result.continuation &&
+                        manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Free,
+                    "released no-retention finish did not free the active owner");
+        }
+        for (unsigned slot = 0; slot < 2; ++slot) {
+            require(manager.catalog_state(slot) == FakeManager::CatalogState::Vacant,
+                    "released finish kept a catalog continuation with Host arena enabled");
+        }
+        auto inspect = manager.inspect(program, FakePreparedPrompt{4}, base, order++);
+        require(inspect.choice && inspect.choice->summary().reusable_prompt_tokens == 0 &&
+                    inspect.choice->summary().prefix_reuse_path == PrefixReusePath::Root,
+                "repeated identical prompt reused a no-retention endpoint");
+    }
+    require(program.finish_calls == 16 && program.abort_calls == 0 &&
+                program.released_continuations.empty(),
+            "no-retention lifecycle required retained-blob release or abort fallback");
+}
+
 void test_terminal_settlement_waits_for_open_resource_transaction() {
     FakeManager manager = make_manager(2, 3);
     FakeProgram program;
@@ -3519,6 +3555,8 @@ int main() {
              test_capture_result_is_validated_before_any_adoption);
     run_test("capture result owner identity", test_capture_result_is_adopted_by_owner_identity);
     run_test("terminal fallback", test_terminal_fallback_releases_failed_retention);
+    run_test("no-retention released lifecycle with Host arena enabled",
+             test_released_finish_with_enabled_host_arena_has_no_catalog_retention);
     run_test("terminal waits for resource transaction",
              test_terminal_settlement_waits_for_open_resource_transaction);
     run_test("commit and discard", test_commit_and_discard_terminal_states);

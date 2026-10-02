@@ -342,6 +342,12 @@ Program::progress_context_transaction(runtime::CancellationFlagView cancellation
 void Program::finalize_context_transaction() noexcept { impl_->finalize_context_transaction(); }
 
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
+bool Program::has_pending_kv_restore() const noexcept { return impl_->has_pending_kv_restore(); }
+
+bool Program::can_plan_materialization() const noexcept {
+    return impl_->can_plan_materialization();
+}
+
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
                                          runtime::ExecutionTiming* failed_timing) {
@@ -468,6 +474,14 @@ runtime::ProgramResourceRevision Program::resource_revision() const noexcept {
 
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 
+SparseKvmemSnapshot Program::sparse_kvmem_snapshot() const noexcept {
+    return impl_->sparse_kvmem_snapshot();
+}
+
+std::array<std::uint64_t, kMaximumConcurrency> Program::sparse_kvmem_epochs() const noexcept {
+    return impl_->sparse_kvmem_epochs();
+}
+
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
@@ -483,6 +497,9 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->parameters != &parameters) {
         throw std::invalid_argument("sequence plan belongs to another model instance");
+    }
+    if (plan.impl_->multiprocessor_count != device.multiprocessor_count()) {
+        throw std::invalid_argument("sequence plan device capacity does not match execution");
     }
     auto impl =
         std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);

@@ -174,7 +174,6 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
     } else {
         append_clause(out, classification_name(failure.classification));
     }
-    if (!failure.machine_message.empty()) { out << " | " << failure.machine_message; }
 }
 
 } // namespace

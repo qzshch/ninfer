@@ -26,6 +26,10 @@ namespace ninfer::models::qwen3_5::execution {
 
 using Phase = qwen3_5::TextPhase;
 
+// Model-owned retrieval capture geometry. Split prefill chunks can contribute
+// to the same block across launches; the generic accumulation Op has no policy.
+inline constexpr std::uint32_t kKvmemCaptureBlockTokens = 128;
+
 enum class GdnStateAction : std::uint8_t {
     UpdateInPlace,
     RecordForReplay,

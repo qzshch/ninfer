@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from kvmem_suite import Suite, parse_sse, validate_answer, validate_json, validate_dual_lane_trace
+from kvmem_suite import Suite, parse_sse, validate_answer, validate_json, validate_lane_trace
 
 
 class ResponseContractTests(unittest.TestCase):
@@ -12,11 +12,22 @@ class ResponseContractTests(unittest.TestCase):
         placements = ("KVMEM retrieval scored=12 selected=20 promoted=3 demoted=2 lane=0\n"
                       "KVMEM retrieval scored=11 selected=20 promoted=4 demoted=1 lane=1\n")
         with self.assertRaisesRegex(AssertionError, 'no verified'):
-            validate_dual_lane_trace(placements, 'mtp')
+            validate_lane_trace(placements, 'mtp', 2)
         with self.assertRaisesRegex(AssertionError, 'no verified'):
-            validate_dual_lane_trace('KVMEM decode backend=mtp lanes=2\n', 'mtp')
-        result = validate_dual_lane_trace(placements + 'KVMEM decode backend=mtp lanes=2\n', 'mtp')
+            validate_lane_trace('KVMEM decode backend=mtp lanes=2\n', 'mtp', 2)
+        result = validate_lane_trace(placements + 'KVMEM decode backend=mtp lanes=2\n', 'mtp', 2)
         self.assertEqual(result['retrieved_lanes'], [0, 1])
+
+    def test_three_lane_execution_requires_all_three_retrievals_and_a_real_batch(self):
+        placements = ''.join(f'KVMEM retrieval scored=12 selected=20 promoted=3 demoted=2 lane={i}\n'
+                             for i in range(3))
+        with self.assertRaisesRegex(AssertionError, 'no verified'):
+            validate_lane_trace(placements + 'KVMEM decode backend=dflash2 lanes=2\n', 'dflash2', 3)
+        with self.assertRaisesRegex(AssertionError, 'no verified'):
+            validate_lane_trace(placements.replace('lane=2', 'lane=1') +
+                                'KVMEM decode backend=dflash2 lanes=3\n', 'dflash2', 3)
+        result = validate_lane_trace(placements + 'KVMEM decode backend=dflash2 lanes=3\n', 'dflash2', 3)
+        self.assertEqual(result['retrieved_lanes'], [0, 1, 2])
 
     def test_memory_guard_stops_only_owned_server_and_fails_report(self):
         with TemporaryDirectory() as directory:

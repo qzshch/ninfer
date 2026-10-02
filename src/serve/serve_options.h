@@ -51,6 +51,9 @@ struct ServeOptions {
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
+    // Disable per-request cache reads, captures and terminal continuation publication while
+    // keeping the Engine Host KV arena available for sparse KVMem storage.
+    bool allow_context_retention = true;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
     std::optional<std::uint32_t> default_thinking_budget;
@@ -66,6 +69,10 @@ struct ServeOptions {
     // while parsing; this is provenance only and never affects execution.
     std::vector<std::string> startup_argv;
 };
+
+[[nodiscard]] inline bool context_cache_participation_enabled(const ServeOptions& options) {
+    return options.allow_prefix_reuse && options.allow_context_retention;
+}
 
 ServeOptions parse_serve_options(int argc, char** argv);
 std::string resolve_public_model_id(const ServeOptions& options,

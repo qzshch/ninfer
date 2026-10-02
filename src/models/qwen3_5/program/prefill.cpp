@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/retrieval/block_retrieval.h"
+#include "models/qwen3_5/program/retrieval/diagnostics.h"
 #include "models/qwen3_5/program/retrieval/query_span.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -29,22 +30,26 @@ namespace ninfer::models::qwen3_5::execution {
 namespace {
 
 DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
-    if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
+    if (!state.execution.io.dflash_prefill || state.dflash_prefill_host_ingress == nullptr) {
         throw std::logic_error("DFlash prefill controls are unavailable");
     }
     return dflash_feature_sink(
         state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
-            auto& frame  = *state.execution.io.dflash_decode;
-            Tensor count = frame.append_counts.slice(0, 0, 1);
-            Tensor lane  = frame.state_destination_slots.slice(0, 0, 1);
-            Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
-            ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
-            // Decode and other lanes share this frame. Publish this chunk's actual
-            // state slot and KV row every time, including query replay after a yield.
-            ops::set_i32_scalar(lane, state.state_destination_slot, state.execution.device.stream);
-            ops::set_i32_scalar(row, state.dflash_kv_table_row, state.execution.device.stream);
+            auto& frame = *state.execution.io.dflash_prefill;
+            // Target execution and draft append use the same chunk bindings. Decode may have
+            // used another compact row, or a checkpoint may have forked the destination slot.
+            *state.dflash_prefill_host_ingress = {
+                .append_count           = features.ne[1],
+                .state_destination_slot = state.state_destination_slot,
+                .full_kv_table_row      = state.dflash_kv_table_row,
+            };
+            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, state.dflash_prefill_host_ingress,
+                                       sizeof(qwen3_5::DFlashPrefillIngress),
+                                       cudaMemcpyHostToDevice, state.execution.device.stream));
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
-            dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
+            dflash_append_context(state, features, positions, frame.append_count,
+                                  frame.state_destination_slot, frame.full_kv_table_row,
+                                  {exact, exact});
             (void)rewrite_checkpoint;
         });
 }
@@ -213,6 +218,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     const std::uint32_t base               = staged.base;
     const std::uint32_t initial_mtp_extent = staged.initial_mtp_extent;
     request.lifecycle                      = Lifecycle::Empty;
+    request.timings                        = {};
+    ++kvmem_observation_epochs_[lane];
+    request.timings.kvmem.enabled           = kvmem_window_pages != 0;
     try {
         const std::uint32_t state_slots = request_plan.demand.active_entitlement.device.state_slots;
         const bool preserving_source =
@@ -663,14 +671,26 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             // branches. Never reuse another conversation's block IDs or aborted sums.
             sparse.index.truncate_to(0);
             (void)sparse.index.append(base);
+            const KvmemPrefixFeatures* prefix_features =
+                transaction.has_shared_source
+                    ? shared_prefix_states[transaction.shared_source_index].kvmem_features.get()
+                    : nullptr;
+            if (prefix_features != nullptr) {
+                if (prefix_features->index.total_tokens() != base ||
+                    prefix_features->key_sums.size() * sizeof(float) != sparse.key_sums.bytes()) {
+                    throw std::logic_error("cached KVMem feature coverage disagrees with prefix");
+                }
+                sparse.index = prefix_features->index;
+            }
             sparse.query.clear();
             sparse.query_count.clear();
             sparse.retrieved_pages.clear();
             sparse.media_groups = media_page_groups(staged.prompt.vision_items);
-            sparse.capture_begin = base;
+            sparse.capture_begin = prefix_features != nullptr
+                ? base - base % execution::kKvmemCaptureBlockTokens : base;
             sparse.query_checkpoint_valid = false;
-            // Long sparse requests currently restart from root, so their User span is
-            // available to capture even when followed by an arbitrarily long tool tail.
+            // Restores stop before query capture, including requests followed by a
+            // long tool tail. The current request always rebuilds its query state.
             const auto query = kvmem_query_span(prompt_tokens, base, staged.prompt.retrieval_query,
                                                staged.prompt.vision_items);
             sparse.query_end = query.end;
@@ -679,12 +699,20 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 staged.vision->retain_for_replay(query.begin);
             }
             if (std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+                std::fprintf(stderr, "KVMEM begin lane=%u base=%u shared=%d reuse=%u\n",
+                    sequence.lane, base, transaction.has_shared_source,
+                    static_cast<unsigned>(request_plan.reuse));
                 std::fprintf(stderr, "KVMEM query source=%s begin=%u end=%u prompt=%u\n",
                              query.exact ? "last_user" : "suffix", sparse.query_begin,
                              sparse.query_end, prompt_tokens);
             }
             CUDA_CHECK(cudaMemsetAsync(sparse.query_sum.data, 0, sparse.query_sum.bytes(), device.stream));
             CUDA_CHECK(cudaMemsetAsync(sparse.key_sums.data, 0, sparse.key_sums.bytes(), device.stream));
+            if (prefix_features != nullptr) {
+                CUDA_CHECK(cudaMemcpyAsync(sparse.key_sums.data, prefix_features->key_sums.data(),
+                                            sparse.key_sums.bytes(), cudaMemcpyHostToDevice,
+                                            device.stream));
+            }
             // Sparse prefill maps only the first chunk of growth;
             // chunk boundaries demote the committed overflow to Host replicas afterwards.
             main_materialized = std::min(
@@ -697,12 +725,41 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 backend_materialized = main_materialized + lead;
             }
         }
-        ensure_sequence_kv_mapped(sequence, main_materialized, backend_materialized);
+        if (kvmem_window_pages != 0) {
+            // The restored checkpoint already names the first-pass working set.
+            // Decode rolling would replace that set and shrink the chunk growth
+            // reservation to the speculative decode margin before prefill runs.
+            text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_materialized,
+                                                       device.stream);
+            if (backend_materialized != 0) {
+                backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend,
+                                                               backend_materialized, device.stream);
+            }
+        } else {
+        if (kvmem_window_pages != 0) {
+            // The restored checkpoint already names the first-pass working set.
+            // Decode rolling would replace that set and shrink the chunk growth
+            // reservation to the speculative decode margin before prefill runs.
+            text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_materialized,
+                                                       device.stream);
+            if (backend_materialized != 0) {
+                backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend,
+                                                               backend_materialized, device.stream);
+            }
+        } else {
+            ensure_sequence_kv_mapped(sequence, main_materialized, backend_materialized);
+        }
+        }
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
+        if (kvmem_window_pages != 0 && !sparse.query_checkpoint_valid &&
+            staged.prompt_tokens > kvmem_window_pages * kPagedKVPageSize &&
+            sparse.query_begin != 0 && staged.cursor == sparse.query_begin) {
+            copy_kvmem_query_state(sequence, false);
+            sparse.query_checkpoint_valid = true;
+        }
 
-        request.timings              = {};
         request.pending              = {};
         request.publish_continuation = request_plan.summary.publish_continuation;
         sequence.mtp_draft_count     = 0;
@@ -714,19 +771,10 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
         if (is_masked_draft_backend(speculative_backend)) {
-            if (!dflash || !io.dflash_decode || (backend_kv_cache() && !sequence.kv->backend)) {
+            if (!dflash || !io.dflash_prefill || !dflash_prefill_host_ingress ||
+                (backend_kv_cache() && !sequence.kv->backend)) {
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
-            *dflash_host_ingress                       = {};
-            dflash_host_ingress->active_lanes[0]       = static_cast<std::int32_t>(sequence.lane);
-            const StateImageSelectors selectors        = state_selectors(sequence);
-            dflash_host_ingress->state_source_slots[0] = selectors.source;
-            dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-            dflash_host_ingress->dflash_kv_table_rows[0] =
-                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
-            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                       sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       device.stream));
         }
 
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
@@ -1029,6 +1077,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        // Prefill IO is shared scratch. Restore this lane's table rows and rope
+        // scalar after another lane's admission, prefill, or decode unit.
+        bind_sequence_kv(sequence);
+        set_device_i32(io.rope_delta, sequence.rope_delta);
+        KvmemReplayStepTimer replay_step_timer(
+            staged.query_replay_cursor ? &request.timings.kvmem : nullptr);
         if (staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == staged.cursor) {
             if (staged.cursor != staged.base ||
@@ -1075,8 +1129,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             selectors.source,
             selectors.destination,
             staged.initial_mtp_extent,
-            dflash_host_ingress,
-            sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0};
+            0,
+            dflash_prefill_host_ingress};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -1140,6 +1194,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
                 schedule_state.state_destination_slot = selectors.destination;
+                schedule_state.dflash_kv_table_row =
+                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                         : 0;
                 if (staged.next_capture < staged.capture_groups.size()) {
                     rewrite_capture_hidden =
                         state_images->continuation_hidden_slot(selectors.destination);
@@ -1413,9 +1470,11 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
                                                      sparse.retrieved_pages)
                             : prefill_window_page_set(mapped_pages, sink_pages,
                                                       kvmem_window_pages - sink_pages);
-    text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
+    const auto phase = retrieved_history ? KvmemPlacementPhase::Replay : KvmemPlacementPhase::Prefill;
+    const auto placement = text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
                                               device.transfer_stream,
                                               retrieved_history ? "replay" : "prefill");
+    record_kvmem_placement(sequence, phase, false, placement);
     if (next_pages > text_kv_addresses->entitlement(sequence.kv->text)) {
         text_kv_addresses->resize_entitlement(sequence.kv->text, next_pages);
     }
@@ -1442,16 +1501,18 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
                                      sparse.retrieved_pages)
             : prefill_window_page_set(backend_mapped, sink_pages,
                                       kvmem_window_pages - sink_pages + lead_pages);
-        backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
+        const auto backend_placement = backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
                                                      backend_window, device.transfer_stream,
                                                      retrieved_history ? "replay" : "prefill");
+        record_kvmem_placement(sequence, phase, true, backend_placement);
     }
 }
 
 void ProgramImpl::copy_kvmem_query_state(SequenceState& sequence, bool restore) {
     auto& live = state_images->linear();
     auto& snapshot = *kvmem_query_checkpoint_;
-    const auto slot = state_selectors(sequence).destination;
+    const auto selectors = state_selectors(sequence);
+    const auto slot = restore ? selectors.destination : selectors.source;
     if (is_masked_draft_backend(speculative_backend)) {
         const auto query_begin = kvmem_lanes_.at(sequence.lane).query_begin;
         if (!dflash || !kvmem_draft_checkpoint_ || dflash->full ||
@@ -1485,7 +1546,7 @@ std::uint32_t ProgramImpl::advance_kvmem_query_replay(SequenceState& sequence,
                                                      runtime::ExecutionTimingRecorder& timing) {
     auto& sparse = kvmem_lanes_.at(sequence.lane);
     if (!sparse.query_checkpoint_valid || !staged.query_replay_cursor ||
-        !staged.capture_groups.empty()) {
+        staged.next_capture != staged.capture_groups.size()) {
         throw std::logic_error("sparse query replay has no private checkpoint");
     }
     auto& cursor = *staged.query_replay_cursor;
@@ -1540,8 +1601,9 @@ std::uint32_t ProgramImpl::advance_kvmem_query_replay(SequenceState& sequence,
             dflash ? &*dflash : nullptr, cursor,
             static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
-            nullptr, slots.source, slots.destination, staged.initial_mtp_extent, dflash_host_ingress,
-            sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0};
+            nullptr, slots.source, slots.destination, staged.initial_mtp_extent,
+            sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0,
+            dflash_prefill_host_ingress};
         if (dflash) { mark_workspace_usage(workspace_plan.dflash_context); }
         const auto count = std::min(prefill_chunk, staged.prompt_tokens - cursor);
         const auto split = std::upper_bound(staged.prompt.identity.rewrite_execution_frontiers.begin(),
@@ -1556,6 +1618,10 @@ std::uint32_t ProgramImpl::advance_kvmem_query_replay(SequenceState& sequence,
                                              cursor + count == staged.prompt_tokens);
         timing.include(result.timing);
         timing.resume_post();
+        auto& diagnostics = requests[sequence.lane].timings.kvmem;
+        diagnostics.replay_tokens += result.processed_tokens;
+        diagnostics.replay_execution_host_ns += result.timing.host_ns();
+        diagnostics.replay_execution_device_wait_ns += result.timing.device_wait_ns;
         if (staged.vision) { staged.vision->release_encoded_media_payloads(); }
         if (result.processed_tokens == 0 || result.processed_tokens > count) {
             throw std::logic_error("sparse query replay made invalid progress");
@@ -1583,17 +1649,20 @@ std::uint32_t ProgramImpl::advance_kvmem_query_replay(SequenceState& sequence,
 // across chunk boundaries; only completed slots are cleared after publication.
 void ProgramImpl::consume_kvmem_chunk_capture(SequenceState& sequence, std::uint32_t chunk_begin,
                                               std::uint32_t chunk_end) {
+    auto& diagnostics = requests[sequence.lane].timings.kvmem;
+    ++diagnostics.key_capture_calls;
+    KvmemHostWallTimer capture_timer(diagnostics.key_capture_host_wall_ns);
     auto& sparse = kvmem_lanes_.at(sequence.lane);
     const std::uint32_t kLayers = sparse.index.layers();
     const std::uint32_t kKvWidth = sparse.index.kv_heads() * sparse.index.head_dim();
     const std::uint32_t first_block =
-        chunk_begin / ops::kKvmemCaptureBlockTokens;
-    const std::uint32_t last_block = chunk_end / ops::kKvmemCaptureBlockTokens;
+        chunk_begin / execution::kKvmemCaptureBlockTokens;
+    const std::uint32_t last_block = chunk_end / execution::kKvmemCaptureBlockTokens;
     if (last_block <= first_block) {
         // No block completed; still advance the index so block numbering tracks tokens.
         while (sparse.index.total_tokens() < chunk_end) {
             const std::uint32_t step = std::min(
-                ops::kKvmemCaptureBlockTokens,
+                execution::kKvmemCaptureBlockTokens,
                 chunk_end - sparse.index.total_tokens());
             (void)sparse.index.append(step);
         }
@@ -1601,16 +1670,19 @@ void ProgramImpl::consume_kvmem_chunk_capture(SequenceState& sequence, std::uint
     }
     while (sparse.index.total_tokens() < chunk_end) {
         const std::uint32_t step =
-            std::min(ops::kKvmemCaptureBlockTokens, chunk_end - sparse.index.total_tokens());
+            std::min(execution::kKvmemCaptureBlockTokens, chunk_end - sparse.index.total_tokens());
         (void)sparse.index.append(step);
     }
     const std::uint32_t block_count = last_block - first_block;
     std::vector<float> sums(static_cast<std::size_t>(kLayers) *
                             kvmem_capture_slots_ * kKvWidth);
+    const auto copy_begin = std::chrono::steady_clock::now();
     CUDA_CHECK(cudaMemcpyAsync(sums.data(), sparse.key_sums.data,
                                sums.size() * sizeof(float), cudaMemcpyDeviceToHost,
                                device.stream));
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    diagnostics.key_capture_d2h_bytes += sums.size() * sizeof(float);
+    diagnostics.key_capture_submit_wait_ns += kvmem_elapsed_ns(copy_begin);
     std::vector<float> mean(kKvWidth);
     for (std::uint32_t offset = 0; offset < block_count; ++offset) {
         const auto block = first_block + offset;
@@ -1621,9 +1693,9 @@ void ProgramImpl::consume_kvmem_chunk_capture(SequenceState& sequence, std::uint
                 (static_cast<std::size_t>(layer) * kvmem_capture_slots_ + slot) * kKvWidth;
             for (std::uint32_t element = 0; element < kKvWidth; ++element) {
                 mean[element] = source[element] /
-                                static_cast<float>(ops::kKvmemCaptureBlockTokens);
+                                static_cast<float>(execution::kKvmemCaptureBlockTokens);
             }
-            if (block * ops::kKvmemCaptureBlockTokens >= sparse.capture_begin) {
+            if (block * execution::kKvmemCaptureBlockTokens >= sparse.capture_begin) {
                 sparse.index.write_block_mean(block, layer, mean);
             }
             auto* device_sum = static_cast<float*>(sparse.key_sums.data) +
@@ -1643,11 +1715,17 @@ void ProgramImpl::finalize_kvmem_query(SequenceState& sequence, std::uint32_t pr
     const std::uint32_t kHeadDim = attention.head_dim;
     const auto query_tokens = std::min(prompt_tokens, sparse.query_end) - sparse.query_begin;
     if (query_tokens == 0) { return; }
+    auto& diagnostics = requests[sequence.lane].timings.kvmem;
+    ++diagnostics.query_capture_calls;
+    KvmemHostWallTimer capture_timer(diagnostics.query_capture_host_wall_ns);
     std::vector<float> sums(static_cast<std::size_t>(kLayers) * kQHeads * kHeadDim);
+    const auto copy_begin = std::chrono::steady_clock::now();
     CUDA_CHECK(cudaMemcpyAsync(sums.data(), sparse.query_sum.data,
                                sums.size() * sizeof(float), cudaMemcpyDeviceToHost,
                                device.stream));
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    diagnostics.query_capture_d2h_bytes += sums.size() * sizeof(float);
+    diagnostics.query_capture_submit_wait_ns += kvmem_elapsed_ns(copy_begin);
     sparse.query.assign(static_cast<std::size_t>(kLayers) * kKvHeads * kHeadDim, 0.0F);
     for (std::uint32_t layer = 0; layer < kLayers; ++layer) {
         for (std::uint32_t head = 0; head < kQHeads; ++head) {
@@ -1687,6 +1765,7 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     if (sparse.query_count.empty() || sparse.query_count[0] == 0) { return; }
     const std::uint32_t blocks = sparse.index.block_count();
     if (blocks == 0) { return; }
+    const auto selection_begin = std::chrono::steady_clock::now();
     std::vector<float> scores(blocks, std::numeric_limits<float>::quiet_NaN());
     for (std::uint32_t block = 0; block < blocks; ++block) {
         if (!sparse.index.block(block).full) { continue; }
@@ -1742,8 +1821,13 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
         std::sort(pages.begin(), pages.end());
         pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
     }
+    auto& diagnostics = requests[sequence.lane].timings.kvmem;
+    ++diagnostics.selection_calls;
+    diagnostics.scored_blocks += selection.scored_blocks;
+    diagnostics.selection_host_wall_ns += kvmem_elapsed_ns(selection_begin);
     const auto placement = text_kv_addresses->apply_device_placement(
         sequence.kv->text, *host_kv_extents, pages, device.transfer_stream, "retrieval");
+    record_kvmem_placement(sequence, KvmemPlacementPhase::Retrieval, false, placement);
     if (std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
         std::fprintf(stderr, "KVMEM retrieval scored=%u selected=%zu promoted=%u demoted=%u lane=%u\n",
                      selection.scored_blocks, pages.size(), placement.promoted, placement.demoted,
@@ -1753,8 +1837,9 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
         const auto backend_mapped = backend_kv_addresses->mapped_pages(*sequence.kv->backend);
         pages.erase(std::lower_bound(pages.begin(), pages.end(), backend_mapped), pages.end());
         for (std::uint32_t page = mapped; page < backend_mapped; ++page) { pages.push_back(page); }
-        backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
+        const auto backend_placement = backend_kv_addresses->apply_device_placement(*sequence.kv->backend, *host_kv_extents,
                                                      pages, device.transfer_stream, "retrieval");
+        record_kvmem_placement(sequence, KvmemPlacementPhase::Retrieval, true, backend_placement);
     }
 }
 

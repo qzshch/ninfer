@@ -2613,9 +2613,17 @@ bool ProgramImpl::persistent_backfill_safe(
             throw std::logic_error("persistent backfill proof contains a duplicate sequence");
         }
         observed_lanes |= bit;
-        borrowers = checked_resource_sum(borrowers, requests[lane].active_resources);
+        auto resources = requests[lane].active_resources;
+        if (requests[lane].sparse_host_peak_bytes != 0) {
+            resources.host.kv_bytes = requests[lane].sparse_host_peak_bytes;
+        }
+        borrowers = checked_resource_sum(borrowers, resources);
     }
-    borrowers = checked_resource_sum(borrowers, candidate.impl_->demand.active_entitlement);
+    auto candidate_resources = candidate.impl_->demand.active_entitlement;
+    if (candidate.impl_->sparse_host_peak_bytes != 0) {
+        candidate_resources.host.kv_bytes = candidate.impl_->sparse_host_peak_bytes;
+    }
+    borrowers = checked_resource_sum(borrowers, candidate_resources);
 
     const detail::PhysicalResources capacity = admission_capacity();
     const auto fits                          = [](detail::PhysicalResources value,
@@ -2630,6 +2638,16 @@ bool ProgramImpl::persistent_backfill_safe(
     const detail::PhysicalDemand& head = blocked_head.impl_->root_demand;
     return fits(checked_resource_sum(borrowers, head.physical_peak_additional), capacity) &&
            fits(checked_resource_sum(borrowers, head.final_added), capacity);
+}
+
+qwen3_5::SparseKvmemSnapshot ProgramImpl::sparse_kvmem_snapshot() const noexcept {
+    qwen3_5::SparseKvmemSnapshot snapshot;
+    snapshot.lane_count = max_concurrency;
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        snapshot.lanes[lane].request_epoch = kvmem_observation_epochs_[lane];
+        snapshot.lanes[lane].request_counters = requests[lane].timings.kvmem;
+    }
+    return snapshot;
 }
 
 qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {

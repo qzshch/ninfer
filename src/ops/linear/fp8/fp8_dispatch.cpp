@@ -1,6 +1,7 @@
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/fp8/fp8_policy_control.h"
 #include <array>
 #include <stdexcept>
 
@@ -22,8 +23,11 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
     if (min_tokens <= 0 || max_tokens < min_tokens)
         throw std::invalid_argument("fp8 linear workspace: invalid token interval");
     const auto& shape = resolve_shape(n, k, policy);
+    policy = fp8_small_t_policy(policy, max_tokens);
     return allows_a8(policy) && shape.uses_a8(min_tokens, max_tokens)
-               ? fp8_a8_workspace_capacity_bytes(max_tokens, k)
+               ? fp8_a8_workspace_capacity_bytes(
+                     max_tokens, k,
+                     shape.partial_capacity_bytes ? shape.partial_capacity_bytes(max_tokens) : 0)
                : 0;
 }
 
@@ -32,12 +36,15 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     validate_fp8_weight(weight, "fp8 linear");
     if (x.ne[1] <= 0) throw std::invalid_argument("fp8 linear: T must be positive");
     const auto& shape = resolve_shape(weight.n, weight.k, policy);
+    policy = fp8_small_t_policy(policy, x.ne[1]);
     if (!allows_a8(policy) || !shape.uses_a8(x.ne[1], x.ne[1]))
         return shape.a16(x, weight, out, stream);
     if (workspace == nullptr)
         throw std::invalid_argument("fp8 A8 linear requires caller workspace");
     auto scope         = workspace->scope();
-    const auto scratch = allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k);
+    const auto scratch = allocate_fp8_a8_workspace(
+        *workspace, x.ne[1], weight.k,
+        shape.partial_capacity_bytes ? shape.partial_capacity_bytes(x.ne[1]) : 0);
     shape.a8(x, weight, out, scratch, stream);
 }
 } // namespace ninfer::ops::detail

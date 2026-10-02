@@ -1,5 +1,65 @@
 # HTTP serving
 
+## Root-only requests with Host KV storage
+
+For controlled performance and diagnostic comparisons, `--no-context-retention` disables
+per-request prefix reads, capture opportunities, and terminal continuation publication.
+The Engine context arena and configured `--host-kv-mib` remain enabled, so KVMem can still
+store and retrieve logical KV pages. The policy reaches `CacheParticipation::Disabled`,
+sets the Program's `allow_prefix_reuse` and `publish_continuation` false, and successful
+finish releases the active sequence and vacates its catalog slot. It is off by default.
+
+This flag is different from `--no-prefix-reuse`, which disables the whole context-cache
+arena and cannot be combined with explicit Host cache capacities. Setting
+`--max-private-continuations 0` is invalid because private slots must cover active lanes;
+zero shared capacity only disables shared retained prefixes. Responses `store=false`
+gives a disposable retention hint and does not by itself disable Engine retention.
+
+The server-start record reports effective `engine.prefix_reuse` and `engine.context_retention`.
+Audit actual per-request cache-hit tokens and capture counters even when the flag is used;
+zero cache hits alone do not prove zero retained ownership. Protocol response/media stores
+remain independently bounded and do not hold model KV continuations.
+
+## Optional DFlash2 probability diagnostics
+
+This observer is disabled by default. For a bounded diagnostic run set
+`NINFER_DFLASH_DIAGNOSTIC_ROUNDS=32` and optionally
+`NINFER_DFLASH_DIAGNOSTIC_EVERY=16` before startup. The first setting is a per-request
+limit of sampled rounds, in `0..256`; `0` disables all observer allocation, kernels,
+and extra copies. `EVERY` is a positive period in `1..1000000`: `1` samples the first
+N rounds, `16` samples rounds 0,16,32,... until N records have been collected. These
+settings require DFlash2 and never change target/draft sampling settings.
+
+`request_done.speculative.diagnostics` is null while disabled. When enabled it records
+the budget/period and a bounded `samples` list, scoped to that request. Each sample
+identifies its round, physical lane, execution frontier, licensed and finally published
+tokens, plus two 64-byte observer packets: first rejection (or full acceptance) and
+one reached accepted proposal, whose position rotates deterministically among the
+accepted prefix. A zero-accepted round has no accepted sample. Proposal positions are
+zero based; a full-accepted round has no rejecting position or proposal, and a
+zero-proposal round records `fallback` separately from full acceptance.
+
+The packets expose the actual global proposal ID, penalty-adjusted target top1,
+target filtered-support size/membership, target top1 membership in positive proposal
+support, `pd`, actual retained FP32 `qd`, the same stateless acceptance RNG counter
+`u`, and `min(1,pd/qd)`. Greedy packets leave `pd`, `u`, and acceptance probability
+null because greedy acceptance compares argmax IDs. Filtered support exclusion has
+`pd=0`; ordinary RNG rejection and missing proposal support are distinguishable.
+Sampling accepted and rejected positions is conditional and does not estimate a full
+unconditional p/q distance. Token IDs can reveal fragments of generated content;
+use this opt-in diagnostic only for the chosen local evaluation workload.
+
+OFF retains the original acceptance kernel, egress format, and copy path. ON runs
+the same selection kernels, then a small observer reads their retained support before
+workspace reuse. It adds one observer graph/eager kernel and a 4-byte mask per active
+row per round. Only rounds with selected rows add a bounded 128-byte per-row readback
+to the existing completion wait; no extra synchronization is added. Once the sample
+budget is exhausted, masks remain zero and detailed readback/logging stops. ON still
+has a lightweight masked observer node, so its performance overhead must be measured
+against OFF with identical workloads and graph settings. The observer owns at most
+1056 bytes of extra Device and pinned Host storage each (eight-row capacity), outside
+the ordinary frozen model workspace summary.
+
 ## Experimental KVMem window
 
 DFlash2 requires its companion in the same artifact. For seven proposals per round,
@@ -10,10 +70,12 @@ draft features. The private cyclic checkpoint is included in startup device capa
 Draft companions with full-attention layers are rejected in KVMem mode.
 
 `--kvmem-window-pages N` enables sparse Host/Device KV placement (`0` is dense).
-One page is 64 tokens. The supported surface is one or two lanes with ordinary
+One page is 64 tokens. The experimental surface is one to three lanes with ordinary
 decoding, MTP, or all-local DFlash2, including `--vision` with matching artifact weights. First-generation DFlash, more
-than two active lanes, scoring, disabled context caching, and windows below 8 pages
+than three active lanes, scoring, disabled context caching, and windows below 8 pages
 are rejected at startup. The window is per lane; the Host KV budget is shared.
+Device and Host headroom for all lanes is mandatory; successful startup does not
+guarantee that an arbitrary maximum-length concurrent workload fits those budgets.
 
 ```bash
 ./build/apps/ninfer-serve /absolute/qwen3_8_27b_nvfp4.ninfer \
@@ -58,6 +120,8 @@ for the requested context and Main/MTP payloads; the INT8 27B 256K regression us
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
 ## Start the server
+
+See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
@@ -920,8 +984,50 @@ preserved for consumer validation, and a stable text-fallback reason. Fallback r
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
-derived downstream from raw token counts and seconds instead of rounded stderr strings.
+`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. It also records
+`attempted_per_position`, `reached_per_position`, and `rejected_per_position`: an attempted proposal
+is inside that round's live extent; a reached proposal follows an entirely accepted prefix; only
+the first failed reached proposal is rejected. The untested suffix after that rejection is not
+counted as rejected. This distinguishes actual conditional acceptance from configured-K averages
+and includes short final rounds. `zero_accept_rounds`, `partial_accept_rounds`, and
+`full_accept_rounds` partition nonempty rounds; zero-proposal fallback remains separate.
+
+`accepted_tokens` describes target-licensed draft acceptance before Frontend stop/EOS/budget or
+cancellation truncation. `licensed_output_tokens` includes the accepted prefix and correction/bonus;
+`published_output_tokens`, `published_accepted_tokens`, and `discarded_licensed_tokens` record the
+committed prefix and withheld suffix. These counters cover speculative decode only, excluding the
+first prefill output token. Licensing equals published plus discarded tokens. All counts are derived
+on the Host from already-required egress and commit decisions; collecting them adds no GPU transfers
+or synchronization. Rates can be derived downstream from raw token counts and seconds instead of
+rounded stderr strings. These are completed-request counters; they do not imply periodic live
+request snapshots or GPU phase timings.
+
+`request_done.kvmem` is `null` when sparse placement is disabled. Otherwise schema 23
+records request-owned counters even when both KVMem stderr trace flags are off.
+`placement` has `prefill`, `retrieval`, `replay`, and `decode`, each with separate
+`main` and `backend` objects. Every object reports `calls`, `no_copy_calls`, logical
+`demoted_pages`/`promoted_pages`, actual `d2h_pages`/`d2h_bytes`/`h2d_bytes`, and
+`d2h_submit_wait_ns`, `h2d_submit_wait_ns`, `publication_wait_ns`, and
+`total_host_wall_ns`. A demotion can reuse an up-to-date Host replica and transfer
+zero bytes; a no-copy placement can still publish page tables and wait.
+
+`key_capture` and `query_capture` report `calls`, actual `d2h_bytes`,
+`submit_wait_ns`, and `host_wall_ns`; these include the already-required copy and
+compute-stream wait and the Host folding/index work. `selection` records CPU
+`calls`, `scored_blocks`, and `host_wall_ns`, including page-set construction before
+placement. `replay` records extra `tokens`, scheduler `units`, inclusive
+`step_host_wall_ns`, and the replay execution's existing `execution_host_ns` and
+`execution_device_wait_ns`. Its execution recorder may exclude the outer final
+step wait; use the inclusive step wall for replay latency.
+
+The `timing_basis` is `host_observed_wall_and_existing_waits`. No CUDA events,
+extra synchronization, per-page timers, or polling are added. These are observed
+blocked intervals, not pure PCIe or GPU kernel durations. Copy and publication
+times are subsets of placement wall; replay placement and execution are subsets
+of replay step wall; capture wait is a subset of capture wall. Do not sum nested
+intervals to infer total slowdown. Compare fixed prompts, contexts, lanes,
+generation lengths, and repeated controls to measure end-to-end loss; different
+sparse windows can also change the attention set and output quality.
 
 `request_done.execution` identifies the `engine_request_id` and zero-based `lane_id` used by the
 request. The lane is `null` if it finishes before physical admission, for example a queued

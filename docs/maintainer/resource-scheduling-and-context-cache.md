@@ -11,6 +11,17 @@ materialization、prefix reuse、cache retention 和 pressure planning 的维护
 顶层请求顺序和生命周期由 [Engine 架构](engine-architecture.md)定义。KV page、address space、
 replica 和 consumer view 的物理合同由 [Paged KV Context Store](paged-kv-cache.md)定义。
 
+Qwen sparse KVMem 的长 prompt 只复用当前 query 之前、与首遍 prefill chunk 对齐的 shared
+checkpoint。该 checkpoint 除 StateImage、Main KV、backend ring 外，还必须包含完整的检索
+Mean-K index 和 capture accumulator。Index 的已完成块采用 copy-on-write，扩展某一 lane
+不会修改其他 reader 的快照；当前请求重新捕获 query 并执行原有必要 replay。
+
+自动 capture 的 frontier 向下移到安全 chunk 边界，并避开媒体内部；显式 boundary 不改写其
+含义，不满足条件时不捕获。长 private endpoint/anchor 和 query 之后的 checkpoint 仍不参与
+长 prompt 恢复。无完整特征、越过安全 frontier 或 chunk 不对齐的候选回退到较早检查点/root。
+这不是仅移除原长 prompt guard；Host-backed immutable KV 页必须能够 pin、fork、abort 和释放，
+准入 credit/restore work 只计算该 address 的 Device working set，不能把所有逻辑 Host 页当作显存。
+
 ---
 
 ## 1. 术语与边界
@@ -448,6 +459,13 @@ exclusive optional resources。Fork 期间借用的 immutable StateImage/KV sour
 再次计费：它若由其他 surviving owner 保留则只存在于全局 physical occupancy，若由 active lineage 的
 optional checkpoint 独占则只通过该 checkpoint 计一次。否则同一 allocation 会被重复收费，并把合法的
 Fork 错判为超出 active guarantee。
+
+KVMem sparse 请求另外持有 request-owned future Host peak claim，以保护全部 active 请求尚未发生的
+stage-out 增长；它不是物理 payload 或另一个 cached owner。Program 在 admission/pressure 中从实际
+Host占用中只扣除有 claim 的 active地址所覆盖的 unique Host replicas，然后加入全部 active full peaks。
+未覆盖的 inactive/短请求副本保持实际计费，shared logical page只扣一次；prepared transfer extent 尚未
+发布成 logical replica 时不获 credit。这个规划预算不改变 ResourceInventory 实际守恒或active Device
+entitlement。Finish/Discard/cancel/error归还claim；保留catalog时只留下实际checkpoint副本费用。
 
 ### 6.2 Terminal 与 capture
 

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <span>
+#include <memory>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -68,7 +69,6 @@ public:
 
 private:
     std::uint32_t head_stride() const noexcept { return kv_heads_ * head_dim_; }
-    float* block_layer(std::uint32_t block_id, std::uint32_t layer) noexcept;
     const float* block_layer(std::uint32_t block_id, std::uint32_t layer) const noexcept;
 
     std::uint32_t block_tokens_;
@@ -78,7 +78,9 @@ private:
     std::vector<RetrievalBlockMeta> blocks_;
     std::uint32_t total_tokens_ = 0;
     // mean_k_[block][layer * kv_heads * head_dim + ...], empty for non-full blocks.
-    std::vector<std::vector<float>> mean_k_;
+    // Checkpoints share completed blocks; publishing another layer detaches the
+    // block so restoring or extending one lane cannot mutate another checkpoint.
+    std::vector<std::shared_ptr<std::vector<float>>> mean_k_;
 };
 
 struct BlockSelectionConfig {

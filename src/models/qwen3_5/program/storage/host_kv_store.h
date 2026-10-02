@@ -771,7 +771,7 @@ cudaStream_t transfer_stream, const char* trace_phase)
 {
         const bool trace = std::getenv("NINFER_KVMEM_TRANSFER_TRACE") != nullptr;
         using TraceClock = std::chrono::steady_clock;
-        const auto trace_begin = trace ? TraceClock::now() : TraceClock::time_point{};
+        const auto trace_begin = TraceClock::now();
         std::uint64_t d2h_bytes = 0, h2d_bytes = 0;
         std::size_t d2h_pages = 0;
         double d2h_ms = 0, h2d_ms = 0;
@@ -789,10 +789,12 @@ cudaStream_t transfer_stream, const char* trace_phase)
         const std::uint32_t reserved_before     = address.reservation.pages();
         std::uint32_t resident_before           = 0;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
-            if (pages_->device_resident(membership(address, page))) { ++resident_before; }
+            if (page_in_working_set(address, page) &&
+                pages_->device_resident(membership(address, page))) { ++resident_before; }
         }
 
         KVPlacementCounts counts;
+        counts.telemetry.calls = 1;
         std::vector<std::uint32_t> outgoing;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             if (pages_->device_resident(membership(address, page)) && !selected(page)) {
@@ -813,20 +815,19 @@ cudaStream_t transfer_stream, const char* trace_phase)
                     placement_scratch_.push_back(pages_->physical(logical));
                 }
                 const auto destination = host_kv_extents.writable_view(*backup);
-                if (trace) {
-                    d2h_pages = stale.size();
-                    d2h_bytes = plan_host_kv_transfer_work(
-                        destination.layout(), static_cast<std::uint32_t>(stale.size()), 1).payload_bytes;
-                }
-                const auto copy_begin = trace ? TraceClock::now() : TraceClock::time_point{};
+                d2h_pages = stale.size();
+                d2h_bytes = plan_host_kv_transfer_work(
+                    destination.layout(), static_cast<std::uint32_t>(stale.size()), 1).payload_bytes;
+                const auto copy_begin = TraceClock::now();
                 pages_->physical_pool().copy_to_host(
                     placement_scratch_, destination,
                     transfer_stream);
                 if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
                     throw std::runtime_error("KV device placement stage-out transfer failed");
                 }
-                if (trace) d2h_ms = std::chrono::duration<double, std::milli>(
-                    TraceClock::now() - copy_begin).count();
+                counts.telemetry.d2h_submit_wait_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(TraceClock::now() - copy_begin).count());
+                d2h_ms = static_cast<double>(counts.telemetry.d2h_submit_wait_ns) / 1.0e6;
                 (void)host_kv_extents.publish(std::move(*backup));
             }
             for (const std::uint32_t page : outgoing) {
@@ -834,6 +835,15 @@ cudaStream_t transfer_stream, const char* trace_phase)
                 // it would break that publication. Keep it resident; the next placement
                 // reconsiders once the pin clears.
                 if (pages_->source_pins(membership(address, page)) != 0) { continue; }
+                // A physical replica can back several live rows with different
+                // retrieval sets. Keep it until no other row can read it.
+                const auto logical = membership(address, page);
+                const bool other_reader = std::any_of(addresses_.begin(), addresses_.end(),
+                    [&](const Address& other) {
+                        return &other != &address && other.active && page < other.page_count &&
+                            page_in_working_set(other, page) && membership(other, page) == logical;
+                    });
+                if (other_reader) { continue; }
                 if (!pages_->drop_device_replica_within_active(membership(address, page))) {
                     throw std::logic_error("KV device placement cannot demote an outgoing page");
                 }
@@ -863,7 +873,7 @@ cudaStream_t transfer_stream, const char* trace_phase)
                 placement_scratch_.push_back(
                     pages_->reserve_device_replica(logical, address.reservation));
             }
-            const auto copy_begin = trace ? TraceClock::now() : TraceClock::time_point{};
+            const auto copy_begin = TraceClock::now();
             std::size_t begin = 0;
             while (begin < sources.size()) {
                 std::size_t end = begin + 1;
@@ -875,7 +885,7 @@ cudaStream_t transfer_stream, const char* trace_phase)
                     host_kv_extents.view(sources[begin].extent)
                         .subview(sources[begin].page_offset,
                                  static_cast<std::uint32_t>(end - begin));
-                if (trace) h2d_bytes += plan_host_kv_transfer_work(
+                h2d_bytes += plan_host_kv_transfer_work(
                     source.layout(), static_cast<std::uint32_t>(end - begin), 1).payload_bytes;
                 pages_->physical_pool().copy_from_host(
                     source,
@@ -887,8 +897,9 @@ cudaStream_t transfer_stream, const char* trace_phase)
             if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
                 throw std::runtime_error("KV device placement stage-in transfer failed");
             }
-            if (trace) h2d_ms = std::chrono::duration<double, std::milli>(
-                TraceClock::now() - copy_begin).count();
+            counts.telemetry.h2d_submit_wait_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(TraceClock::now() - copy_begin).count());
+            h2d_ms = static_cast<double>(counts.telemetry.h2d_submit_wait_ns) / 1.0e6;
             for (const std::uint32_t page : incoming) {
                 pages_->publish_device_replica(membership(address, page));
                 ++counts.promoted;
@@ -915,8 +926,9 @@ cudaStream_t transfer_stream, const char* trace_phase)
             }
         }
 
-        const std::uint32_t working_set =
-            resident_before - counts.demoted + counts.promoted;
+        address.device_working_set =
+            std::vector<std::uint32_t>(selected_pages.begin(), selected_pages.end());
+        const std::uint32_t working_set = static_cast<std::uint32_t>(selected_pages.size());
         std::uint32_t final_reservation =
             reserved_before + resident_before > working_set
                 ? reserved_before + resident_before - working_set
@@ -936,9 +948,20 @@ cudaStream_t transfer_stream, const char* trace_phase)
             std::vector<std::uint32_t>(selected_pages.begin(), selected_pages.end());
         // The next consumer is on the compute stream, not transfer_stream. Its
         // block-table reads must observe this placement's final publication.
+        const auto publication_wait_begin = TraceClock::now();
         if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
             throw std::runtime_error("KV device placement table publication failed");
         }
+        counts.telemetry.publication_wait_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(TraceClock::now() - publication_wait_begin).count());
+        counts.telemetry.demoted_pages = counts.demoted;
+        counts.telemetry.promoted_pages = counts.promoted;
+        counts.telemetry.d2h_pages = d2h_pages;
+        counts.telemetry.d2h_bytes = d2h_bytes;
+        counts.telemetry.h2d_bytes = h2d_bytes;
+        counts.telemetry.no_copy_calls = d2h_bytes == 0 && h2d_bytes == 0 ? 1 : 0;
+        counts.telemetry.total_host_wall_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(TraceClock::now() - trace_begin).count());
         if (trace) {
             // Payload excludes Host arena padding. Copy times include submission and
             // the existing stream wait; total also includes planning/table publication.

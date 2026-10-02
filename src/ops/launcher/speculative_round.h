@@ -33,6 +33,12 @@ void speculative_accept_sparse_drafts_launch(
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,
                                                Tensor& out, cudaStream_t stream);
 
+void speculative_collect_sparse_diagnostics_launch(
+    const Tensor& target_tokens, const Tensor& drafts, const Tensor& candidate_ids,
+    const Tensor& proposal_q, const Tensor& current_extents, const Tensor& round_lengths,
+    const Tensor& accepted_drafts, const SamplingConfig* configs, bool raw_greedy,
+    DeviceSpan workspace, const Tensor& mask, Tensor& packets, cudaStream_t stream);
+
 void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t* id_map,
                                      std::int32_t n, cudaStream_t stream);
 

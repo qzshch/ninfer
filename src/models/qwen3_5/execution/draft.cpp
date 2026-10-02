@@ -133,7 +133,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             if (!state.execution.io.dflash_prefill) {
                 throw std::logic_error("DFlash prefill count storage is unavailable");
             }
-            local_counts = state.execution.io.dflash_prefill->produced_count;
+            local_counts = state.execution.io.dflash_prefill->local_append_count;
             ops::set_i32_scalar(local_counts, dimension(config.sliding_window.value_or(0)),
                                 state.execution.device.stream);
         }
@@ -210,7 +210,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                              state.execution.device.stream);
                 ops::rope(layer_positions.view({layer_columns}),
                           dimension(config.attention.head_dim), config.rope_theta, key,
-                          state.execution.device.stream);
+                          state.execution.device.execution_view());
                 Tensor key_batch =
                     key.view({dimension(config.attention.head_dim),
                               dimension(config.attention.num_key_value_heads), layer_width, batch});
@@ -455,7 +455,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, false, key,
                              state.execution.device.stream);
                 ops::rope(positions.view({columns}), dimension(config.attention.head_dim),
-                          config.rope_theta, query, key, state.execution.device.stream);
+                          config.rope_theta, query, key, state.execution.device.execution_view());
                 Tensor query_batch = query.view({dimension(config.attention.head_dim),
                                                  dimension(config.attention.num_attention_heads),
                                                  width, batch_size});
@@ -652,6 +652,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .replay_records  = state.execution.replay_records,
                     .sampling        = frame.sampling,
                     .feature_sink    = &sink,
+                    .diagnostic_mask = state.diagnostic_mask.data
+                                           ? state.diagnostic_mask.slice(0, 0, batch_size) : Tensor{},
+                    .diagnostic_packets = state.diagnostic_packets.data
+                                              ? state.diagnostic_packets.slice(2, 0, batch_size) : Tensor{},
+                    .support_frontiers = state.support_frontiers.data
+                        ? state.support_frontiers.slice(2, 0, batch_size) : Tensor{},
                 },
                 target_envelope);
         }

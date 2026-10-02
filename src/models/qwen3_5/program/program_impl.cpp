@@ -6,10 +6,13 @@
 #include "core/startup.h"
 #include "core/device.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "models/qwen3_5/program/speculative/diagnostic_sampling.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -70,7 +73,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                    : std::nullopt),
       dflash_host(is_masked_draft_backend(plan.speculative_backend)
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::DFlashDecodeIngress) +
-                                                             sizeof(qwen3_5::DFlashDecodeEgress))
+                                                             sizeof(qwen3_5::DFlashDecodeEgress) +
+                                                             sizeof(qwen3_5::DFlashPrefillIngress))
                       : std::nullopt),
       context_source_ready_(device_in), context_completion_(device_in),
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
@@ -78,6 +82,48 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
     if (&parameters != plan.parameters || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
+    }
+    dflash_diagnostic_max_rounds = diagnostic_environment_value(
+        std::getenv("NINFER_DFLASH_DIAGNOSTIC_ROUNDS"), 0, 256);
+    dflash_diagnostic_every = diagnostic_environment_value(
+        std::getenv("NINFER_DFLASH_DIAGNOSTIC_EVERY"), 1, 1000000);
+    if (dflash_diagnostic_every == 0) {
+        throw std::invalid_argument("NINFER_DFLASH_DIAGNOSTIC_EVERY must be positive");
+    }
+    dflash_support_frontier_enabled = support_frontier_environment(
+        std::getenv("NINFER_DFLASH_SUPPORT_FRONTIER"));
+    if (dflash_support_frontier_enabled && dflash_diagnostic_max_rounds == 0)
+        throw std::invalid_argument("DFlash support frontier requires diagnostic rounds > 0");
+    if (dflash_support_frontier_enabled) {
+        constexpr auto bytes = kMaximumConcurrency * 2 * sizeof(DFlashSupportFrontier);
+        dflash_support_frontier_device.emplace(bytes);
+        dflash_support_frontier_host.emplace(bytes);
+        std::memset(dflash_support_frontier_host->data(), 0, bytes);
+        CUDA_CHECK(cudaMemsetAsync(dflash_support_frontier_device->p, 0, bytes, device.stream));
+        dflash_support_frontier_host_packets =
+            static_cast<DFlashSupportFrontier*>(dflash_support_frontier_host->data());
+        dflash_support_frontiers = Tensor(dflash_support_frontier_device->p, DType::I32,
+            {16, 2, static_cast<std::int32_t>(kMaximumConcurrency)});
+    }
+    if (dflash_diagnostic_max_rounds != 0) {
+        if (speculative_backend != SpeculativeBackend::DFlash2) {
+            throw std::invalid_argument("DFlash probability diagnostics require DFlash2");
+        }
+        constexpr auto masks_bytes = kMaximumConcurrency * sizeof(std::int32_t);
+        constexpr auto packets_bytes = kMaximumConcurrency * 2 * sizeof(SpeculativeProposalDiagnostic);
+        dflash_diagnostic_device.emplace(masks_bytes + packets_bytes);
+        dflash_diagnostic_host.emplace(masks_bytes + packets_bytes);
+        std::memset(dflash_diagnostic_host->data(), 0, masks_bytes + packets_bytes);
+        CUDA_CHECK(cudaMemsetAsync(dflash_diagnostic_device->p, 0, masks_bytes + packets_bytes,
+                                   device.stream));
+        dflash_diagnostic_host_mask = static_cast<std::int32_t*>(dflash_diagnostic_host->data());
+        dflash_diagnostic_host_packets = reinterpret_cast<SpeculativeProposalDiagnostic*>(
+            static_cast<unsigned char*>(dflash_diagnostic_host->data()) + masks_bytes);
+        dflash_diagnostic_mask = Tensor(dflash_diagnostic_device->p, DType::I32,
+                                        {static_cast<std::int32_t>(kMaximumConcurrency)});
+        dflash_diagnostic_packets = Tensor(
+            static_cast<unsigned char*>(dflash_diagnostic_device->p) + masks_bytes,
+            DType::I32, {16, 2, static_cast<std::int32_t>(kMaximumConcurrency)});
     }
     if (workspace_plan.general_capacity == 0 ||
         workspace_plan.vision.has_value() != vision_enabled ||
@@ -96,7 +142,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 ? plan.persistent.kvmem_query_sum->bind(backing).slice(1, lane, 1) : Tensor{},
             .key_sums = plan.persistent.kvmem_key_sums
                 ? plan.persistent.kvmem_key_sums->bind(backing).slice(1, lane, 1) : Tensor{},
-            .index = RetrievalIndex(ops::kKvmemCaptureBlockTokens, config.full_attention_layers,
+            .index = RetrievalIndex(execution::kKvmemCaptureBlockTokens, config.full_attention_layers,
                                     config.attention->num_key_value_heads, config.attention->head_dim),
         });
     }
@@ -213,9 +259,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
     }
     pressure_text_page_scratch_.resize(text_kv_pages->capacity());
+    host_budget_text_seen_.resize(text_kv_pages->capacity());
     pressure_text_selected_pages_.reserve(text_kv_pages->capacity());
     if (backend_kv_pages) {
         pressure_backend_page_scratch_.resize(backend_kv_pages->capacity());
+        host_budget_backend_seen_.resize(backend_kv_pages->capacity());
         pressure_backend_selected_pages_.reserve(backend_kv_pages->capacity());
     }
     if (plan.context_cache.host_kv_capacity_bytes != 0) {
@@ -316,12 +364,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         dflash_host_egress  = reinterpret_cast<qwen3_5::DFlashDecodeEgress*>(
             static_cast<unsigned char*>(dflash_host->data()) +
             sizeof(qwen3_5::DFlashDecodeIngress));
-        *dflash_host_ingress = {};
-        *dflash_host_egress  = {};
-    }
-    if (io.dflash_prefill) {
-        CUDA_CHECK(cudaMemsetAsync(io.dflash_prefill->produced_count.data, 0,
-                                   io.dflash_prefill->produced_count.bytes(), device.stream));
+        *dflash_host_ingress        = {};
+        *dflash_host_egress         = {};
+        dflash_prefill_host_ingress = reinterpret_cast<qwen3_5::DFlashPrefillIngress*>(
+            static_cast<unsigned char*>(dflash_host->data()) +
+            sizeof(qwen3_5::DFlashDecodeIngress) + sizeof(qwen3_5::DFlashDecodeEgress));
+        *dflash_prefill_host_ingress = {};
     }
     CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
     if (io.mtp) {
@@ -401,7 +449,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     try {
         state = state_store->reserve_reset(device.stream);
         if (!state) { throw std::bad_alloc(); }
-        address = text_kv_addresses->create_active(entitlement, 0);
+        address = text_kv_addresses->create_active(entitlement, 0, device.stream);
         if (!address) { throw std::bad_alloc(); }
         if (text_kv_addresses->bound_row(*address) != 0) {
             throw std::logic_error("causal score did not bind the unique Main KV row");
@@ -454,6 +502,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 nullptr,
                 state_slot,
                 state_slot,
+                0,
                 0,
                 nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);

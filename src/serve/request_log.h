@@ -20,7 +20,7 @@ class logger;
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 22;
+inline constexpr int kRequestLogSchemaVersion        = 26;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {
@@ -33,6 +33,9 @@ struct ServerLogEnvironment {
     std::string cuda_compile_version;
     std::string cuda_runtime_version;
     std::string cuda_driver_version;
+    std::optional<std::string> dflash_diagnostic_rounds_env;
+    std::optional<std::string> dflash_diagnostic_every_env;
+    std::optional<std::string> dflash_support_frontier_env;
 };
 
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON

@@ -1,5 +1,6 @@
 #include "serve/operational_log.h"
 #include "serve/request_log.h"
+#include "runtime/engine/sparse_epoch_binding.h"
 
 #include <nlohmann/json.hpp>
 
@@ -146,6 +147,9 @@ int main() {
     environment.cuda_compile_version      = "13.1";
     environment.cuda_runtime_version      = "13.1";
     environment.cuda_driver_version       = "13.1";
+    environment.dflash_diagnostic_rounds_env = "32";
+    environment.dflash_diagnostic_every_env = "16";
+    environment.dflash_support_frontier_env = "1";
 
     const Json server = Json::parse(format_server_start_json(
         "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias", load,
@@ -155,6 +159,10 @@ int main() {
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
+    failures += check(server.at("diagnostic_environment_requested").at("dflash_sampled_rounds") == "32" &&
+        server.at("diagnostic_environment_requested").at("dflash_sample_every") == "16" &&
+        server.at("diagnostic_environment_requested").at("dflash_support_frontier") == "1",
+        "startup requested diagnostic environment provenance lost");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
     failures += check(server.at("artifact").at("architecture") == "Qwen3_5ForCausalLM",
@@ -205,6 +213,17 @@ int main() {
             server.at("engine").at("context_cost").at("preset_path") == "local-costs.json",
         "resolved context-cost layers missing");
     failures += check(server.at("engine").at("prefix_reuse") == true, "prefix-reuse state missing");
+    failures += check(server.at("engine").at("context_retention") == true,
+                      "default retention policy missing");
+    ServeOptions no_retention_options = options;
+    no_retention_options.allow_context_retention = false;
+    const Json no_retention_server = Json::parse(format_server_start_json(
+        "serve-no-retention", 1000, no_retention_options, engine_options, sampling_defaults,
+        "public-model", load, memory, environment, 1234));
+    failures += check(no_retention_server.at("engine").at("prefix_reuse") == false &&
+                          no_retention_server.at("engine").at("context_retention") == false &&
+                          no_retention_server.at("engine").at("context_cache").at("enabled") == true,
+                      "no-retention provenance must disable request participation and preserve Host arena");
     failures += check(
         server.at("engine").at("context_cache").at("device_state_slots") == 2 &&
             server.at("engine").at("context_cache").at("total_device_state_slots") == 4 &&
@@ -397,6 +416,31 @@ int main() {
     outcome.metrics.speculative_accepted_tokens       = 720;
     outcome.metrics.speculative_fallback_steps        = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.metrics.speculative_attempted_per_position = {300, 300, 300};
+    outcome.metrics.speculative_reached_per_position = {300, 290, 240};
+    outcome.metrics.speculative_rejected_per_position = {10, 50, 50};
+    outcome.metrics.speculative_zero_accept_rounds = 10;
+    outcome.metrics.speculative_partial_accept_rounds = 100;
+    outcome.metrics.speculative_full_accept_rounds = 190;
+    outcome.metrics.speculative_licensed_output_tokens = 1022;
+    outcome.metrics.speculative_published_output_tokens = 1021;
+    outcome.metrics.speculative_published_accepted_tokens = 720;
+    outcome.metrics.speculative_discarded_licensed_tokens = 1;
+    outcome.metrics.kvmem.enabled = true;
+    outcome.metrics.kvmem.placement[3][0] = {
+        .calls = 8, .no_copy_calls = 6, .demoted_pages = 4, .promoted_pages = 3,
+        .d2h_pages = 2, .d2h_bytes = 8192, .h2d_bytes = 12288,
+        .d2h_submit_wait_ns = 123, .h2d_submit_wait_ns = 456,
+        .publication_wait_ns = 78, .total_host_wall_ns = 900};
+    outcome.metrics.kvmem.key_capture_calls = 4;
+    outcome.metrics.kvmem.key_capture_d2h_bytes = 4096;
+    outcome.metrics.kvmem.query_capture_calls = 1;
+    outcome.metrics.kvmem.query_capture_submit_wait_ns = 50;
+    outcome.metrics.kvmem.selection_calls = 1;
+    outcome.metrics.kvmem.scored_blocks = 320;
+    outcome.metrics.kvmem.replay_tokens = 512;
+    outcome.metrics.kvmem.replay_units = 2;
+    outcome.metrics.kvmem.replay_step_host_wall_ns = 3000;
     outcome.metrics.materialization                   = {
                           .predicted_now_ns           = 200000,
                           .predicted_future_loss_ns   = 50000,
@@ -480,6 +524,105 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
+    failures += check(
+        done.at("speculative").at("attempted_per_position") == Json::array({300, 300, 300}) &&
+            done.at("speculative").at("reached_per_position") == Json::array({300, 290, 240}) &&
+            done.at("speculative").at("rejected_per_position") == Json::array({10, 50, 50}) &&
+            done.at("speculative").at("zero_accept_rounds") == 10 &&
+            done.at("speculative").at("partial_accept_rounds") == 100 &&
+            done.at("speculative").at("full_accept_rounds") == 190 &&
+            done.at("speculative").at("licensed_output_tokens") == 1022 &&
+            done.at("speculative").at("published_output_tokens") == 1021 &&
+            done.at("speculative").at("published_accepted_tokens") == 720 &&
+            done.at("speculative").at("discarded_licensed_tokens") == 1,
+        "speculative reach/rejection and Frontend publication accounting missing");
+    failures += check(
+        done.at("kvmem").at("timing_basis") == "host_observed_wall_and_existing_waits" &&
+            done.at("kvmem").at("placement").at("decode").at("main").at("calls") == 8 &&
+            done.at("kvmem").at("placement").at("decode").at("main").at("no_copy_calls") == 6 &&
+            done.at("kvmem").at("placement").at("decode").at("main").at("d2h_pages") == 2 &&
+            done.at("kvmem").at("placement").at("decode").at("main").at("d2h_bytes") == 8192 &&
+            done.at("kvmem").at("placement").at("decode").at("backend").at("calls") == 0 &&
+            done.at("kvmem").at("key_capture").at("d2h_bytes") == 4096 &&
+            done.at("kvmem").at("query_capture").at("submit_wait_ns") == 50 &&
+            done.at("kvmem").at("selection").at("scored_blocks") == 320 &&
+            done.at("kvmem").at("replay").at("tokens") == 512 &&
+            done.at("kvmem").at("replay").at("step_host_wall_ns") == 3000,
+        "request-owned KVMem measured stages missing");
+    GenerationOutcome dense_outcome = outcome;
+    dense_outcome.metrics.kvmem = {};
+    const auto dense_done = Json::parse(format_request_done_json("serve-test", 1000, context, dense_outcome));
+    failures += check(dense_done.at("kvmem").is_null(), "disabled KVMem must be null");
+    failures += check(done.at("speculative").at("diagnostics").is_null(),
+                      "disabled detailed diagnostics must remain null");
+    GenerationOutcome diagnostic_outcome = outcome;
+    diagnostic_outcome.metrics.speculative_support_frontier_enabled = true;
+    diagnostic_outcome.diagnostic_input_token_ids = {248044, 872, 198};
+    diagnostic_outcome.metrics.speculative_diagnostic_max_rounds = 32;
+    diagnostic_outcome.metrics.speculative_diagnostic_every = 16;
+    ninfer::SpeculativeDiagnosticSample diagnostic_sample;
+    diagnostic_sample.round_index = 16;
+    diagnostic_sample.lane = 2;
+    diagnostic_sample.frontier = 40000;
+    diagnostic_sample.licensed_tokens = 3;
+    diagnostic_sample.published_tokens = 0;
+    diagnostic_sample.publication_recorded = true;
+    diagnostic_sample.first = {.valid = 1, .stochastic = 1, .kind = 0, .position = 2,
+        .extent = 3, .accepted = 2, .proposal_id = 248076, .target_top1 = 100,
+        .target_support_size = 20, .draft_in_target_support = 1, .pd = .25f,
+        .qd = .5f, .u = .75f, .acceptance_probability = .5f};
+    diagnostic_sample.accepted = {.valid = 1, .stochastic = 0, .kind = 1, .position = 0,
+        .extent = 3, .accepted = 2, .proposal_id = 100, .target_top1 = 100,
+        .target_support_size = 1, .draft_in_target_support = 1,
+        .target_top1_in_proposal_support = 1, .qd = 1};
+    diagnostic_sample.round_anchor_id = 17;
+    diagnostic_sample.first_reached_prefix_token_ids = {17, 21, 22};
+    diagnostic_sample.accepted_reached_prefix_token_ids = {17};
+    diagnostic_sample.first_support_frontier = {.valid = 1, .raw_rank = 1,
+        .adjusted_rank = 2, .effective_top_k = 20, .committed_count = 1,
+        .proposal_in_raw_candidates = 1, .target_top1_in_raw_candidates = 1,
+        .target_top1_candidate_rank = 2,
+        .stage = ninfer::DFlashSupportStage::PositiveProbability, .round_anchor_id = 17, .raw_logit = 5,
+        .adjusted_logit = 3.5f, .target_top1_q = 0, .proposal_q = .5f};
+    diagnostic_outcome.metrics.speculative_diagnostic_samples.push_back(diagnostic_sample);
+    const auto diagnostic_done = Json::parse(format_request_done_json("serve-test", 1000, context,
+                                                                      diagnostic_outcome));
+    const auto& detailed = diagnostic_done.at("speculative").at("diagnostics");
+    const auto& detailed_sample = detailed.at("samples").at(0);
+    failures += check(detailed.at("max_sampled_rounds") == 32 && detailed.at("sample_every") == 16 &&
+        detailed.at("collected_rounds") == 1 && detailed_sample.at("lane_id") == 2 &&
+        detailed_sample.at("frontier") == 40000 && detailed_sample.at("published_tokens") == 0 &&
+        detailed_sample.at("first").at("pd") == .25f && detailed_sample.at("first").at("qd") == .5f &&
+        detailed_sample.at("first").at("u") == .75f &&
+        detailed_sample.at("accepted_sample").at("pd").is_null() &&
+        detailed_sample.at("accepted_sample").at("u").is_null(),
+        "bounded detailed diagnostics lost support/probability/publication or greedy nulls");
+    failures += check(detailed.at("support_frontier_enabled") == true &&
+        detailed.at("top_k_zero_semantics") == "bounded_cap20" &&
+        detailed_sample.at("first_support_frontier").at("decision_reason") == "ratio_rng" &&
+        detailed_sample.at("first_support_frontier").at("target_top1_proposal_coverage") == "raw_top16_q_zero" &&
+        detailed_sample.at("first_support_frontier").at("penalty_crossed_top_k") == false &&
+        detailed_sample.at("accepted_support_frontier").is_null(),
+        "support frontier metadata/reason/raw candidate membership lost");
+    failures += check(diagnostic_done.at("diagnostic_prompt_input").at("token_ids") == Json::array({248044, 872, 198}) &&
+        detailed_sample.at("round_anchor_id") == 17 &&
+        detailed_sample.at("first_reached_prefix_token_ids") == Json::array({17, 21, 22}) &&
+        detailed_sample.at("accepted_reached_prefix_token_ids") == Json::array({17}) &&
+        detailed_sample.at("first_proposal_absolute_position_0based") == 40003,
+        "exact bounded prompt/round anchor/reached prefix identity lost");
+    auto top_k_outcome = diagnostic_outcome;
+    auto& top_k_sample = top_k_outcome.metrics.speculative_diagnostic_samples.front();
+    top_k_sample.first.draft_in_target_support = 0;
+    top_k_sample.first.pd = 0;
+    top_k_sample.first.acceptance_probability = 0;
+    top_k_sample.first_support_frontier.adjusted_rank = 21;
+    top_k_sample.first_support_frontier.penalty_crossed_top_k = 1;
+    top_k_sample.first_support_frontier.stage = ninfer::DFlashSupportStage::TopK;
+    const auto top_k_done = Json::parse(format_request_done_json("serve-test", 1000, context, top_k_outcome));
+    const auto& top_k_frontier = top_k_done.at("speculative").at("diagnostics").at("samples").at(0).at("first_support_frontier");
+    failures += check(top_k_frontier.at("decision_reason") == "target_top20_or_top_k_exclusion" &&
+        top_k_frontier.at("penalty_crossed_top_k") == true,
+        "top-k exclusion/penalty crossing observer contract lost");
     failures += check(done.at("materialization").at("predicted_total_ns") == 250000 &&
                           done.at("materialization").at("targets_evaluated") == 7 &&
                           done.at("materialization").at("stop_reason") == "queue_exhausted" &&
@@ -728,6 +871,86 @@ int main() {
             throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&
             !throughput_json.at("context_cache").contains("last_materialization"),
         "context-cache throughput statistics missing or not interval-scoped");
+
+
+    ninfer::runtime::detail::SparseEpochBinding epoch0, epoch1;
+    using ninfer::runtime::detail::observe_sparse_epoch;
+    failures += check(!observe_sparse_epoch(epoch0, 0, 101) && epoch0.engine_request_id == 0,
+                      "zero Program epoch must remain unbound");
+    failures += check(observe_sparse_epoch(epoch0, 1, 101) && epoch0.engine_request_id == 101,
+                      "first reset must latch the actual Engine owner");
+    failures += check(!observe_sparse_epoch(epoch0, 1, 202) && epoch0.engine_request_id == 101,
+                      "materializing new Engine owner must not rebind old counters");
+    failures += check(!observe_sparse_epoch(epoch0, 1, 0) && epoch0.engine_request_id == 101,
+                      "idle gauge must preserve known counter owner");
+    failures += check(observe_sparse_epoch(epoch0, 2, 202) && epoch0.engine_request_id == 202,
+                      "new reset must safely bind a reused lane");
+    failures += check(observe_sparse_epoch(epoch0, 3, 0) && epoch0.engine_request_id == 0 &&
+                          !observe_sparse_epoch(epoch0, 3, 303) && epoch0.engine_request_id == 0,
+                      "unobserved owner must never be guessed from a later Engine gauge");
+    failures += check(observe_sparse_epoch(epoch0, 5, 505) &&
+                          observe_sparse_epoch(epoch1, 5, 606) && epoch0.engine_request_id == 505 &&
+                          epoch1.engine_request_id == 606,
+                      "two lanes with same epoch must keep separate ownership");
+    failures += check(observe_sparse_epoch(epoch0, 0, 707) && epoch0.engine_request_id == 0 &&
+                          observe_sparse_epoch(epoch0, 6, 808) && epoch0.engine_request_id == 808 &&
+                          epoch1.engine_request_id == 606,
+                      "reset/fast reuse must preserve other lane's identity");
+
+    failures += check(throughput_json.at("direct_sparse_sampling").is_null() &&
+                          lanes[0].at("kvmem").is_null() && lanes[1].at("kvmem").is_null(),
+                      "unsupported direct Sparse telemetry must be null, not fake zero");
+    ThroughputReport sparse_live = throughput;
+    sparse_live.current.direct_sparse_sampling.supported = true;
+    sparse_live.current.direct_sparse_sampling.sample_revision = 8;
+    sparse_live.current.direct_sparse_sampling.sampled_steady_ns = 1230000000;
+    sparse_live.current.direct_sparse_sampling.sample_age_ns = 250000000;
+    auto& live0 = sparse_live.current.direct_sparse_sampling.lanes[0];
+    live0.available = true;
+    live0.current_request = true;
+    live0.request_epoch = 3;
+    live0.engine_request_id = 13;
+    live0.request_counters = outcome.metrics.kvmem;
+    auto& live1 = sparse_live.current.direct_sparse_sampling.lanes[1];
+    live1 = live0;
+    live1.current_request = false;
+    live1.request_epoch = 7;
+    live1.engine_request_id = 88;
+    const Json sparse_json = Json::parse(format_throughput_json("serve-test", 5002, sparse_live));
+    const auto& sparse_sampling = sparse_json.at("direct_sparse_sampling");
+    const auto& sparse_lanes = sparse_json.at("lanes");
+    failures += check(sparse_sampling.at("scope") == "program_direct_sparse_latest_request_cumulative" &&
+                          sparse_sampling.at("sample_revision") == 8 &&
+                          sparse_sampling.at("sampling_interval_ms") == 1000 &&
+                          sparse_sampling.at("sampled_steady_ns") == 1230000000 &&
+                          sparse_sampling.at("age_at_engine_publication_ns") == 250000000 &&
+                          sparse_sampling.at("catalog_transfer_counters_include_direct_sparse") == false,
+                      "live Sparse source/cadence/age must keep exact scope");
+    failures += check(sparse_lanes[0].at("kvmem").at("engine_request_id") == 13 &&
+                          sparse_lanes[0].at("kvmem").at("request_epoch") == 3 &&
+                          sparse_lanes[0].at("kvmem").at("identity_status") == "current_request" &&
+                          sparse_lanes[1].at("kvmem").at("engine_request_id") == 88 &&
+                          sparse_lanes[1].at("kvmem").at("identity_status") == "latest_request" &&
+                          sparse_lanes[1].at("engine_request_id").is_null(),
+                      "current/latest counter owner must be separate from live engine lane gauge");
+    failures += check(sparse_lanes[0].at("kvmem").at("counters") == done.at("kvmem") &&
+                          sparse_lanes[0].at("kvmem").at("d2d_bytes").is_null() &&
+                          sparse_lanes[1].at("kvmem").at("counters") == done.at("kvmem"),
+                      "live Sparse must reuse formal per-phase fields; missing D2D remains null");
+    // Old samples are cumulative: previous live counters must not be subtracted or summed.
+    sparse_live.previous.direct_sparse_sampling.lanes[0] = live0;
+    sparse_live.previous.direct_sparse_sampling.lanes[0].request_counters.placement[3][0].d2h_bytes = 8000;
+    const Json cumulative_live = Json::parse(format_throughput_json("serve-test", 5003, sparse_live));
+    failures += check(cumulative_live.at("lanes")[0].at("kvmem").at("counters")
+                          .at("placement").at("decode").at("main").at("d2h_bytes") == 8192,
+                      "live Sparse cumulative bytes were incorrectly interval-differenced");
+    live0.engine_request_id = 0;
+    live0.current_request = false;
+    const Json unbound_live = Json::parse(format_throughput_json("serve-test", 5004, sparse_live));
+    failures += check(unbound_live.at("lanes")[0].at("kvmem").at("engine_request_id").is_null() &&
+                          unbound_live.at("lanes")[0].at("kvmem").at("identity_status") == "unbound" &&
+                          unbound_live.at("lanes")[0].at("kvmem").at("counters") == done.at("kvmem"),
+                      "unbound observations must preserve counters without inventing Engine ownership");
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /

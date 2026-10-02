@@ -221,6 +221,57 @@ void speculative_accept_sparse_drafts(
         envelope.all_rows_greedy_without_penalties, scratch, stream);
 }
 
+void speculative_accept_sparse_drafts_diagnostic(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
+    Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
+    SpeculativeAcceptExecutionEnvelope envelope, const Tensor& mask, Tensor& packets,
+    WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr const char* op = "speculative_accept_sparse_drafts";
+    if (token_domain != kSparseTokenDomain) {
+        throw std::invalid_argument(
+            "speculative_accept_sparse_drafts: token_domain must be 248077");
+    }
+    const std::int32_t k = drafts.ne[0];
+    if (k < 1 || k > kSparseMaxDrafts)
+        throw std::invalid_argument("speculative_accept_sparse_drafts: K must be 1..15");
+    const std::int32_t columns = k + 1;
+    const std::int32_t batch   = drafts.ne[1];
+    if (batch < 1 || batch > kSparseMaxBatch) {
+        throw std::invalid_argument("speculative_accept_sparse_drafts: B must be 1..8");
+    }
+    require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
+    require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
+    require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    require_vector(round_lengths, DType::I32, batch, op, "round_lengths");
+    require_vector(round_anchors, DType::I32, batch, op, "round_anchors");
+    require_matrix(licensed_tokens, DType::I32, columns, batch, op, "licensed_tokens");
+    require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
+    require_vector(accepted_drafts, DType::I32, batch, op, "accepted_drafts");
+    if (configs == nullptr) {
+        throw std::invalid_argument("speculative_accept_sparse_drafts: configs must be non-null");
+    }
+
+    require_vector(mask, DType::I32, batch, op, "diagnostic_mask");
+    require_tensor3(packets, DType::I32, 16, 2, batch, op, "diagnostic_packets");
+    auto scratch_scope      = workspace.scope();
+    const std::size_t bytes = speculative_accept_sparse_drafts_workspace_capacity_bytes(
+        token_domain, envelope, k, k, batch, batch);
+    const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
+    detail::speculative_accept_sparse_drafts_launch(
+        target_tokens, logits, drafts, candidate_ids, proposal_q, current_extents, round_lengths,
+        round_anchors, licensed_tokens, licensed_counts, accepted_drafts, token_domain, configs,
+        envelope.all_rows_greedy_without_penalties, scratch, stream);
+    detail::speculative_collect_sparse_diagnostics_launch(
+        target_tokens, drafts, candidate_ids, proposal_q, current_extents, round_lengths,
+        accepted_drafts, configs, envelope.all_rows_greedy_without_penalties, scratch,
+        mask, packets, stream);
+}
+
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,
                                         cudaStream_t stream) {
     constexpr const char* op = "speculative_select_accepted_hidden";

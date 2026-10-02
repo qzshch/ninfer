@@ -289,7 +289,8 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            ContextCacheHints context_cache) const {
     return prepare_impl(
         request, consumer_mode, observation, std::move(is_cancelled), std::move(context_cache),
-        options_.allow_prefix_reuse ? CacheParticipation::ReadWrite : CacheParticipation::Disabled,
+        context_cache_participation_enabled(options_) ? CacheParticipation::ReadWrite
+                                                       : CacheParticipation::Disabled,
         DeadlinePolicy::ClientPendingTimeout);
 }
 
@@ -419,6 +420,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
+    outcome.diagnostic_input_token_ids = result.prompt.diagnostic_input_token_ids;
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
@@ -440,6 +442,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.engine_timing               = result.engine_timing;
+    outcome.metrics.kvmem                       = result.timings.kvmem;
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.metrics.materialization             = result.materialization;
@@ -451,6 +454,23 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_fallback_steps  = result.speculative.fallback_steps;
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
+    outcome.metrics.speculative_attempted_per_position =
+        std::move(result.speculative.attempted_per_position);
+    outcome.metrics.speculative_reached_per_position =
+        std::move(result.speculative.reached_per_position);
+    outcome.metrics.speculative_rejected_per_position =
+        std::move(result.speculative.rejected_per_position);
+    outcome.metrics.speculative_zero_accept_rounds = result.speculative.zero_accept_rounds;
+    outcome.metrics.speculative_partial_accept_rounds = result.speculative.partial_accept_rounds;
+    outcome.metrics.speculative_full_accept_rounds = result.speculative.full_accept_rounds;
+    outcome.metrics.speculative_licensed_output_tokens = result.speculative.licensed_output_tokens;
+    outcome.metrics.speculative_published_output_tokens = result.speculative.published_output_tokens;
+    outcome.metrics.speculative_published_accepted_tokens = result.speculative.published_accepted_tokens;
+    outcome.metrics.speculative_discarded_licensed_tokens = result.speculative.discarded_licensed_tokens;
+    outcome.metrics.speculative_diagnostic_max_rounds = result.speculative.diagnostic_max_rounds;
+    outcome.metrics.speculative_diagnostic_every = result.speculative.diagnostic_every;
+    outcome.metrics.speculative_support_frontier_enabled = result.speculative.support_frontier_enabled;
+    outcome.metrics.speculative_diagnostic_samples = std::move(result.speculative.diagnostic_samples);
 
     outcome.tool_calls      = std::move(result.tool_calls);
     outcome.tool_call_parse = result.tool_call_parse;

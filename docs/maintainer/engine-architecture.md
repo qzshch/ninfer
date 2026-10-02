@@ -361,13 +361,22 @@ FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected hea
 
 Scheduler 保证：
 
-- 同时最多一个 staged-prefill request；
+- 可以同时持有多个已通过资源准入的 staged-prefill owner，数量不超过 active lane；
+- 新准入须等待 Program 的 context transaction、pending transaction 和 GDN state fork 全部结算；
+- 普通首遍 prefill 保留原有单 owner 准入顺序；已有 owner 进入 replay 后才允许额外 staged owner，避免改变普通 decode-ready 顺序；
+- 有 owner 已完成逻辑 prompt、仍在执行 replay/tail 时，各 runnable owner 在 GPU unit 边界轮转；
+- capture 等待中的 owner 不阻塞其他 runnable owner；取消或完成只移除自己的 owner；
 - 已有 decode work 不会被连续 prefill 饿死；
 - decode round 包含所有且仅包含当前 decode-ready requests；
 - batch 使用精确 `B`，不以 inactive lane padding 到 `max_concurrency`。
 
 Program 接收紧凑的 `SequenceHandle[B]` 和每行预算。Prefix reuse 只减少 materialization 或 suffix
 prefill，不创建另一条调度路径。
+
+这仍然是单个 GPU unit 串行提交的调度，不是多个 prompt 的 ragged kernel packing。
+每次切换必须重新绑定该 sequence 的 KV execution row 和 rope delta；这些标量属于共享 IO scratch。
+Host→Device 的 checkpoint KV 恢复尚未发布时暂停 GPU execution unit，仍在 worker boundary 处理取消和事务进度，避免共享历史页被另一路 replay 重复恢复。
+query replay 仍按原 prefill chunk 返回取消边界，不省略必要的历史计算。
 
 ### 5.4 Admission invalidation
 
@@ -537,7 +546,11 @@ ResourceManager 与完成所有 request response。内部不变量错误不能�
 - workspace 是 Program 启动时统一规划的 backing，Vision、Text 和 speculative schedule 按互斥 lifetime
   使用其内部区域。
 
-容量查询消费与执行同源的逐层参数和 Use。Allocation scope 同时用于布局计算与实际执行；
+Op 拥有其声明执行范围内的 Graph 更新兼容性；Program 捕获完整执行单元，并在启动时验证同类
+定义的更新。长度档位用于限制预留资源，不等同于拓扑类别。Program 不复制 target attention 的
+私有 kernel 分派边界；draft 等其他 Op 的实际拓扑要求仍由完整执行单元分别处理。
+
+容量查询消费与执行同源的逐层参数、Use 和设备容量信息。Allocation scope 同时用于布局计算与实际执行；
 顺序互斥的 scratch 取峰值，跨阶段仍活跃的数据计入完整存活期。Vision handoff 保留至 Text
 及所选 MTP 的最后消费者，speculative pending features 和 verify records 保留至对应提交边界。
 

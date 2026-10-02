@@ -59,7 +59,7 @@ void RetrievalIndex::truncate_to(std::uint32_t token_pos) {
         tail.n_tokens = kept;
         if (!tail.full || kept < block_tokens_) {
             tail.full = false;
-            mean_k_.back().clear();
+            mean_k_.back().reset();
         }
     }
     total_tokens_ = token_pos;
@@ -73,8 +73,14 @@ void RetrievalIndex::write_block_mean(std::uint32_t block_id, std::uint32_t laye
     if (layer >= layers_ || mean.size() != head_stride()) {
         throw std::invalid_argument("retrieval mean-K geometry is invalid");
     }
-    std::vector<float>& block = mean_k_[block_id];
-    if (block.empty()) { block.assign(static_cast<std::size_t>(layers_) * head_stride(), 0.0F); }
+    auto& storage = mean_k_[block_id];
+    if (!storage) {
+        storage = std::make_shared<std::vector<float>>(
+            static_cast<std::size_t>(layers_) * head_stride(), 0.0F);
+    } else if (!storage.unique()) {
+        storage = std::make_shared<std::vector<float>>(*storage);
+    }
+    auto& block = *storage;
     std::copy(mean.begin(), mean.end(), block.begin() +
                                            static_cast<std::size_t>(layer) * head_stride());
 }
@@ -92,19 +98,12 @@ const RetrievalBlockMeta& RetrievalIndex::block(std::uint32_t block_id) const {
     return blocks_[block_id];
 }
 
-float* RetrievalIndex::block_layer(std::uint32_t block_id, std::uint32_t layer) noexcept {
-    std::vector<float>& block = mean_k_[block_id];
-    return block.empty()
-               ? nullptr
-               : block.data() + static_cast<std::size_t>(layer) * head_stride();
-}
-
 const float* RetrievalIndex::block_layer(std::uint32_t block_id,
                                          std::uint32_t layer) const noexcept {
-    const std::vector<float>& block = mean_k_[block_id];
-    return block.empty()
+    const auto& block = mean_k_[block_id];
+    return !block
                ? nullptr
-               : block.data() + static_cast<std::size_t>(layer) * head_stride();
+               : block->data() + static_cast<std::size_t>(layer) * head_stride();
 }
 
 bool RetrievalIndex::score(std::uint32_t block_id, std::span<const float> query,

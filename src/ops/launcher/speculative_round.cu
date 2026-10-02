@@ -6,6 +6,7 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/speculative_round.cuh"
+#include "ops/kernel/speculative_diagnostics.cuh"
 #include "core/device.h"
 
 #include <algorithm>
@@ -147,6 +148,23 @@ void speculative_accept_sparse_drafts_launch(
         static_cast<std::int32_t*>(accepted_drafts.data), configs, token_domain, cols,
         partial_blocks, groups, scratch, layout.bytes);
 
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void speculative_collect_sparse_diagnostics_launch(
+    const Tensor& target_tokens, const Tensor& drafts, const Tensor& candidate_ids,
+    const Tensor& proposal_q, const Tensor& current_extents, const Tensor& round_lengths,
+    const Tensor& accepted_drafts, const SamplingConfig* configs, bool raw_greedy,
+    DeviceSpan workspace, const Tensor& mask, Tensor& packets, cudaStream_t stream) {
+    const auto layout = make_sampling_workspace_layout(248077, drafts.ne[0] + 1);
+    const SamplingWorkspace scratch = raw_greedy ? SamplingWorkspace{} : layout.bind(workspace);
+    speculative_collect_sparse_diagnostics_kernel<<<drafts.ne[1], 32, 0, stream>>>(
+        static_cast<const int*>(target_tokens.data), static_cast<const int*>(drafts.data),
+        static_cast<const int*>(candidate_ids.data), static_cast<const float*>(proposal_q.data),
+        static_cast<const int*>(current_extents.data), static_cast<const int*>(round_lengths.data),
+        static_cast<const int*>(accepted_drafts.data), configs, raw_greedy, scratch, layout.bytes,
+        static_cast<const int*>(mask.data),
+        static_cast<ninfer::SpeculativeProposalDiagnostic*>(packets.data), drafts.ne[0]);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -54,3 +54,8 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/target_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/vision_pos_embed.cpp"
 )
+
+# Read-only bounded DFlash observer; independent of every existing math TU.
+target_sources(ninfer_ops PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/wrapper/dflash_support_frontier.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/dflash_support_frontier.cu")

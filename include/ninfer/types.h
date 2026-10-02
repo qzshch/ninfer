@@ -1,4 +1,7 @@
 #pragma once
+#include "ninfer/runtime_observations.h"
+#include "ninfer/speculative_diagnostics.h"
+#include "ninfer/dflash_support_frontier.h"
 
 #include <array>
 #include <chrono>
@@ -161,7 +164,8 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     // Sparse KV working-set window in 64-token pages for prefill rolling; 0 keeps the
-    // dense full-residency semantics.
+    // dense full-residency semantics. Experimental sparse mode supports 1..3 active
+    // lanes; higher concurrency is rejected. Device/Host headroom must cover all lanes.
     std::uint32_t kvmem_window_pages   = 0;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
@@ -518,6 +522,7 @@ private:
 };
 
 struct PromptSummary {
+    std::vector<TokenId> diagnostic_input_token_ids;
     bool starts_in_reasoning    = false;
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
@@ -639,6 +644,48 @@ struct PreparationControl {
     CancellationView cancellation;
 };
 
+enum class KvmemPlacementPhase : std::uint8_t { Prefill, Retrieval, Replay, Decode };
+
+struct KvmemPlacementStats {
+    std::uint64_t calls = 0;
+    std::uint64_t no_copy_calls = 0;
+    std::uint64_t demoted_pages = 0;
+    std::uint64_t promoted_pages = 0;
+    std::uint64_t d2h_pages = 0;
+    std::uint64_t d2h_bytes = 0;
+    std::uint64_t h2d_bytes = 0;
+    // Copy submit+existing wait and table-publication wait are subsets of total Host wall.
+    std::uint64_t d2h_submit_wait_ns = 0;
+    std::uint64_t h2d_submit_wait_ns = 0;
+    std::uint64_t publication_wait_ns = 0;
+    std::uint64_t total_host_wall_ns = 0;
+};
+
+// Request-owned direct sparse-KV diagnostics. These are observed Host wall/blocked
+// intervals, not GPU kernel times. They require no additional synchronization.
+struct KvmemDiagnostics {
+    bool enabled = false;
+    // [Prefill,Retrieval,Replay,Decode][Main,Backend]; physical rows do not identify requests.
+    std::array<std::array<KvmemPlacementStats, 2>, 4> placement{};
+    std::uint64_t key_capture_calls = 0;
+    std::uint64_t key_capture_d2h_bytes = 0;
+    std::uint64_t key_capture_submit_wait_ns = 0;
+    std::uint64_t key_capture_host_wall_ns = 0;
+    std::uint64_t query_capture_calls = 0;
+    std::uint64_t query_capture_d2h_bytes = 0;
+    std::uint64_t query_capture_submit_wait_ns = 0;
+    std::uint64_t query_capture_host_wall_ns = 0;
+    std::uint64_t selection_calls = 0;
+    std::uint64_t scored_blocks = 0;
+    std::uint64_t selection_host_wall_ns = 0;
+    std::uint64_t replay_tokens = 0;
+    std::uint64_t replay_units = 0;
+    // Entire scheduler replay step, including nested replay placement and existing waits.
+    std::uint64_t replay_step_host_wall_ns = 0;
+    std::uint64_t replay_execution_host_ns = 0;
+    std::uint64_t replay_execution_device_wait_ns = 0;
+};
+
 // Request-stage wall timings retained for end-to-end latency/rate reporting. Prefill/decode are
 // Program execution elapsed time and include Device completion waits; total also includes queueing
 // and other request lifetime. They are not Host-work phases. GenerationEngineTiming below is the
@@ -655,6 +702,8 @@ struct GenerationTimings {
     double prompt_wall_seconds     = 0.0;
     double generation_wall_seconds = 0.0;
     double total_seconds           = 0.0;
+    // Retained with the same request-stage observations through finish/cancellation.
+    KvmemDiagnostics kvmem;
 };
 
 // Wall elapsed time directly observed in Engine-owned regions. "Exposed" values are latency
@@ -676,6 +725,22 @@ struct GenerationEngineTiming {
     std::uint64_t control_units                 = 0;
 };
 
+struct SpeculativeDiagnosticSample {
+    std::uint64_t round_index = 0; // includes zero-proposal fallback, scoped to one request
+    std::uint32_t lane = 0;
+    std::uint32_t frontier = 0;
+    std::uint32_t licensed_tokens = 0;
+    std::uint32_t published_tokens = 0;
+    bool publication_recorded = false;
+    SpeculativeProposalDiagnostic first;
+    SpeculativeProposalDiagnostic accepted;
+    DFlashSupportFrontier first_support_frontier;
+    DFlashSupportFrontier accepted_support_frontier;
+    std::int32_t round_anchor_id = -1;
+    std::vector<TokenId> first_reached_prefix_token_ids;
+    std::vector<TokenId> accepted_reached_prefix_token_ids;
+};
+
 struct SpeculativeStats {
     SpeculativeBackend backend    = SpeculativeBackend::None;
     bool enabled                  = false;
@@ -685,6 +750,24 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    // Position counts are over live proposal extents, including short final rounds.
+    // Reached means all earlier proposals accepted; rejected excludes the unreached suffix.
+    std::vector<std::uint64_t> attempted_per_position;
+    std::vector<std::uint64_t> reached_per_position;
+    std::vector<std::uint64_t> rejected_per_position;
+    std::uint64_t zero_accept_rounds    = 0;
+    std::uint64_t partial_accept_rounds = 0;
+    std::uint64_t full_accept_rounds    = 0;
+    // Target licensing precedes Frontend stop/EOS/budget/cancellation truncation.
+    // These count speculative decode outputs only, excluding the first prefill token.
+    std::uint64_t licensed_output_tokens    = 0;
+    std::uint64_t published_output_tokens   = 0;
+    std::uint64_t published_accepted_tokens = 0;
+    std::uint64_t discarded_licensed_tokens = 0;
+    std::uint32_t diagnostic_max_rounds = 0;
+    std::uint32_t diagnostic_every = 1;
+    bool support_frontier_enabled = false;
+    std::vector<SpeculativeDiagnosticSample> diagnostic_samples;
 };
 
 struct ThinkingBudgetStats {
@@ -914,6 +997,9 @@ enum class RuntimeLaneState : std::uint8_t {
     return "idle";
 }
 
+using RuntimeDirectSparseLaneStats = RuntimeDirectSparseLaneObservation<KvmemDiagnostics>;
+using RuntimeDirectSparseSampling = RuntimeDirectSparseSamplingObservation<KvmemDiagnostics, kMaximumConcurrency>;
+
 struct RuntimeLaneStats {
     // Lifetime counters of this physical lane, never reset when its request changes.
     std::uint64_t computed_prefill_tokens = 0;
@@ -1006,6 +1092,8 @@ struct RuntimeStats {
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;
+    // Latest-request observation only. No subtraction across request epochs.
+    RuntimeDirectSparseSampling direct_sparse_sampling;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
@@ -1038,6 +1126,7 @@ struct ContextCostSummary {
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
+    std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;
     double load_seconds                = 0.0;

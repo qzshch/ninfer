@@ -43,6 +43,20 @@ struct PhysicalUsageSnapshot {
                                                    const PhysicalUsageSnapshot&) noexcept = default;
 };
 
+// Observed counters, separate from PhysicalUsageSnapshot/resource accounting.
+// Read only on the Engine-owned boundary thread. No Device wait is introduced.
+// Counters belong to the latest request epoch of each physical lane; they are
+// not process-lifetime totals. Consumers must never subtract across epochs.
+struct SparseKvmemLaneSnapshot {
+    std::uint64_t request_epoch = 0;
+    KvmemDiagnostics request_counters;
+};
+
+struct SparseKvmemSnapshot {
+    std::uint32_t lane_count = 0;
+    std::array<SparseKvmemLaneSnapshot, kMaximumConcurrency> lanes{};
+};
+
 enum class TextPhase {
     Prefill,
     Verify,
@@ -878,6 +892,9 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    // Materialization must wait until source StateImage forks are settled too.
+    [[nodiscard]] bool can_plan_materialization() const noexcept;
+    [[nodiscard]] bool has_pending_kv_restore() const noexcept;
     [[nodiscard]] PrefillProgress
     advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] CaptureAssessment
@@ -936,6 +953,8 @@ public:
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+    [[nodiscard]] SparseKvmemSnapshot sparse_kvmem_snapshot() const noexcept;
+    [[nodiscard]] std::array<std::uint64_t, kMaximumConcurrency> sparse_kvmem_epochs() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 

@@ -355,7 +355,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rmsnorm(q, mtp_->query_norm, config_.rms_norm_eps, true, qn, s);
     ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
+    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, ctx_.execution_view());
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -385,7 +385,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, ctx_.execution_view());
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
@@ -393,7 +393,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
+            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, ctx_.execution_view());
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -407,7 +407,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     {
         auto post_mixer_scope = work_.scope();
-        ffn(mh, mtp_->ffn, x, {}, work_, s, true);
+        ffn(mh, mtp_->ffn, x, {}, work_, ctx_.execution_view(), true);
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({dimension(config_.hidden_size), T});
@@ -488,7 +488,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             work_.alloc(DType::BF16, {dimension(config_.attention->head_dim),
                                       dimension(config_.attention->num_key_value_heads), T});
         ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
-        text_rope(rope_positions, *config_.rope_parameters, kn, s);
+        text_rope(rope_positions, *config_.rope_parameters, kn, ctx_.execution_view());
         ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
 
         if (final_chunk) {
@@ -533,7 +533,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                     cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
             }
         }
-        text_rope(last_rope_position, *config_.rope_parameters, qn, s);
+        text_rope(last_rope_position, *config_.rope_parameters, qn, ctx_.execution_view());
 
         Tensor a = work_.alloc(DType::BF16, {dimension(config_.attention->head_dim),
                                              dimension(config_.attention->num_attention_heads), 1});
@@ -543,7 +543,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            mtp_kv_.layer_view(0), envelope, work_, a, s);
+            mtp_kv_.layer_view(0), envelope, work_, a, ctx_.execution_view());
         ops::sigmoid_mul(gate, a, s);
 
         Tensor o = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
@@ -555,7 +555,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rmsnorm(x_last, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, s);
         {
             auto post_mixer_scope = work_.scope();
-            ffn(mh, mtp_->ffn, x_last, {}, work_, s, true);
+            ffn(mh, mtp_->ffn, x_last, {}, work_, ctx_.execution_view(), true);
         }
         ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, true, *final_hidden, s);
         proposal_argmax(*final_hidden, *logits, *draft_token);
@@ -887,14 +887,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         if (q_begin < q_end) {
             ops::span_accumulate(q_capture, q_begin - text_kv_base_, q_end - q_begin, q_sum, s);
         }
-        const auto first_block = text_kv_base_ / ops::kKvmemCaptureBlockTokens;
-        const auto last_block = (chunk_end + ops::kKvmemCaptureBlockTokens - 1U) /
-                                 ops::kKvmemCaptureBlockTokens;
+        const auto first_block = text_kv_base_ / execution::kKvmemCaptureBlockTokens;
+        const auto last_block = (chunk_end + execution::kKvmemCaptureBlockTokens - 1U) /
+                                 execution::kKvmemCaptureBlockTokens;
         if (last_block > first_block) {
             Tensor k_capture(kn.view({rows_k, T}));
             for (auto block = first_block; block < last_block; ++block) {
-                const auto begin = std::max(text_kv_base_, block * ops::kKvmemCaptureBlockTokens);
-                const auto end = std::min(chunk_end, (block + 1U) * ops::kKvmemCaptureBlockTokens);
+                const auto begin = std::max(text_kv_base_, block * execution::kKvmemCaptureBlockTokens);
+                const auto end = std::min(chunk_end, (block + 1U) * execution::kKvmemCaptureBlockTokens);
                 const std::uint32_t slot = block % kvmem_capture_slots_;
                 Tensor k_sum(kvmem_k_sum_ +
                                  (static_cast<std::size_t>(fidx) * kvmem_capture_slots_ +
@@ -910,7 +910,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
+    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, ctx_.execution_view());
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -942,7 +942,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
-            a_batch, s);
+            a_batch, ctx_.execution_view());
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
@@ -951,7 +951,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
-            s);
+            ctx_.execution_view());
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -1078,17 +1078,17 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor recurrent_state_out =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
-        ops::gated_delta_net(
-            q_recurrent, k_recurrent, vv, g, beta,
-            static_cast<float>(1.0 /
-                               std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
-            /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o, s);
+        ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta,
+                             static_cast<float>(1.0 / std::sqrt(static_cast<double>(
+                                                          config_.gdn->linear_key_head_dim))),
+                             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
+                             o, ctx_.execution_view());
     }
 
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
                     .view({dimension(config_.gdn->linear_value_head_dim),
                            dimension(config_.gdn->linear_num_value_heads), T});
-    ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
+    ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
 
     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
                     p.output.policy, work_, s);
@@ -1104,7 +1104,7 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
                            const ops::SparseMoeHints& hints) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
-    ffn(h, weights.ffn, x, hints, work_, ctx_.stream);
+    ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view());
 }
 
 template <class Tap>

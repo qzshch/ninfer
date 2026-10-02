@@ -6,6 +6,8 @@
 #include "models/qwen3_5/program/context.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -266,18 +268,68 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
-    // Sparse capture/fork of a prefix beyond the window would snapshot Host-backed
-    // pages through device-only stability checks; long conversations re-prefill
-    // instead until that subsystem grows Host-aware pins.
+    const bool long_sparse_prompt = kvmem_window_pages != 0 &&
+        base->summary.prompt_tokens > kvmem_window_pages * kPagedKVPageSize;
+    std::uint32_t sparse_reuse_limit = long_sparse_prompt
+        ? std::min(kvmem_query_span(base->summary.prompt_tokens, 0, prompt.retrieval_query,
+                                   prompt.vision_items).begin,
+                   prompt.retrieval_query ? static_cast<std::uint32_t>(prompt.retrieval_query->begin)
+                                          : base->summary.prompt_tokens)
+        : base->summary.prompt_tokens;
+    if (long_sparse_prompt) {
+        sparse_reuse_limit -= sparse_reuse_limit % prefill_chunk;
+        // Do not turn an automatic text checkpoint into a partial media prefix.
+        for (auto item = prompt.vision_items.rbegin(); item != prompt.vision_items.rend(); ++item) {
+            if (item->token_spans.empty()) { continue; }
+            const auto begin = static_cast<std::uint32_t>(item->token_spans.front().begin);
+            const auto& last = item->token_spans.back();
+            if (begin < sparse_reuse_limit && sparse_reuse_limit < last.begin + last.count) {
+                sparse_reuse_limit = begin - begin % prefill_chunk;
+            }
+        }
+    }
     const bool prefix_cache_participation =
-        options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled &&
-        (kvmem_window_pages == 0 ||
-         base->summary.prompt_tokens <=
-             kvmem_window_pages * static_cast<std::uint32_t>(kPagedKVPageSize));
-    base->summary.publish_continuation = prefix_cache_participation;
-    // Long prompts need features for the entire history. The cache currently stores
-    // State/KV, not retrieval features, so a partial cached prefix cannot supply them.
+        options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+    // Sparse endpoints have undergone query-dependent placement/replay. Only
+    // independent first-pass shared checkpoints before the query are reusable.
+    base->summary.publish_continuation = prefix_cache_participation && !long_sparse_prompt;
     base->allow_prefix_reuse = prefix_cache_participation;
+    if (long_sparse_prompt) {
+        // Protocol automatic writes normally target the last message boundary,
+        // which already includes this request's query. Move automatic writes to
+        // the last complete prefill chunk before the query. Splitting inside a
+        // rolling chunk changes which historical pages the next suffix can see.
+        // Explicit boundaries keep their declared meaning or remain ineligible.
+        for (auto& opportunity : base->context_cache.opportunities) {
+            const bool automatic = has_shared_candidate_evidence(opportunity.evidence,
+                SharedCandidateEvidence::DefaultAutomatic) ||
+                has_shared_candidate_evidence(opportunity.evidence,
+                SharedCandidateEvidence::RequestedAutomatic);
+            if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && automatic &&
+                !has_shared_candidate_evidence(opportunity.evidence,
+                    SharedCandidateEvidence::ExplicitBoundary) &&
+                opportunity.frontier > sparse_reuse_limit) {
+                opportunity.frontier = sparse_reuse_limit;
+            }
+        }
+        if (std::getenv("NINFER_KVMEM_TRACE") != nullptr) {
+            std::fprintf(stderr, "KVMEM cache prompt=%u query=%u safe_frontier=%u enabled=%d opportunities=%zu\n",
+                base->summary.prompt_tokens,
+                prompt.retrieval_query ? static_cast<std::uint32_t>(prompt.retrieval_query->begin) : 0U,
+                sparse_reuse_limit, prefix_cache_participation,
+                base->context_cache.opportunities.size());
+            for (const auto& opportunity : base->context_cache.opportunities) {
+                std::fprintf(stderr, "KVMEM cache opportunity kind=%u frontier=%u\n",
+                    static_cast<unsigned>(opportunity.kind), opportunity.frontier);
+            }
+        }
+        std::erase_if(base->context_cache.opportunities, [&](const auto& opportunity) {
+            return opportunity.frontier == 0 ||
+                   opportunity.kind != PromptCacheMarkerKind::SharedStablePrefix ||
+                   opportunity.frontier > sparse_reuse_limit ||
+                   opportunity.frontier % prefill_chunk != 0;
+        });
+    }
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
@@ -364,7 +416,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         }
         previous_rewrite_frontier = frontier;
     }
-    if (base->summary.publish_continuation) {
+    if (prefix_cache_participation) {
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag =
             capture_identity_tag(speculative_backend, proposal_head, kv_storage);
@@ -376,6 +428,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
             if (frontier == 0 || frontier > base->summary.prompt_tokens) {
                 throw std::invalid_argument("capture opportunity frontier is invalid");
             }
+            if (long_sparse_prompt && (!shared || frontier > sparse_reuse_limit)) { return; }
             auto& groups = shared ? base->shared_candidates : base->capture_groups;
             auto existing =
                 std::find_if(groups.begin(), groups.end(),
@@ -507,6 +560,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
 
     auto plan                         = std::make_unique<AdmissionCandidateImpl>();
     plan->summary                     = base.summary;
+    plan->sparse_host_peak_bytes = base.root_demand.physical_peak_additional.host.kv_bytes;
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
@@ -527,6 +581,18 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             throw std::logic_error("catalog shared-prefix summary disagrees with Program state");
         }
         if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
+        if (kvmem_window_pages != 0 &&
+            base.summary.prompt_tokens > kvmem_window_pages * kPagedKVPageSize) {
+            const auto query = kvmem_query_span(base.summary.prompt_tokens, 0,
+                                               prompt.retrieval_query, prompt.vision_items);
+            const auto limit = std::min(query.begin, prompt.retrieval_query
+                ? static_cast<std::uint32_t>(prompt.retrieval_query->begin) : query.begin);
+            if (!shared_source->kvmem_features || selected.frontier > limit ||
+                selected.frontier % prefill_chunk != 0 ||
+                shared_source->kvmem_features->index.total_tokens() != selected.frontier) {
+                return std::nullopt;
+            }
+        }
         const auto* shared_identity = shared_source->identity->prefix_identity();
         if (shared_identity == nullptr ||
             !qwen3_5::detail::prefix_matches(prompt, shared_source->identity->ledger(),
@@ -537,6 +603,10 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         plan->reuse_base  = selected.frontier;
         plan->source_mode = runtime::PrivateSourceMode::Retain;
     } else if (source != nullptr) {
+        if (kvmem_window_pages != 0 &&
+            base.summary.prompt_tokens > kvmem_window_pages * kPagedKVPageSize) {
+            return std::nullopt;
+        }
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
         plan->source_mode                     = must_retain_private_source
@@ -901,7 +971,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         }
         const auto [main_missing, main_contiguous_runs] =
             missing_kv_restore(*text_kv_addresses, *text_kv_pages, source_kv->text, main_required);
-        if (main_missing != main_required - main_device) {
+        if (main_missing > main_required - main_device ||
+            (kvmem_window_pages == 0 && main_missing != main_required - main_device)) {
             throw std::logic_error(
                 "Text KV restore inventory is inconsistent [required=" +
                 std::to_string(main_required) + " device=" + std::to_string(main_device) +
@@ -927,7 +998,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             }
             const auto [backend_missing, backend_contiguous_runs] = missing_kv_restore(
                 *backend_kv_addresses, *backend_kv_pages, *source_kv->backend, backend_required);
-            if (backend_missing != backend_required - backend_device) {
+            if (backend_missing > backend_required - backend_device ||
+                (kvmem_window_pages == 0 && backend_missing != backend_required - backend_device)) {
                 throw std::logic_error("Backend KV restore inventory is inconsistent");
             }
             plan->needs_transfer = plan->needs_transfer || backend_missing != 0;
@@ -967,15 +1039,21 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         if (source_kv == nullptr) {
             throw std::logic_error("retained source has no KV address space");
         }
-        const std::uint32_t main_full_pages =
-            plan->reuse_base / static_cast<std::uint32_t>(kPagedKVPageSize);
+        const auto resident_or_required = [&](const KVAddressSpaceStore& addresses,
+                                              KVAddressSpaceHandle address,
+                                              std::uint32_t frontier) {
+            return addresses.device_prefix_residency_floor_pages(address, pages_for_tokens(frontier));
+        };
+        const std::uint32_t main_full_pages = resident_or_required(*text_kv_addresses,
+            source_kv->text, plan->reuse_base - plan->reuse_base % kPagedKVPageSize);
         const std::uint32_t backend_frontier =
             backend_frontier_at(speculative_backend, plan->reuse_base);
-        const std::uint32_t backend_full_pages =
-            backend_frontier / static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t backend_full_pages = source_kv->backend
+            ? resident_or_required(*backend_kv_addresses, *source_kv->backend,
+                backend_frontier - backend_frontier % kPagedKVPageSize) : 0U;
         if (main_full_pages > active.main_kv_pages ||
             backend_full_pages > active.backend_kv_pages) {
-            throw std::logic_error("retained prefix exceeds its active KV entitlement");
+            return std::nullopt;
         }
         detail::PhysicalResources active_resources{
             .device =
@@ -993,7 +1071,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         if (main_device > main_required) {
             throw std::logic_error("retained Text KV replica count exceeds requirement");
         }
-        source_replica_additions.device.main_kv_pages = main_required - main_device;
+        source_replica_additions.device.main_kv_pages =
+            text_kv_addresses->restore_estimate(source_kv->text, main_required).missing_pages;
         if (source_kv->backend) {
             const std::uint32_t backend_required =
                 backend_frontier == 0 ? 0U : pages_for_tokens(backend_frontier);
@@ -1002,7 +1081,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             if (backend_device > backend_required) {
                 throw std::logic_error("retained Backend KV replica count exceeds requirement");
             }
-            source_replica_additions.device.backend_kv_pages = backend_required - backend_device;
+            source_replica_additions.device.backend_kv_pages = backend_kv_addresses->restore_estimate(
+                *source_kv->backend, backend_required).missing_pages;
         }
         detail::PhysicalResources retained_tail_added;
         detail::PhysicalResources retained_tail_removed;
@@ -1012,7 +1092,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 KVAddressSpaceHandle address, std::uint32_t frontier, std::uint32_t active_pages,
                 std::uint32_t missing_source_pages, bool prefix_fork, bool& staged,
                 runtime::ContextResourceClass resource) {
-                const std::uint32_t required = pages_for_tokens(frontier);
+                const std::uint32_t logical_required = pages_for_tokens(frontier);
+                const std::uint32_t required = resident_or_required(addresses, address, frontier);
                 const std::uint64_t final_without_release =
                     static_cast<std::uint64_t>(required) + active_pages;
                 const std::uint32_t capacity = pages.physical_pool().capacity_pages();
@@ -1020,10 +1101,10 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 if (!prefix_fork || frontier == 0 ||
                     frontier % static_cast<std::uint32_t>(kPagedKVPageSize) == 0 ||
                     final_without_release != static_cast<std::uint64_t>(capacity) + 1U ||
-                    required > addresses.mapped_pages(address)) {
+                    logical_required > addresses.mapped_pages(address)) {
                     return false;
                 }
-                const LogicalKVPageHandle tail = addresses.logical_page(address, required - 1U);
+                const LogicalKVPageHandle tail = addresses.logical_page(address, logical_required - 1U);
                 if (pages.address_references(tail) != 1 || pages.writer_references(tail) != 0 ||
                     addresses.has_active_reference(tail)) {
                     return false;

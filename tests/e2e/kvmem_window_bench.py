@@ -13,7 +13,7 @@ import threading
 import time
 import urllib.request
 
-from kvmem_suite import Suite, parse_sse, validate_dual_lane_trace
+from kvmem_suite import Suite, parse_sse, validate_lane_trace
 
 
 def read_since(path, offset):
@@ -43,7 +43,7 @@ def summarize_placements(text):
 
 def validate_execution_trace(trace, backend, concurrency, records=()):
     if concurrency == 2:
-        return validate_dual_lane_trace(trace, backend)
+        return validate_lane_trace(trace, backend, 2)
     if concurrency != 1:
         raise AssertionError('window benchmark supports one or two lanes')
     rounds = [line for line in trace.splitlines()

@@ -195,7 +195,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
 
-    const auto address = addresses.create_active(3, 0);
+    const auto address = addresses.create_active(3, 0, device.stream);
     expect(address.has_value(), "active KV address allocation");
     addresses.ensure_mapped_to_tokens(*address, 65, device.stream);
     device.synchronize();
@@ -330,7 +330,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "KV release invalidates generations and closes physical ownership");
 
     // Verify crosses a page boundary, but the terminal commit consumes only its first column.
-    const auto terminal = addresses.create_active(3, 0);
+    const auto terminal = addresses.create_active(3, 0, device.stream);
     expect(terminal.has_value(), "terminal boundary KV address allocation");
     addresses.ensure_mapped_to_tokens(*terminal, 63, device.stream);
     addresses.commit_frontier(*terminal, 63);
@@ -366,7 +366,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.reserved_pages() == 0 && physical_pages.available_pages() == 8,
            "terminal settlement releases both mappings and unused growth");
 
-    const auto snapshot_source      = addresses.create_active(3, 0);
+    const auto snapshot_source      = addresses.create_active(3, 0, device.stream);
     const auto snapshot_destination = addresses.create_inactive();
     expect(snapshot_source && snapshot_destination, "active KV snapshot endpoints allocate");
     addresses.ensure_mapped_to_tokens(*snapshot_source, 65, device.stream);
@@ -392,7 +392,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.occupied() == 0,
            "active KV snapshot references close with both address spaces");
 
-    const auto alternating = addresses.create_active(4, 0);
+    const auto alternating = addresses.create_active(4, 0, device.stream);
     expect(alternating.has_value(), "alternating Host release address allocation");
     addresses.ensure_mapped_to_tokens(*alternating, 193, device.stream);
     addresses.commit_frontier(*alternating, 193);
@@ -425,7 +425,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.occupied() == 0,
            "alternating Host extent partitions close without leaked descriptors");
 
-    const auto shared = addresses.create_active(3, 0);
+    const auto shared = addresses.create_active(3, 0, device.stream);
     expect(shared.has_value(), "shared-prefix source address allocation");
     addresses.ensure_mapped_to_tokens(*shared, 65, device.stream);
     addresses.commit_frontier(*shared, 65);
@@ -480,7 +480,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.allocated_pages() == 0,
            "shared full-page occupancy survives until its final address reference releases");
 
-    const auto mixed_source = addresses.create_active(4, 0);
+    const auto mixed_source = addresses.create_active(4, 0, device.stream);
     expect(mixed_source.has_value(), "mixed snapshot retained-prefix source allocation");
     addresses.ensure_mapped_to_tokens(*mixed_source, 65, device.stream);
     addresses.commit_frontier(*mixed_source, 65);
@@ -571,14 +571,14 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.occupied() == 0 && physical_pages.allocated_pages() == 0,
            "repeated mixed snapshot ownership closes without leaked logical or physical pages");
 
-    const auto filler = addresses.create_active(4, 0);
+    const auto filler = addresses.create_active(4, 0, device.stream);
     expect(filler.has_value(), "full-capacity staged-fork filler allocation");
     addresses.ensure_mapped_to_tokens(*filler, 193, device.stream);
     addresses.commit_frontier(*filler, 193);
     addresses.set_checkpoint_requirement(*filler, 193);
     addresses.deactivate(*filler);
 
-    const auto retained = addresses.create_active(4, 0);
+    const auto retained = addresses.create_active(4, 0, device.stream);
     expect(retained.has_value(), "full-capacity retained source allocation");
     addresses.ensure_mapped_to_tokens(*retained, 65, device.stream);
     addresses.commit_frontier(*retained, 65);
@@ -655,7 +655,7 @@ void test_kv_placement(ninfer::DeviceContext& device) {
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
 
-    const auto address = addresses.create_active(3, 0);
+    const auto address = addresses.create_active(3, 0, device.stream);
     expect(address.has_value(), "placement KV address allocation");
     addresses.ensure_mapped_to_tokens(*address, 192, device.stream);
     addresses.commit_frontier(*address, 192);
@@ -783,7 +783,7 @@ void test_kv_placement(ninfer::DeviceContext& device) {
            "sparse activation republishes holes for Host-only pages");
     addresses.deactivate(*address);
     addresses.truncate_inactive_prefix(*address, 64);
-    addresses.activate(*address, 3, 0);
+    addresses.activate(*address, 3, 0, device.stream);
     addresses.ensure_mapped_to_tokens(*address, 192, device.stream);
     expect(addresses.device_residency_floor_pages(*address) == 3,
            "inactive truncate followed by growth has no stale or duplicate working-set entries");
@@ -813,7 +813,7 @@ void test_sparse_replay_truncate(ninfer::DeviceContext& device) {
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, tables, 2, 8);
     addresses.set_sparse_activation_budget(6);
-    const auto address = addresses.create_active(6, 0);
+    const auto address = addresses.create_active(6, 0, device.stream);
     addresses.ensure_mapped_to_tokens(*address, 256, device.stream);
     addresses.commit_frontier(*address, 256);
     device.synchronize();
@@ -839,6 +839,73 @@ void test_sparse_replay_truncate(ninfer::DeviceContext& device) {
                pages.occupied() == 0, "replay rewind and growth leave no physical or logical leak");
 }
 
+void test_sparse_host_credit_shared_aliases(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const auto layout = ninfer::plan_device_kv_page_pool(builder, {
+        .page_group_count = 12,
+        .geometry = {.page_tokens = 64,
+                     .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                     .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
+    const auto table_layout = ninfer::plan_kv_execution_tables(
+        builder, {.logical_page_capacity = 8, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical(backing, layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, physical);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(physical.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical, 20);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, tables, 4, 8);
+    addresses.set_sparse_activation_budget(6);
+    const auto source = addresses.create_active(6, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*source, 256, device.stream);
+    addresses.commit_frontier(*source, 256);
+    device.synchronize();
+    addresses.apply_device_placement(*source, extents, std::array{0U, 3U}, device.transfer_stream);
+    addresses.apply_device_placement(*source, extents, std::array{0U, 1U, 2U, 3U}, device.transfer_stream);
+    addresses.deactivate(*source);
+    const auto first = addresses.create_inactive();
+    auto fork_first = addresses.prepare_prefix_fork(*source, *first, 256, 6, 0);
+    addresses.commit_prefix_fork(std::move(fork_first), device.stream);
+    const auto second = addresses.create_inactive();
+    auto fork_second = addresses.prepare_prefix_fork(*source, *second, 256, 6, 1);
+    addresses.commit_prefix_fork(std::move(fork_second), device.stream);
+    device.synchronize();
+    std::vector<std::uint8_t> seen(pages.capacity());
+    std::size_t unique = 0;
+    for (const auto address : std::array{*first, *second}) {
+        for (std::uint32_t page = 0; page < addresses.mapped_pages(address); ++page) {
+            expect(pages.mark_host_replica_once(addresses.logical_page(address, page), seen, unique),
+                   "valid claimed-active Host credit");
+        }
+    }
+    expect(unique == 2 && host_arena.occupied_bytes() == 2 * host_layout.page_stride,
+           "two active aliases and inactive source share exactly two actual Host replicas");
+    const auto peak = 6 * host_layout.page_stride;
+    const std::array two_peaks{peak, peak};
+    const auto both = store::sparse_host_budget_occupancy(host_arena.occupied_bytes(),
+        unique * host_layout.page_stride, two_peaks);
+    expect(both && *both == 2 * peak, "shared actual store replicas credited once, not per address");
+    addresses.deactivate(*first);
+    expect(addresses.release(*first), "first active alias releases");
+    const auto old = addresses.logical_page(*second, 1);
+    addresses.deactivate(*second);
+    expect(addresses.release(*second), "second active alias releases");
+    (void)extents.release_unreferenced();
+    const std::array no_peaks{std::size_t{0}};
+    const auto retained = store::sparse_host_budget_occupancy(host_arena.occupied_bytes(), 0, no_peaks);
+    expect(retained && *retained == 2 * host_layout.page_stride,
+           "inactive catalog retains actual replicas after active claims released");
+    expect(addresses.release(*source), "inactive catalog source releases");
+    (void)extents.release_unreferenced();
+    expect(!pages.mark_host_replica_once(old, seen, unique), "stale Host handle fails closed");
+    expect(host_arena.occupied_bytes() == 0 && pages.occupied() == 0 &&
+               physical.allocated_pages() == 0 && physical.reserved_pages() == 0,
+           "shared Host credit test closes all real payload and claims");
+}
+
 void test_sparse_shared_reservation(ninfer::DeviceContext& device) {
     ninfer::LayoutBuilder builder;
     const auto layout = ninfer::plan_device_kv_page_pool(builder, {
@@ -856,7 +923,7 @@ void test_sparse_shared_reservation(ninfer::DeviceContext& device) {
     store::KVAddressSpaceStore addresses(pages, tables, 4, 64);
     addresses.set_sparse_activation_budget(8);
 
-    auto source = addresses.create_active(8, 0);
+    auto source = addresses.create_active(8, 0, device.stream);
     addresses.ensure_mapped_to_tokens(*source, 256, device.stream);
     addresses.commit_frontier(*source, 256);
     addresses.deactivate(*source);
@@ -878,6 +945,80 @@ void test_sparse_shared_reservation(ninfer::DeviceContext& device) {
            "sparse shared-prefix test leaves no physical claim");
 }
 
+void test_sparse_host_prefix_snapshot(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const auto layout = ninfer::plan_device_kv_page_pool(builder, {
+        .page_group_count = 12,
+        .geometry = {.page_tokens = 64,
+                     .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                     .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
+    const auto table_layout = ninfer::plan_kv_execution_tables(
+        builder, {.logical_page_capacity = 8, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical(backing, layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, physical);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(physical.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical, 20);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, tables, 5, 8);
+    const auto source = addresses.create_active(6, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*source, 257, device.stream);
+    addresses.commit_frontier(*source, 257);
+    device.synchronize();
+    addresses.apply_device_placement(*source, extents, std::array{0U, 3U, 4U}, device.transfer_stream);
+    const auto host_page = addresses.logical_page(*source, 1);
+    addresses.deactivate(*source);
+    auto activation = addresses.prepare_activation(*source, 3, 0, 257);
+    addresses.commit_activation(std::move(activation), device.stream);
+    const auto shape = addresses.active_snapshot_shape(*source, 257);
+    expect(shape.unique_full_pages == 2, "snapshot Device credit excludes Host-only full pages");
+    const auto active = addresses.create_inactive();
+    {
+        auto aborted = addresses.prepare_active_snapshot(*source, *active, 257);
+        expect(pages.source_pins(host_page) == 1, "Host-only snapshot source is pinned");
+    }
+    expect(pages.source_pins(host_page) == 0, "aborted snapshot releases Host pins");
+    auto snapshot = addresses.prepare_active_snapshot(*source, *active, 257);
+    physical.copy_page(addresses.active_snapshot_tail_source(snapshot),
+                       addresses.active_snapshot_tail_destination(snapshot), device.stream);
+    device.synchronize();
+    addresses.commit_active_snapshot(std::move(snapshot), device.stream);
+    const auto table = read_block_table(tables, 0, 5);
+    expect(table[0] >= 0 && table[1] == ninfer::kPagedKVPageHole &&
+               table[2] == ninfer::kPagedKVPageHole && table[3] >= 0 && table[4] >= 0 &&
+               addresses.device_residency_floor_pages(*active) == 3,
+           "snapshot preserves holes and the sparse working set");
+    const auto forked = addresses.create_inactive();
+    {
+        auto aborted = addresses.prepare_prefix_fork(*source, *forked, 257, 3, 1);
+        expect(pages.source_pins(host_page) == 1, "Host-only fork source is pinned");
+    }
+    expect(pages.source_pins(host_page) == 0, "aborted fork releases Host pins");
+    auto fork = addresses.prepare_prefix_fork(*source, *forked, 257, 3, 1);
+    physical.copy_page(addresses.prefix_fork_tail_source(fork),
+                       addresses.prefix_fork_tail_destination(fork), device.stream);
+    device.synchronize();
+    addresses.commit_prefix_fork(std::move(fork), device.stream);
+    expect(addresses.device_residency_floor_pages(*forked) == 3 &&
+               addresses.logical_page(*forked, 1) == host_page && pages.source_pins(host_page) == 0,
+           "sparse fork shares immutable Host history with a window-sized entitlement");
+    addresses.apply_device_placement(*forked, extents, std::array{1U, 3U, 4U}, device.transfer_stream);
+    expect(pages.device_resident(host_page), "shared Host history remains restorable after fork");
+    expect(pages.device_resident(addresses.logical_page(*active, 0)),
+           "one lane's placement cannot demote another lane's selected shared page");
+    addresses.deactivate(*forked);
+    addresses.deactivate(*active);
+    expect(addresses.release(*forked) && addresses.release(*active) && addresses.release(*source),
+           "sparse snapshot and fork release all owners");
+    (void)extents.release_unreferenced();
+    expect(physical.allocated_pages() == 0 && physical.reserved_pages() == 0 &&
+               host_arena.occupied_bytes() == 0,
+           "sparse snapshot teardown leaks no Device or Host claim");
+}
+
 } // namespace
 
 int main() {
@@ -896,6 +1037,8 @@ int main() {
         test_kv_placement(device);
         test_sparse_replay_truncate(device);
         test_sparse_shared_reservation(device);
+        test_sparse_host_credit_shared_aliases(device);
+        test_sparse_host_prefix_snapshot(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

@@ -11,6 +11,7 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/sparse_epoch_binding.h"
 
 #include <algorithm>
 #include <array>
@@ -517,6 +518,80 @@ private:
         bool active_ = true;
     };
 
+    void sample_direct_sparse(RuntimeStats& snapshot, Clock::time_point now,
+                              bool force_final_boundary = false) {
+        if constexpr (requires { instance_.program->sparse_kvmem_epochs();
+                                 instance_.program->sparse_kvmem_snapshot(); }) {
+            // 64-byte epoch observation avoids copying every diagnostic counter per round.
+            const auto epochs = instance_.program->sparse_kvmem_epochs();
+            bool changed = false;
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                changed = detail::observe_sparse_epoch(direct_sparse_bindings_[lane], epochs[lane],
+                    snapshot.lanes[lane].engine_request_id) || changed;
+            }
+            if (detail::sparse_snapshot_refresh_due(force_final_boundary, changed,
+                    direct_sparse_sample_revision_ == 0,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        now - direct_sparse_sampled_at_).count())) {
+                const auto observed = instance_.program->sparse_kvmem_snapshot();
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    auto& cached = direct_sparse_lane_cache_[lane];
+                    cached = {};
+                    if (lane >= observed.lane_count) { continue; }
+                    const auto& counters = observed.lanes[lane];
+                    const auto& binding = direct_sparse_bindings_[lane];
+                    cached.available = counters.request_epoch != 0 && counters.request_counters.enabled;
+                    cached.request_epoch = counters.request_epoch;
+                    cached.engine_request_id = binding.request_epoch == counters.request_epoch
+                                                   ? binding.engine_request_id : 0;
+                    cached.request_counters = counters.request_counters;
+                }
+                direct_sparse_sampled_at_ = now;
+                ++direct_sparse_sample_revision_;
+            }
+            snapshot.direct_sparse_sampling.supported = true;
+            snapshot.direct_sparse_sampling.sample_revision = direct_sparse_sample_revision_;
+            snapshot.direct_sparse_sampling.sampled_steady_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(direct_sparse_sampled_at_.time_since_epoch()).count());
+            snapshot.direct_sparse_sampling.sample_age_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - direct_sparse_sampled_at_).count());
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                auto& target = snapshot.direct_sparse_sampling.lanes[lane];
+                target = direct_sparse_lane_cache_[lane];
+                target.current_request = target.available && target.engine_request_id != 0 &&
+                    target.engine_request_id == snapshot.lanes[lane].engine_request_id;
+            }
+        }
+    }
+
+    // Engine-owner boundary; fixed Host counters only, no Context access or CUDA calls.
+    // Capture before finish/abort can release reusable storage. Complete-success
+    // fallback covers commit cancellation, whose Program Host timing still survives.
+    void sample_terminal_sparse(const std::shared_ptr<Request>& request) {
+        if constexpr (requires { instance_.program->sparse_kvmem_epochs();
+                                 instance_.program->sparse_kvmem_snapshot(); }) {
+            if (!request->lane) { return; }
+            const std::uint32_t lane = request->lane->value;
+            if (lane >= max_concurrency_) { return; }
+            const auto epochs = instance_.program->sparse_kvmem_epochs();
+            if (!detail::sparse_terminal_refresh_due(slots_[lane] == request,
+                    epochs[lane], direct_sparse_terminal_epochs_[lane])) { return; }
+            // Refresh the whole observation batch at one timestamp. Refreshing just
+            // this lane would falsely make other lanes' global sample-age look fresh.
+            RuntimeStats owners{};
+            owners.lane_count = max_concurrency_;
+            for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+                if (slots_[other]) { owners.lanes[other].engine_request_id = slots_[other]->id; }
+            }
+            if (materializing_) {
+                owners.lanes[materializing_->destination.value].engine_request_id =
+                    materializing_->request->id;
+            }
+            sample_direct_sparse(owners, Clock::now(), true);
+            direct_sparse_terminal_epochs_[lane] = epochs[lane];
+        }
+    }
+
     void publish_runtime_stats() {
         HostPhaseMeasurement measurement = begin_host_phase();
         std::optional<nvtx::ScopedRange> phase_range;
@@ -531,9 +606,9 @@ private:
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
         snapshot.prefilling_requests = 0;
-        if (const auto lane = scheduler_.prefill_lane();
-            lane && slots_[*lane] != nullptr && !slots_[*lane]->capture_pending) {
-            snapshot.prefilling_requests = 1;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (scheduler_.owns_prefill_lane(lane) && slots_[lane] != nullptr &&
+                !slots_[lane]->capture_pending) { ++snapshot.prefilling_requests; }
         }
         snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -562,6 +637,7 @@ private:
             lane_stats.engine_request_id = materializing_->request->id;
             lane_stats.state = RuntimeLaneState::Materializing;
         }
+        sample_direct_sparse(snapshot, detail_started);
         detail_range.reset();
         record_detail(&RuntimeHostWorkStats::stats_publication_ns,
                       &RuntimeHostWorkStats::stats_publication_invocations, detail_started);
@@ -845,6 +921,7 @@ private:
     }
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
+        sample_terminal_sparse(request);
         HostPhaseMeasurement completion = begin_host_phase();
         double prompt_wall_seconds      = 0.0;
         double generation_wall_seconds  = 0.0;
@@ -977,6 +1054,7 @@ private:
                 throw std::logic_error("terminal-pending request has invalid ownership");
             }
             const FinishReason reason = *request->terminal_reason;
+            sample_terminal_sparse(request);
             auto finished =
                 resources_.finish(*instance_.program, *request->lane, *request->sequence);
             request->generation_timings = finished.timings;
@@ -1005,10 +1083,11 @@ private:
                 throw std::logic_error("active cancellation has no sequence binding");
             }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
+            sample_terminal_sparse(request);
             auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
-            if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
+            if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_success(request, FinishReason::Cancelled);
@@ -1395,7 +1474,7 @@ private:
             throw std::logic_error("runtime Begin summary differs from committed admission");
         }
         const std::uint32_t lane = request->lane->value;
-        if (scheduler_.prefill_lane() == lane) {
+        if (scheduler_.owns_prefill_lane(lane)) {
             scheduler_.clear_prefill_lane(lane);
             request_admission_check();
         }
@@ -1406,12 +1485,13 @@ private:
         progress.pending.reset();
     }
 
-    void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+    void run_prefill_step(std::uint32_t lane,
+                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
-        const auto prefill_lane = scheduler_.prefill_lane();
-        if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
-        const std::uint32_t lane = *prefill_lane;
+        if (!scheduler_.owns_prefill_lane(lane)) {
+            throw std::logic_error("no request owns staged prefill");
+        }
         const auto request       = slots_[lane];
         if (request == nullptr || !request->is_prefilling() || request->capture_pending) {
             throw std::logic_error("staged prefill lane has invalid request state");
@@ -1425,6 +1505,24 @@ private:
             instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
         program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        if (scheduler_.owns_prefill_lane(lane)) {
+            // Finish first-pass prompts promptly so decode batching starts early.
+            // A replay owner has consumed its logical prompt but remains staged:
+            // interleave at unit boundaries while that tail is in flight.
+            bool have_replay_owner = false;
+            for (std::uint32_t owner = 0; owner < max_concurrency_; ++owner) {
+                if (!scheduler_.owns_prefill_lane(owner)) { continue; }
+                const auto& staged = slots_[owner];
+                if (staged == nullptr || !staged->admitted_begin) { continue; }
+                const auto& begin = *staged->admitted_begin;
+                if (staged->computed_prompt_tokens ==
+                    begin.prompt_tokens - begin.reused_prompt_tokens) {
+                    have_replay_owner = true;
+                    break;
+                }
+            }
+            if (have_replay_owner) { scheduler_.rotate_prefill_lane(lane); }
+        }
         publish_runtime_stats();
     }
 
@@ -1951,6 +2049,9 @@ private:
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
         materializing_.reset();
+        for (const auto& request : slots_) {
+            if (request) { sample_terminal_sparse(request); }
+        }
         instance_.program->fail_all_cleanup();
         resources_.clear_after_program_cleanup();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -2001,9 +2102,25 @@ private:
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
                     admission_check_pending_.load(std::memory_order_acquire);
+                // An additional staged owner is useful while an existing owner
+                // replays its completed logical prompt. Preserve first-pass FIFO
+                // admission so ordinary prefill/decode overlap keeps its old shape.
+                bool replay_allows_admission = !scheduler_.prefill_lane().has_value();
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    const auto& staged = slots_[lane];
+                    if (!scheduler_.owns_prefill_lane(lane) || !staged ||
+                        !staged->admitted_begin) { continue; }
+                    const auto& begin = *staged->admitted_begin;
+                    if (staged->computed_prompt_tokens ==
+                        begin.prompt_tokens - begin.reused_prompt_tokens) {
+                        replay_allows_admission = true;
+                        break;
+                    }
+                }
                 if (scheduler_.should_attempt_admission(
                         have_pending, admission_check_pending, !membership.empty(),
-                        previous_unit_was_decode, instance_.program->has_context_transaction()) &&
+                        previous_unit_was_decode, instance_.program->has_context_transaction(),
+                        (!replay_allows_admission || !instance_.program->can_plan_materialization())) &&
                     consume_admission_check()) {
                     (void)try_admit_one();
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
@@ -2014,6 +2131,18 @@ private:
                 // not reinterpret an already-issued unit with a later atomic read.
                 const auto cancelled_at_unit_start = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_unit_start, boundary);
+                // A retained sparse source can alias another lane's history. Its
+                // Host-to-Device restore owns pending physical replicas until
+                // context publication; rolling/retrieval must not promote them
+                // a second time. The worker keeps polling/cancelling at boundaries.
+                if (instance_.program->has_pending_kv_restore()) {
+                    set_host_work_class(HostWorkClass::Control);
+                    finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    execution_lock.unlock();
+                    std::unique_lock wait_lock(queue_mutex_);
+                    queue_cv_.wait_for(wait_lock, std::chrono::milliseconds(1));
+                    continue;
+                }
                 const ControlMembership control_membership =
                     scheduler_.build_control_membership(slots_, max_concurrency_);
                 if (!control_membership.empty()) {
@@ -2025,19 +2154,21 @@ private:
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
 
-                bool prefill_runnable = false;
-                if (const auto lane = scheduler_.prefill_lane(); lane) {
-                    if (slots_[*lane] == nullptr || !slots_[*lane]->is_prefilling()) {
+                std::array<bool, kMaximumConcurrency> runnable_prefills{};
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    if (!scheduler_.owns_prefill_lane(lane)) { continue; }
+                    if (slots_[lane] == nullptr || !slots_[lane]->is_prefilling()) {
                         throw std::logic_error("prefill owner has no active Engine request");
                     }
-                    prefill_runnable = !slots_[*lane]->capture_pending;
+                    runnable_prefills[lane] = !slots_[lane]->capture_pending;
                 }
+                const auto prefill_lane = scheduler_.runnable_prefill_lane(runnable_prefills);
                 const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
+                    !membership.empty(), prefill_lane.has_value(), previous_unit_was_decode);
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    run_prefill_step(cancelled_at_unit_start);
+                    run_prefill_step(*prefill_lane, cancelled_at_unit_start);
                     previous_unit_was_decode = false;
                     continue;
                 }
@@ -2058,9 +2189,6 @@ private:
                 try {
                     publish_runtime_stats();
                 } catch (...) {}
-                // An engine-wide failure can include a poisoned CUDA context or
-                // incomplete physical cleanup. Request-local failures are handled
-                // above; never announce this Program healthy without reconstructing it.
                 return;
             }
             execution_lock.unlock();
@@ -2093,6 +2221,11 @@ private:
     HostWorkClass current_host_work_class_     = HostWorkClass::Control;
     std::array<std::uint32_t, kMaximumConcurrency> current_decode_lanes_{};
     std::size_t current_decode_lane_count_ = 0;
+    std::array<detail::SparseEpochBinding, kMaximumConcurrency> direct_sparse_bindings_{};
+    std::array<std::uint64_t, kMaximumConcurrency> direct_sparse_terminal_epochs_{};
+    std::array<RuntimeDirectSparseLaneStats, kMaximumConcurrency> direct_sparse_lane_cache_{};
+    Clock::time_point direct_sparse_sampled_at_{};
+    std::uint64_t direct_sparse_sample_revision_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
     bool stopping_ = false;

@@ -24,12 +24,29 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  frame.target_tokens);
     }
     if (frame.proposal_q.data != nullptr) {
-        ops::speculative_accept_sparse_drafts(
-            frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
-            frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
-            frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
-            dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            {false}, execution.work, execution.device.stream);
+        if (frame.diagnostic_packets.data != nullptr) {
+            ops::speculative_accept_sparse_drafts_diagnostic(
+                frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
+                frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
+                frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
+                dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
+                {false}, frame.diagnostic_mask, frame.diagnostic_packets,
+                execution.work, execution.device.stream);
+            if (frame.support_frontiers.data != nullptr) {
+                ops::speculative_collect_support_frontier(
+                    frame.target_logits, frame.ids, frame.drafts, frame.candidate_ids, frame.proposal_q,
+                    dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
+                    frame.diagnostic_packets, frame.support_frontiers,
+                    {ops::SpeculativeSupportFrontierMode::ReadRanks}, execution.device.stream);
+            }
+        } else {
+            ops::speculative_accept_sparse_drafts(
+                frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
+                frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
+                frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
+                dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
+                {false}, execution.work, execution.device.stream);
+        }
     } else {
         ops::speculative_accept_greedy_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,

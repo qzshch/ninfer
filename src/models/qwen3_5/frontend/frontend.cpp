@@ -1,4 +1,7 @@
 #include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen3_5/program/speculative/diagnostic_sampling.h"
+#include "ninfer/dflash_support_frontier.h"
+#include <cstdlib>
 
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -654,7 +657,11 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
     if (data_ == nullptr) { throw std::logic_error("prepared prompt is empty"); }
-    return PromptSummary{.starts_in_reasoning = data_->starts_in_reasoning,
+    const bool diagnostic_binding = detail::support_frontier_environment(
+        std::getenv("NINFER_DFLASH_SUPPORT_FRONTIER"));
+    return PromptSummary{.diagnostic_input_token_ids = bounded_dflash_prompt_identity(
+                             diagnostic_binding, data_->has_media(), data_->token_ids),
+                         .starts_in_reasoning = data_->starts_in_reasoning,
                          .prompt_tokens       = checked_token_count(data_->token_ids.size()),
                          .has_media           = data_->has_media()};
 }

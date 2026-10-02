@@ -9,6 +9,7 @@ set(ninfer_op_tests
   gated_rmsnorm
   l2norm
   gated_delta_net
+  kimi_delta_attention
   causal_conv1d_silu
   layer_norm
   embedding
@@ -46,17 +47,6 @@ ninfer_add_op_test(ninfer_softmax_attention_test
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/plain_and_packed.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/context.cpp"
   LIBRARIES ninfer_ops)
-
-add_test(NAME ninfer_softmax_attention_nvfp4_test
-  COMMAND ninfer_softmax_attention_test --nvfp4-only)
-
-add_test(NAME ninfer_softmax_attention_k8v4_test
-  COMMAND ninfer_softmax_attention_test --k8v4-only)
-
-set_tests_properties(
-  ninfer_softmax_attention_nvfp4_test
-  ninfer_softmax_attention_k8v4_test
-  PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_op_test(ninfer_sliding_window_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sliding_window_attention.cpp"
@@ -105,6 +95,10 @@ ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_round.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_speculative_proposal_diagnostics_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_proposal_diagnostics.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
   LIBRARIES ninfer_ops)
@@ -141,3 +135,8 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
+
+# Optional read-only frontier: reuses full FP64 acceptance/RNG/Graph/multilane suite.
+ninfer_add_op_test(ninfer_dflash_support_frontier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_support_frontier.cpp"
+  LIBRARIES ninfer_ops)

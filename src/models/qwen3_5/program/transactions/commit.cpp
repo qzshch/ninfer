@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/speculative/diagnostics.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
 
@@ -151,6 +152,7 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
             }
         }
         requests[lane].active_resources   = active;
+        requests[lane].sparse_host_peak_bytes = details.sparse_host_peak_bytes;
         requests[lane].optional_resources = details.active_optional_resources;
         invalidate_lane(lane);
         const SequenceHandle handle =
@@ -158,6 +160,9 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         return StartResult{.sequence = handle};
     } catch (...) {
         if (destination && *destination < max_concurrency) {
+            // Startup may have queued work before a later publication check failed.
+            // Complete it before returning its buffers, pages or execution row to the pools.
+            device.synchronize();
             const std::uint32_t lane = *destination;
             if (active_continuations[lane] < continuation_capacity) {
                 clear_lane_best_effort(active_sequence(lane), requests[lane]);
@@ -346,21 +351,10 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             }
 
             if (is_masked_draft_backend(speculative_backend)) {
-                if (!dflash || !io.dflash_decode || !sequence.kv ||
+                if (!dflash || !io.dflash_prefill || !dflash_prefill_host_ingress || !sequence.kv ||
                     (backend_kv_cache() && !sequence.kv->backend)) {
                     throw std::logic_error("DFlash forced continuation state is incomplete");
                 }
-                *dflash_host_ingress                            = {};
-                dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(lane);
-                const StateImageSelectors selectors             = state_selectors(sequence);
-                dflash_host_ingress->state_source_slots[0]      = selectors.source;
-                dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-                dflash_host_ingress->dflash_kv_table_rows[0] =
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0;
-                CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                           sizeof(qwen3_5::DFlashDecodeIngress),
-                                           cudaMemcpyHostToDevice, device.stream));
             }
 
             std::uint32_t cursor = base;
@@ -382,8 +376,9 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     selectors.source,
                     selectors.destination,
                     0,
-                    dflash_host_ingress,
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0};
+                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                         : 0,
+                    dflash_prefill_host_ingress};
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
                                          : workspace_plan.text_prefill);
@@ -460,6 +455,7 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
     std::array<GenerationTimings, kMaximumConcurrency> timings{};
     std::array<SpeculativeStats, kMaximumConcurrency> speculative{};
     std::array<PendingKind, kMaximumConcurrency> pending_kinds{};
+    std::array<std::uint32_t, kMaximumConcurrency> licensed_counts{};
     const auto release_members = [&]() noexcept {
         std::array<std::uint32_t, kMaximumConcurrency> failed_lanes{};
         std::size_t failed_count = 0;
@@ -488,6 +484,7 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
             lanes[row]                              = lane;
             const PendingCandidate& candidate       = requests[lane].pending;
             pending_kinds[row]                      = candidate.kind;
+            licensed_counts[row]                   = candidate.produced;
             const runtime::CommitDecision& decision = decisions[row];
             if (decision.cancelled && has_context_transaction()) {
                 throw std::logic_error(
@@ -509,6 +506,9 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
             if (decision.cancelled) {
                 timings[row]     = requests[lane].timings;
                 speculative[row] = std::move(requests[lane].speculative_stats);
+                if (candidate.kind == PendingKind::Speculative) {
+                    record_speculative_publication(speculative[row], candidate.produced, 0);
+                }
             }
         }
 
@@ -528,6 +528,10 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
         out.row_count          = row_count;
         bool released_resource = false;
         for (std::size_t row = 0; row < row_count; ++row) {
+            if (!decisions[row].cancelled && pending_kinds[row] == PendingKind::Speculative) {
+                record_speculative_publication(requests[lanes[row]].speculative_stats,
+                                               licensed_counts[row], decisions[row].accepted_tokens);
+            }
             if (decisions[row].cancelled) {
                 invalidate_lane(lanes[row]);
                 released_resource = true;
@@ -670,6 +674,7 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     release_sequence_growth_entitlement(state);
     unbind_sequence_kv(state);
     request.active_resources                    = {};
+    request.sparse_host_peak_bytes               = 0;
     request.optional_resources                  = {};
     request.lifecycle                           = Lifecycle::Empty;
     request.pending                             = {};
@@ -697,6 +702,9 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         return out;
     }
     SequenceState& state = active_sequence(lane);
+    // Cancellation can arrive after activation and before the first prefill unit has waited
+    // for its uploads and initialization. Settle that work before releasing reusable resources.
+    device.synchronize();
     if (!clear_lane_strict(state, request)) { return out; }
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);

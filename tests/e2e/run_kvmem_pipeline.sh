@@ -64,9 +64,11 @@ if [[ "$PROFILE" == vision ]]; then
     exit 0
 fi
 if [[ "$PROFILE" == concurrency ]]; then
+    LANES=${NINFER_TEST_CONCURRENCY:-2}
+    case "$LANES" in 2|3) ;; *) echo 'concurrency profile requires two or three lanes' >&2; exit 2 ;; esac
     for SPEC in none mtp; do
-        "$PYTHON" tests/e2e/kvmem_suite.py "${COMMON[@]}" --output "$OUTPUT/dual-$SPEC" \
-            --profile concurrency --concurrency 2 --spec "$SPEC" --host-mib 2048 --port "$PORT"
+        "$PYTHON" tests/e2e/kvmem_suite.py "${COMMON[@]}" --output "$OUTPUT/c$LANES-$SPEC" \
+            --profile concurrency --concurrency "$LANES" --spec "$SPEC" --host-mib 2048 --port "$PORT"
         PORT=$((PORT + 1))
     done
     echo "KVMem concurrency pipeline passed: $OUTPUT"

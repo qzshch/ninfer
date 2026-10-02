@@ -178,15 +178,38 @@ int main() {
                           !scheduler.should_attempt_admission(true, true, true, false, false) &&
                           scheduler.should_attempt_admission(true, true, true, true, false) &&
                           !scheduler.should_attempt_admission(true, true, false, false, true) &&
+                          !scheduler.should_attempt_admission(true, true, false, false, false, true) &&
                           scheduler.choose_execution(true, false, false) == ExecutionAction::Decode,
                       "admission and GPU-unit fairness gates changed");
     scheduler.set_prefill_lane(0);
     failures +=
-        check(!scheduler.should_attempt_admission(true, true, true, true, false) &&
+        check(scheduler.should_attempt_admission(true, true, true, true, false) &&
                   scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
                   scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
-              "prefill/decode alternation changed");
+              "prefill/decode alternation or multi-prefill admission changed");
+    scheduler.set_prefill_lane(1);
+    scheduler.set_prefill_lane(2);
+    std::array<bool, ninfer::kMaximumConcurrency> prefill_runnable{};
+    prefill_runnable[0] = prefill_runnable[1] = prefill_runnable[2] = true;
+    failures += check(scheduler.runnable_prefill_lane(prefill_runnable) == 0,
+                      "new prefill owners retain FIFO unit order");
+    scheduler.rotate_prefill_lane(0);
+    failures += check(scheduler.runnable_prefill_lane(prefill_runnable) == 1,
+                      "prefill and replay units rotate among lane owners");
+    prefill_runnable[1] = false;
+    failures += check(scheduler.runnable_prefill_lane(prefill_runnable) == 2,
+                      "pending capture on one lane does not block another prefill");
     scheduler.clear_prefill_lane(0);
+    failures += check(!scheduler.owns_prefill_lane(0) && scheduler.owns_prefill_lane(2),
+                      "cancelling a non-front prefill preserves other owners");
+    bool duplicate_rejected = false;
+    try { scheduler.set_prefill_lane(2); } catch (const std::logic_error&) {
+        duplicate_rejected = true;
+    }
+    failures += check(duplicate_rejected, "duplicate prefill owner was accepted");
+    scheduler.clear_prefill_lane(1);
+    scheduler.clear_prefill_lane(2);
+    failures += check(!scheduler.prefill_lane(), "completed prefills leave no scheduler owner");
 
     std::array<std::shared_ptr<SchedulerRequest>, ninfer::kMaximumConcurrency> slots{};
     slots[0]                      = std::make_shared<SchedulerRequest>();

@@ -16,7 +16,7 @@ class SWEFrozenContract(unittest.TestCase):
         module = ModuleType('docker.models.containers')
         module.ContainerCollection = Collection
         original = Collection.create
-        environment = proxy_environment('http://192.168.100.180:7897')
+        environment = proxy_environment('http://192.0.2.1:7897')
         with patch.dict('sys.modules', {'docker.models.containers': module}):
             with self.assertRaisesRegex(RuntimeError, 'test interruption'):
                 with grading_container_network(environment):

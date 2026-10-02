@@ -180,6 +180,20 @@ SpeculativeStats aggregate_speculative(const TestResult& result) {
         for (std::size_t i = 0; i < in.accepted_per_position.size(); ++i) {
             out.accepted_per_position[i] += in.accepted_per_position[i];
         }
+        const auto add_positions = [](auto& destination, const auto& source) {
+            if (destination.size() < source.size()) { destination.resize(source.size()); }
+            for (std::size_t i = 0; i < source.size(); ++i) { destination[i] += source[i]; }
+        };
+        add_positions(out.attempted_per_position, in.attempted_per_position);
+        add_positions(out.reached_per_position, in.reached_per_position);
+        add_positions(out.rejected_per_position, in.rejected_per_position);
+        out.zero_accept_rounds += in.zero_accept_rounds;
+        out.partial_accept_rounds += in.partial_accept_rounds;
+        out.full_accept_rounds += in.full_accept_rounds;
+        out.licensed_output_tokens += in.licensed_output_tokens;
+        out.published_output_tokens += in.published_output_tokens;
+        out.published_accepted_tokens += in.published_accepted_tokens;
+        out.discarded_licensed_tokens += in.discarded_licensed_tokens;
     }
     return out;
 }
@@ -251,7 +265,24 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
         if (i != 0) { out << ", "; }
         out << stats.accepted_per_position[i];
     }
-    out << "]\n" << indent << '}';
+    const auto append_positions = [&](std::string_view name, const auto& positions) {
+        out << "],\n" << indent << "  \"" << name << "\": [";
+        for (std::size_t i = 0; i < positions.size(); ++i) {
+            if (i != 0) { out << ", "; }
+            out << positions[i];
+        }
+    };
+    append_positions("attempted_per_position", stats.attempted_per_position);
+    append_positions("reached_per_position", stats.reached_per_position);
+    append_positions("rejected_per_position", stats.rejected_per_position);
+    out << "],\n" << indent << "  \"zero_accept_rounds\": " << stats.zero_accept_rounds
+        << ",\n" << indent << "  \"partial_accept_rounds\": " << stats.partial_accept_rounds
+        << ",\n" << indent << "  \"full_accept_rounds\": " << stats.full_accept_rounds
+        << ",\n" << indent << "  \"licensed_output_tokens\": " << stats.licensed_output_tokens
+        << ",\n" << indent << "  \"published_output_tokens\": " << stats.published_output_tokens
+        << ",\n" << indent << "  \"published_accepted_tokens\": " << stats.published_accepted_tokens
+        << ",\n" << indent << "  \"discarded_licensed_tokens\": " << stats.discarded_licensed_tokens
+        << '\n' << indent << '}';
 }
 
 void append_timings_json(std::ostringstream& out, const GenerationTimings& timings,

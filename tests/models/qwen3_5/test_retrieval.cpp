@@ -167,7 +167,9 @@ void test_media_windows() {
            "in-progress image maps no future pages and a fitting prefix stays dense");
     bool rejected = false;
     try { r::validate_media_window(groups, 7); }
-    catch (const std::invalid_argument&) { rejected = true; }
+    catch (const ninfer::RequestError& error) {
+        rejected = error.kind() == ninfer::RequestErrorKind::MediaBudgetExceeded;
+    }
     expect(rejected, "oversized media fails before execution rather than becoming partial");
     // Independent all-or-none invariant across every materialized prefix/window.
     for (std::uint32_t mapped = 0; mapped < 30; ++mapped) {
@@ -195,6 +197,28 @@ void test_media_windows() {
 
 } // namespace
 
+void test_checkpoint_copy_on_write() {
+    r::RetrievalIndex live(128, 1, 1, 2);
+    (void)live.append(129);
+    live.write_block_mean(0, 0, std::array{1.0F, 0.0F});
+    auto saved = live;
+    live.write_block_mean(0, 0, std::array{-1.0F, 0.0F});
+    float saved_score = 0.0F, live_score = 0.0F;
+    const std::array query{1.0F, 0.0F};
+    const std::array counts{1U};
+    expect(saved.score(0, query, counts, saved_score) && saved_score > 0.99F &&
+               live.score(0, query, counts, live_score) && live_score < -0.99F,
+           "updating one lane does not mutate shared checkpoint block features");
+    live.truncate_to(64);
+    expect(saved.total_tokens() == 129 && saved.block(0).full && !live.block(0).full,
+           "truncate does not shrink a retained checkpoint");
+    live = saved;
+    (void)live.append(127);
+    live.write_block_mean(1, 0, query);
+    expect(saved.block_count() == 2 && !saved.block(1).full && live.block(1).full,
+           "restored partial retrieval block completes independently");
+}
+
 int main() {
     try {
         test_append_and_truncate();
@@ -202,6 +226,7 @@ int main() {
         test_selection();
         test_window_helpers();
         test_media_windows();
+        test_checkpoint_copy_on_write();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
         return 1;
