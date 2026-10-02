@@ -68,7 +68,9 @@ int main() {
         options.max_concurrency = 2;
         options.prefill_chunk = 256;
         options.kvmem_window_pages = 32;
-        options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
+        options.kv_cache = std::getenv("NINFER_TEST_FP8") != nullptr
+                               ? ninfer::KvCacheStorage::Fp8E4M3Row256
+                               : ninfer::KvCacheStorage::Int8Group64;
         options.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens = 7;
         options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
@@ -152,6 +154,25 @@ int main() {
                 "tool-tail replay lost its safe pre-query prefix");
         require(replay_cold.generated_token_ids == replay_warm.generated_token_ids,
                 "cached activation changed long tool-tail replay output");
+        // Reusing one long checkpoint and then publishing a longer checkpoint must
+        // account for borrowed pages evicted by the rolling prefill window. A saved
+        // admission claim can be smaller than the newly private pages at publication.
+        std::cerr << "phase growing cached conversation\n";
+        auto growing = prompt("Print READY.", true);
+        std::string continuation;
+        for (int i = 0; i < 320; ++i) { continuation += "alpha beta gamma delta "; }
+        growing.messages.push_back(message(ninfer::ChatRole::Assistant, std::move(continuation)));
+        growing.messages.push_back(message(ninfer::ChatRole::User, "Print EXTENDED."));
+        growing.context_cache.markers.push_back({.after_message_count = 6,
+            .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::DefaultAutomatic});
+        const auto growing_warm = engine.generate(engine.prepare(growing), request(true, 1));
+        require(growing_warm.reused_prompt_tokens > 2048,
+                "growing conversation did not reuse its Host-backed prefix");
+        const auto growing_cold = engine.generate(engine.prepare(growing), request(false, 1));
+        require(growing_warm.generated_token_ids == growing_cold.generated_token_ids,
+                "growing cached conversation changed the target prefill token");
+
         // Destroy a live cold-prefill owner while another lane remains in flight.
         std::cerr << "phase cancellation\n";
         auto survivor = engine.submit(engine.prepare(prompt("Print SURVIVE.")), request(false));

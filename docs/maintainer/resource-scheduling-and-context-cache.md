@@ -467,6 +467,14 @@ Host占用中只扣除有 claim 的 active地址所覆盖的 unique Host replica
 发布成 logical replica 时不获 credit。这个规划预算不改变 ResourceInventory 实际守恒或active Device
 entitlement。Finish/Discard/cancel/error归还claim；保留catalog时只留下实际checkpoint副本费用。
 
+KVMem 的滚动 Device placement 会把 borrowed shared 页换出、把 private 页换入，因此 admission
+时记录的 exclusive Device KV inventory 不能作为整个请求期间固定不变的账本。Active capture
+在发布 snapshot、转移 unique full pages 到 shared ownership 之前，从当前 owner 重新读取 Main/
+Backend KV claim，再执行 checked resource deduction；State/optional checkpoint 仍按原事务结算。
+这不降低真实 physical peak 或放宽减法检查。Persistent backfill 的完成保证使用 borrower 的完整
+future window budget（包含 prefill/speculative slack），不能以临时 borrowed residency 或某次
+capture 后较小的 exclusive inventory 抵扣未来峰值。
+
 ### 6.2 Terminal 与 capture
 
 TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，直到 Program 完成：
