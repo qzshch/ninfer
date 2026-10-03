@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
+#include "ninfer/ops/sampling.h"
 
 namespace ninfer::ops {
 
@@ -37,5 +38,24 @@ void dspark_markov_greedy(const Tensor& logits, const Tensor& w1, const Tensor& 
 
 [[nodiscard]] std::size_t dspark_markov_workspace_capacity_bytes(std::int32_t vocabulary,
                                                                  std::int32_t batch);
+
+// Sequential top-16 vanilla Markov sampling. ids I32 / unary FP32 [16,K,B]
+// are distinct public-vocabulary candidates chosen by the base head; hidden is
+// BF16 [H,K,B], H<=5120. W1/W2 are BF16 [256,V], anchors/positions I32 [B].
+// edge=BF16(BF16(unary)+BF16(FP32 dot(W1[prev],W2[candidate]))).
+// Positive temperature uses normalized softmax(edge/temperature) and the
+// counter key (seed,position+i,DSparkProposal). Other sampling fields are ignored;
+// zero temperature chooses the lowest token ID attaining max(edge), with one-hot q.
+// Every sampled token becomes the next predecessor. q FP32 [16,K,B] is exactly
+// the distribution used for the draw; drafts I32 [K,B]. Neither counts nor inputs
+// are modified. Target residual rejection must consume this same q.
+// Optional BF16 confidence weight [1,H+256] and bias [1] compute sigmoid of
+// FP32 dot(concat(hidden,W1[prev]),weight)+bias. confidence FP32 [K,B] is NaN
+// when the head is absent. K=1..7, B=1..8; all views contiguous, nonoverlapping.
+void dspark_markov_sample(const Tensor& ids, const Tensor& unary, const Tensor& hidden,
+                          const Tensor& w1, const Tensor& w2, const Tensor& anchors,
+                          const Tensor& positions, const SamplingConfig* configs,
+                          const Tensor& confidence_weight, const Tensor& confidence_bias,
+                          Tensor& drafts, Tensor& q, Tensor& confidence, cudaStream_t stream);
 
 } // namespace ninfer::ops

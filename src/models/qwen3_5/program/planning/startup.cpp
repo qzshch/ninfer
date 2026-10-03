@@ -732,8 +732,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                        : parameters.draft->output_head;
                 linear_scratch(layout, head, drafts * batch, drafts * batch);
                 if (draft->dspark) {
-                    scratch(layout, ops::dspark_markov_workspace_capacity_bytes(
-                                        dimension(config.vocab_size), batch));
+                    matrix(layout, DType::I32, 16, drafts * batch);
+                    matrix(layout, DType::FP32, 16, drafts * batch);
+                    scratch(layout, ops::linear_topk_workspace_capacity_bytes(
+                                        head.weight.qtype, head.weight.n, head.weight.k,
+                                        drafts * batch, drafts * batch));
                 }
                 return finish(layout);
             };
@@ -747,7 +750,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
                             GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
                 const std::size_t accept =
-                    draft->dflash2.has_value()
+                    (draft->dflash2.has_value() || draft->dspark)
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), {false},
                               drafts, drafts, batch, batch)
@@ -832,6 +835,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     default:
         throw std::invalid_argument("unknown kv_capacity policy");
     }
+    if (options.speculative.dspark_dynamic_k &&
+        (options.speculative.backend != SpeculativeBackend::DSpark || !parameters.draft ||
+         !parameters.draft->confidence)) {
+        throw std::invalid_argument("DSpark dynamic K requires a bound confidence head");
+    }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
@@ -890,6 +898,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk        = inputs.prefill_chunk;
     impl->kvmem_window_pages   = inputs.kvmem_window_pages;
     impl->draft_window         = inputs.draft_window;
+    impl->dspark_dynamic_k     = inputs.dspark_dynamic_k;
     impl->speculative_backend  = inputs.speculative_backend;
     impl->proposal_head        = inputs.proposal_head;
     impl->features             = inputs.features;
@@ -957,6 +966,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
         .kvmem_window_pages   = options.kvmem_window_pages,
         .draft_window         = options.speculative.draft_tokens,
+        .dspark_dynamic_k     = options.speculative.dspark_dynamic_k,
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,

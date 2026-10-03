@@ -120,6 +120,7 @@ struct DraftWeights {
     std::vector<DraftBlockWeights> layers;
     std::optional<SelectorWeights> selector;
     std::optional<std::pair<WeightId, WeightId>> markov;
+    std::optional<std::pair<WeightId, WeightId>> confidence;
     WeightId token_embedding, output_head;
     WeightUseId output_head_use;
 };

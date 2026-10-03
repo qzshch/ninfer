@@ -33,6 +33,9 @@ namespace ninfer::product {
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (options.dspark_dynamic_k && options.backend != SpeculativeBackend::DSpark) {
+        throw std::invalid_argument("--dspark-dynamic-k requires --spec dspark");
+    }
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {

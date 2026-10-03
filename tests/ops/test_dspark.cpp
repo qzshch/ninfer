@@ -267,6 +267,144 @@ void markov_case(int vocabulary, int steps, int batch, bool ties, bool graph) {
     std::cout << "Markov V=" << vocabulary << " K=" << steps << " B=" << batch << " ties=" << ties
               << " graph=" << graph << " passed\n";
 }
+
+unsigned long long mix(unsigned long long x) {
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+
+float draw(unsigned long long seed, int pos) {
+    auto key = mix(seed ^ (static_cast<unsigned long long>(pos) * 0xD1B54A32D192ED03ull));
+    key = mix(key ^ (static_cast<unsigned long long>(ops::kSamplePurposeDSparkProposal) << 21));
+    return float(key >> 40) / 16777216.f;
+}
+
+void sampled_markov_case(int steps, int batch, bool graph, bool head) {
+    const int vocabulary = 257, h = 5120;
+    auto w1 = data(256 * vocabulary), w2 = data(256 * vocabulary);
+    auto hidden = data(h * steps * batch), cw = data(h + 256);
+    std::vector<std::uint16_t> cb{bf(0.125f)};
+    std::vector<float> unary(16 * steps * batch);
+    std::vector<int> ids(unary.size()), anchors(batch), positions(batch), counts(vocabulary, 19);
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (int b = 0; b < batch; ++b) {
+        anchors[b]                  = 3 + b;
+        positions[b]                = 7913 + 5 * b;
+        configs[b].seed             = 937 + b;
+        configs[b].temperature      = b == 0 ? 0 : (b == 1 ? 1.f : 0.3f);
+        configs[b].presence_penalty = 9.f;
+        for (int k = 0; k < steps; ++k)
+            for (int c = 0; c < 16; ++c) {
+                const int at = c + 16 * (k + steps * b);
+                ids[at]      = (c * 13 + k * 3 + b) % vocabulary;
+                unary[at]    = (16 - c) * 0.13f + random_value();
+            }
+    }
+    Buffer dcounts(counts);
+    for (auto& cfg : configs) cfg.token_counts = static_cast<int*>(dcounts.p);
+    Buffer di(ids);
+    Buffer du(unary);
+    Buffer dh(hidden), d1(w1), d2(w2);
+    Buffer da(anchors), dp(positions);
+    Buffer dc(configs);
+    Buffer dw(cw), db(cb);
+    Buffer dd(std::vector<int>(steps * batch, -9));
+    Buffer dq(std::vector<float>(16 * steps * batch, -9)),
+        df(std::vector<float>(steps * batch, -9));
+    auto ti = di.tensor(DType::I32, {16, steps, batch}),
+         tu = du.tensor(DType::FP32, {16, steps, batch});
+    auto th = dh.tensor(DType::BF16, {h, steps, batch}),
+         t1 = d1.tensor(DType::BF16, {256, vocabulary}),
+         t2 = d2.tensor(DType::BF16, {256, vocabulary});
+    auto ta = da.tensor(DType::I32, {batch}), tp = dp.tensor(DType::I32, {batch}),
+         td = dd.tensor(DType::I32, {steps, batch});
+    auto tq = dq.tensor(DType::FP32, {16, steps, batch}),
+         tf = df.tensor(DType::FP32, {steps, batch});
+    auto tw = dw.tensor(DType::BF16, {h + 256}), tb = db.tensor(DType::BF16, {1});
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    auto run = [&] {
+        ops::dspark_markov_sample(ti, tu, th, t1, t2, ta, tp,
+                                  static_cast<const ops::SamplingConfig*>(dc.p),
+                                  head ? tw : Tensor{}, head ? tb : Tensor{}, td, tq, tf, stream);
+    };
+    if (graph) {
+        cudaGraph_t g;
+        cudaGraphExec_t e;
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        run();
+        CUDA_CHECK(cudaStreamEndCapture(stream, &g));
+        CUDA_CHECK(cudaGraphInstantiate(&e, g, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphLaunch(e, stream));
+        CUDA_CHECK(cudaGraphLaunch(e, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        cudaGraphExecDestroy(e);
+        cudaGraphDestroy(g);
+    } else {
+        run();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    const auto result = dd.read();
+    const auto q = dq.read(), conf = df.read();
+    for (int b = 0; b < batch; ++b) {
+        int prev = anchors[b];
+        for (int k = 0; k < steps; ++k) {
+            const int at = k + steps * b, row = 16 * at;
+            double edge[16], prob[16], sum = 0;
+            int best = 0;
+            for (int c = 0; c < 16; ++c) {
+                double bias = 0;
+                for (int r = 0; r < 256; ++r)
+                    bias += double(unbf(w1[r + 256 * prev])) * unbf(w2[r + 256 * ids[row + c]]);
+                edge[c] = unbf(bf(unbf(bf(unary[row + c])) + unbf(bf(float(bias)))));
+                if (edge[c] > edge[best] ||
+                    (edge[c] == edge[best] && ids[row + c] < ids[row + best]))
+                    best = c;
+            }
+            const double temp = configs[b].temperature;
+            for (int c = 0; c < 16; ++c) {
+                prob[c] = temp > 0 ? std::exp((edge[c] - edge[best]) / temp) : (c == best ? 1 : 0);
+                sum += prob[c];
+            }
+            double cumulative = 0, actual_sum = 0;
+            int expected = ids[row + best];
+            bool picked  = false;
+            for (int c = 0; c < 16; ++c) {
+                prob[c] /= sum;
+                actual_sum += q[row + c];
+                check(std::abs(q[row + c] - prob[c]) < 2e-5,
+                      "sampled q differs from FP64 represented oracle");
+                cumulative += prob[c];
+                if (!picked && draw(configs[b].seed, positions[b] + k) < cumulative) {
+                    expected = ids[row + c];
+                    picked   = true;
+                }
+            }
+            check(std::abs(actual_sum - 1) < 2e-6, "proposal q is not normalized");
+            check(result[at] == expected, "sequential sampled token / RNG mismatch");
+            if (head) {
+                double linear = unbf(cb[0]);
+                for (int i = 0; i < h; ++i)
+                    linear += double(unbf(hidden[i + h * at])) * unbf(cw[i]);
+                for (int r = 0; r < 256; ++r)
+                    linear += double(unbf(w1[r + 256 * prev])) * unbf(cw[h + r]);
+                check(std::abs(conf[at] - 1 / (1 + std::exp(-linear))) < 2e-6,
+                      "confidence differs from FP64 oracle");
+            } else
+                check(std::isnan(conf[at]), "absent confidence must be unavailable");
+            prev = result[at];
+        }
+    }
+    check(di.read() == ids && du.read() == unary && dh.read() == hidden && d1.read() == w1 &&
+              d2.read() == w2 && dcounts.read() == counts,
+          "sampled Markov mutated input or committed counts");
+    cudaStreamDestroy(stream);
+    std::cout << "sampled Markov K=" << steps << " B=" << batch << " graph=" << graph
+              << " head=" << head << " FP64 passed\n";
+}
+
 } // namespace
 
 int main() {
@@ -276,6 +414,9 @@ int main() {
         attention_case(8, 3, 2048, true);
         attention_case(8, 3, 2051, false);
         append_case();
+        sampled_markov_case(1, 1, false, false);
+        sampled_markov_case(7, 3, true, true);
+        sampled_markov_case(7, 8, false, true);
         markov_case(257, 7, 3, false, true);
         markov_case(257, 1, 1, true, false);
         markov_case(248320, 7, 3, false, false);

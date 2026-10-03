@@ -45,6 +45,11 @@ DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig
         out.markov =
             std::pair{b.direct(component + "/markov/predecessor", {target.vocab_size, 256}),
                       b.direct(component + "/markov/successor", {target.vocab_size, 256})};
+        if (config.dspark_confidence) {
+            out.confidence =
+                std::pair{b.direct(component + "/confidence/weight", {1, target.hidden_size + 256}),
+                          b.direct(component + "/confidence/bias", {1})};
+        }
     }
     return out;
 }

@@ -254,6 +254,9 @@ public:
                                               tensor(w.selector->successor_codebook)};
         }
         if (w.markov) { out.markov = std::pair{tensor(w.markov->first), tensor(w.markov->second)}; }
+        if (w.confidence) {
+            out.confidence = std::pair{tensor(w.confidence->first), tensor(w.confidence->second)};
+        }
         return out;
     }
 

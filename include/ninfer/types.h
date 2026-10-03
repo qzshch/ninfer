@@ -85,6 +85,8 @@ struct SpeculativeOptions {
     // Startup-fixed K: MTP 1..5; DFlash/DFlash2 1..15; DSpark 1..7 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // DSpark verifies a per-lane confidence-selected prefix of the fixed draft block.
+    bool dspark_dynamic_k = false;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -756,6 +758,9 @@ struct SpeculativeStats {
     std::vector<std::uint64_t> attempted_per_position;
     std::vector<std::uint64_t> reached_per_position;
     std::vector<std::uint64_t> rejected_per_position;
+    // DSpark confidence calibration over positions actually reached by verification.
+    std::vector<double> confidence_sum_on_reached;
+    std::vector<std::uint64_t> confidence_samples_on_reached;
     std::uint64_t zero_accept_rounds    = 0;
     std::uint64_t partial_accept_rounds = 0;
     std::uint64_t full_accept_rounds    = 0;

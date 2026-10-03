@@ -889,6 +889,11 @@ class _Builder:
                         (2 * taps * groups, h),
                         inputs=(p + branch + "_input",),
                     )
+        if backend == "dspark" and config["dspark_config"].get("confidence_head", False):
+            self.add(backend + "/confidence/weight", store,
+                     "confidence_head.proj.weight", (1, target["hidden_size"] + 256))
+            self.add(backend + "/confidence/bias", store,
+                     "confidence_head.proj.bias", (1,))
         if backend == "dspark":
             for role, field in (("predecessor", "markov_w1"), ("successor", "markov_w2")):
                 self.add(backend + "/markov/" + role, store,

@@ -121,6 +121,7 @@ struct DraftParameters {
     std::vector<DraftBlockParameters> layers;
     std::optional<SelectorParameters> selector;
     std::optional<std::pair<Tensor, Tensor>> markov;
+    std::optional<std::pair<Tensor, Tensor>> confidence;
     LinearParameters output_head;
 };
 

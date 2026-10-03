@@ -45,6 +45,8 @@ struct GenerationMetrics {
     std::vector<std::uint64_t> speculative_attempted_per_position;
     std::vector<std::uint64_t> speculative_reached_per_position;
     std::vector<std::uint64_t> speculative_rejected_per_position;
+    std::vector<double> speculative_confidence_sum_on_reached;
+    std::vector<std::uint64_t> speculative_confidence_samples_on_reached;
     std::uint64_t speculative_zero_accept_rounds = 0;
     std::uint64_t speculative_partial_accept_rounds = 0;
     std::uint64_t speculative_full_accept_rounds = 0;

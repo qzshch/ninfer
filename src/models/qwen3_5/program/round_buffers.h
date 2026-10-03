@@ -98,6 +98,7 @@ struct DFlashDecodeIngress {
 };
 
 struct DFlashDecodeEgress {
+    std::array<float, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> confidence{};
     std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
@@ -291,6 +292,7 @@ struct DFlashDecodeState {
     Tensor verify_positions;
     Tensor candidate_ids;
     Tensor proposal_q;
+    Tensor confidence;
     Tensor append_positions;
     Tensor append_counts;
     Tensor draft_tokens;

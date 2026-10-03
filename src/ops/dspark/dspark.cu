@@ -1,6 +1,7 @@
 #include "ninfer/ops/dspark.h"
 #include "core/device.h"
 #include "core/layout.h"
+#include "ops/kernel/sampling_device.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -8,6 +9,7 @@
 #include <climits>
 #include <stdexcept>
 #include <string>
+#include <iterator>
 
 namespace ninfer::ops {
 namespace {
@@ -238,5 +240,139 @@ void dspark_markov_greedy(const Tensor& logits, const Tensor& w1, const Tensor& 
                                         static_cast<int*>(drafts.data));
         CUDA_CHECK(cudaGetLastError());
     }
+}
+} // namespace ninfer::ops
+
+namespace ninfer::ops {
+namespace {
+__global__ void markov_sample_kernel(const int* ids, const float* unary, const Bf16* hidden,
+                                     const Bf16* w1, const Bf16* w2, const int* anchors,
+                                     const int* positions, const SamplingConfig* configs,
+                                     const Bf16* cw, const Bf16* cb, int hidden_size, int steps,
+                                     int* drafts, float* q, float* confidence) {
+    const int b = blockIdx.x, tid = threadIdx.x, rank = tid / 16, part = tid % 16;
+    __shared__ float predecessor[256], edges[16], probs[16], reduce[256];
+    __shared__ int prev;
+    if (tid == 0) prev = anchors[b];
+    __syncthreads();
+    for (int step = 0; step < steps; ++step) {
+        const int at = step + steps * b, row = 16 * at;
+        predecessor[tid] = __bfloat162float(w1[tid + 256 * prev]);
+        __syncthreads();
+        float bias      = 0;
+        const int token = ids[row + rank];
+        for (int r = part; r < 256; r += 16)
+            bias += predecessor[r] * __bfloat162float(w2[r + 256 * token]);
+        for (int shift = 8; shift; shift >>= 1)
+            bias += __shfl_down_sync(0xffffffff, bias, shift, 16);
+        if (part == 0) {
+            // Match the represented BF16 Markov and logit addition boundaries.
+            edges[rank] = __bfloat162float(
+                __float2bfloat16(__bfloat162float(__float2bfloat16(unary[row + rank])) +
+                                 __bfloat162float(__float2bfloat16(bias))));
+        }
+        float value = 0;
+        if (cw) {
+            for (int h = tid; h < hidden_size; h += 256)
+                value += __bfloat162float(hidden[h + hidden_size * at]) * __bfloat162float(cw[h]);
+            value += predecessor[tid] * __bfloat162float(cw[hidden_size + tid]);
+        }
+        reduce[tid] = value;
+        __syncthreads();
+        for (int stride = 128; stride; stride >>= 1) {
+            if (tid < stride) reduce[tid] += reduce[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            confidence[at] = cw ? 1.f / (1.f + expf(-(reduce[0] + __bfloat162float(cb[0])))) : NAN;
+            int best       = 0;
+            for (int c = 1; c < 16; ++c)
+                if (better(edges[c], ids[row + c], edges[best], ids[row + best])) best = c;
+            const float temp = configs[b].temperature;
+            float sum        = 0;
+            for (int c = 0; c < 16; ++c) {
+                probs[c] =
+                    temp > 0 ? expf((edges[c] - edges[best]) / temp) : (c == best ? 1.f : 0.f);
+                sum += probs[c];
+            }
+            const float u    = sampling_uniform(configs[b].seed, positions[b] + step,
+                                                kSamplePurposeDSparkProposal, 0);
+            float cumulative = 0;
+            int picked       = best;
+            bool selected    = false;
+            for (int c = 0; c < 16; ++c) {
+                q[row + c] = probs[c] / sum;
+                cumulative += q[row + c];
+                if (!selected && u < cumulative) {
+                    picked   = c;
+                    selected = true;
+                }
+            }
+            drafts[at] = ids[row + picked];
+            prev       = drafts[at];
+        }
+        __syncthreads();
+    }
+}
+} // namespace
+
+void dspark_markov_sample(const Tensor& ids, const Tensor& unary, const Tensor& hidden,
+                          const Tensor& w1, const Tensor& w2, const Tensor& anchors,
+                          const Tensor& positions, const SamplingConfig* configs,
+                          const Tensor& confidence_weight, const Tensor& confidence_bias,
+                          Tensor& drafts, Tensor& q, Tensor& confidence, cudaStream_t stream) {
+    const int steps = ids.ne[1], batch = ids.ne[2], vocabulary = w1.ne[1], h = hidden.ne[0];
+    if (!configs || steps < 1 || steps > 7 || batch < 1 || batch > 8 || vocabulary < 16 || h < 1 ||
+        h > 5120 || bool(confidence_weight.data) != bool(confidence_bias.data))
+        throw std::invalid_argument("dspark: invalid sampled Markov profile");
+    require(ids, DType::I32, 16, steps, batch, 1, "candidate ids");
+    require(unary, DType::FP32, 16, steps, batch, 1, "unary scores");
+    require(hidden, DType::BF16, h, steps, batch, 1, "hidden");
+    require(w1, DType::BF16, 256, vocabulary, 1, 1, "predecessor");
+    require(w2, DType::BF16, 256, vocabulary, 1, 1, "successor");
+    require(anchors, DType::I32, batch, 1, 1, 1, "anchors");
+    require(positions, DType::I32, batch, 1, 1, 1, "positions");
+    require(drafts, DType::I32, steps, batch, 1, 1, "sampled drafts");
+    require(q, DType::FP32, 16, steps, batch, 1, "proposal q");
+    require(confidence, DType::FP32, steps, batch, 1, 1, "confidence");
+    if (confidence_weight.data) {
+        require(confidence_weight, DType::BF16, h + 256, 1, 1, 1, "confidence weight");
+        require(confidence_bias, DType::BF16, 1, 1, 1, 1, "confidence bias");
+    }
+    const Tensor* views[] = {&ids,
+                             &unary,
+                             &hidden,
+                             &w1,
+                             &w2,
+                             &anchors,
+                             &positions,
+                             &confidence_weight,
+                             &confidence_bias,
+                             &drafts,
+                             &q,
+                             &confidence};
+    for (std::size_t i = 0; i < std::size(views); ++i) {
+        if (!views[i]->data) continue;
+        const auto begin = reinterpret_cast<std::uintptr_t>(views[i]->data);
+        const auto end   = begin + views[i]->bytes();
+        for (std::size_t j = i + 1; j < std::size(views); ++j) {
+            if (!views[j]->data) continue;
+            const auto other = reinterpret_cast<std::uintptr_t>(views[j]->data);
+            if (begin < other + views[j]->bytes() && other < end)
+                throw std::invalid_argument("dspark: sampled Markov views overlap");
+        }
+        const auto config_begin = reinterpret_cast<std::uintptr_t>(configs);
+        if (begin < config_begin + batch * sizeof(SamplingConfig) && config_begin < end)
+            throw std::invalid_argument("dspark: sampled Markov config overlaps a view");
+    }
+    markov_sample_kernel<<<batch, 256, 0, stream>>>(
+        static_cast<const int*>(ids.data), static_cast<const float*>(unary.data),
+        static_cast<const Bf16*>(hidden.data), static_cast<const Bf16*>(w1.data),
+        static_cast<const Bf16*>(w2.data), static_cast<const int*>(anchors.data),
+        static_cast<const int*>(positions.data), configs,
+        static_cast<const Bf16*>(confidence_weight.data),
+        static_cast<const Bf16*>(confidence_bias.data), h, steps, static_cast<int*>(drafts.data),
+        static_cast<float*>(q.data), static_cast<float*>(confidence.data));
+    CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops

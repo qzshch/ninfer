@@ -287,7 +287,8 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2, boo
         require_members(extra,
                         {"markov_rank", "markov_head_type", "sample_from_anchor", "block_size",
                          "sliding_window_non_causal"},
-                        {}, "DSpark config");
+                        {"confidence_head"}, "DSpark config");
+        out.dspark_confidence = extra.value("confidence_head", false);
         if (extra.at("markov_rank") != 256 || extra.at("markov_head_type") != "vanilla" ||
             extra.at("sample_from_anchor") != true || extra.at("block_size") != 8 ||
             extra.at("sliding_window_non_causal") != false || out.attention.head_dim != 256 ||

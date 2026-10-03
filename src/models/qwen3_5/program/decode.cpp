@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/speculative/adaptive_draft_window.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/graph_execution.h"
@@ -11,6 +12,7 @@
 #include "ninfer/ops/scatter.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -140,6 +142,8 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
     request.sampling_host     = config;
+    // The physical lane outlives a request; confidence is never prefix state.
+    request.dspark_next_extent = 0;
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -148,6 +152,8 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .attempted_per_position = std::vector<std::uint64_t>(draft_window, 0),
         .reached_per_position = std::vector<std::uint64_t>(draft_window, 0),
         .rejected_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .confidence_sum_on_reached     = std::vector<double>(draft_window, 0),
+        .confidence_samples_on_reached = std::vector<std::uint64_t>(draft_window, 0),
     };
     request.speculative_stats.diagnostic_max_rounds = dflash_diagnostic_max_rounds;
     request.speculative_stats.diagnostic_every = dflash_diagnostic_every;
@@ -634,8 +640,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
-        const std::uint32_t extent =
-            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
+        const std::uint32_t extent        = std::min(
+            {dspark_dynamic_k && request.dspark_next_extent != 0 ? request.dspark_next_extent
+                                                                        : draft_window,
+             max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
@@ -669,8 +677,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
-            const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+            const std::uint32_t extent        = std::min(
+                {dspark_dynamic_k && request.dspark_next_extent != 0 ? request.dspark_next_extent
+                                                                            : draft_window,
+                 max_by_budget, capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -765,6 +775,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     capacity) {
                 throw std::runtime_error("DFlash batch returned invalid row metadata");
             }
+            if (dspark_dynamic_k) {
+                request.dspark_next_extent = confidence_draft_window(std::span<const float>(
+                    dflash_host_egress->confidence.data() + row * draft_window, draft_window));
+            }
             const std::span<const TokenId> row_tokens(dflash_host_egress->licensed_tokens.data() +
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
@@ -775,6 +789,18 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             }
             record_speculative_verification(request.speculative_stats, extent,
                                               static_cast<std::uint32_t>(accepted_i));
+            if (speculative_backend == SpeculativeBackend::DSpark && parameters.draft->confidence) {
+                for (std::uint32_t position = 0;
+                     position < extent && position <= static_cast<std::uint32_t>(accepted_i);
+                     ++position) {
+                    const float p = dflash_host_egress->confidence[row * draft_window + position];
+                    if (!std::isfinite(p) || p < 0 || p > 1) {
+                        throw std::runtime_error("DSpark confidence is not a valid probability");
+                    }
+                    request.speculative_stats.confidence_sum_on_reached[position] += p;
+                    ++request.speculative_stats.confidence_samples_on_reached[position];
+                }
+            }
             if (dflash_diagnostic_max_rounds != 0 && dflash_diagnostic_host_mask[row] != 0) {
                 auto& stats = request.speculative_stats;
                 const auto first = dflash_diagnostic_host_packets[row * 2];

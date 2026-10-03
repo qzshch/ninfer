@@ -41,3 +41,10 @@ def test_reject_unqualified_math_or_tap_domains(field,value):
 def test_reject_other_geometries(field,value):
     raw,target=configs();raw["transformer_layer_config"][field]=value
     with pytest.raises(ValueError):dspark_config(raw,target)
+
+def test_confidence_requires_the_official_markov_input():
+    raw,target=configs()
+    raw.update(enable_confidence_head=True, confidence_head_with_markov=True)
+    assert dspark_config(raw,target)["dspark_config"]["confidence_head"] is True
+    raw["confidence_head_with_markov"]=False
+    with pytest.raises(ValueError,match="predecessor embedding"):dspark_config(raw,target)

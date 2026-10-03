@@ -432,6 +432,7 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+    std::uint32_t dspark_next_extent = 0;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
@@ -611,6 +612,7 @@ public:
     const std::uint32_t kvmem_window_pages;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
+    const bool dspark_dynamic_k;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
     const bool vision_enabled;

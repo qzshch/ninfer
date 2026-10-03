@@ -34,4 +34,7 @@ def dspark_config(raw, target):
     result['architectures'] = ['DSparkDraftModel']
     result['dspark_config'] = {k: raw[k] for k in ('markov_rank', 'markov_head_type',
         'sample_from_anchor', 'block_size', 'sliding_window_non_causal')}
+    result['dspark_config']['confidence_head'] = bool(raw.get('enable_confidence_head', False))
+    if result['dspark_config']['confidence_head'] and not raw.get('confidence_head_with_markov'):
+        raise ValueError('dspark: confidence head must include predecessor embedding')
     return result

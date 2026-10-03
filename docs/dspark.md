@@ -1,9 +1,10 @@
 # Experimental DSpark backend
 
-This initial DSpark route uses deterministic greedy draft tokens (point-mass proposals),
-including when the target sampler has nonzero temperature. Target verification still
-uses that requested sampler. Stochastic Markov proposal distributions are a separate
-optimization and are not implemented here.
+DSpark draws sequential Markov proposals from the base head's top sixteen
+candidates. Positive temperature uses their normalized proposal distribution q;
+zero temperature uses a one-hot proposal. Target verification uses the requested
+target sampler, accepts with min(1,p/q), and samples max(p-q,0) at the first
+rejection. Target penalties and filters remain part of p.
 
 DSpark uses the existing public Engine, Text/Vision preparation, sparse KVMem,
 prefix state, batched verification and result publication. Select it explicitly:
@@ -12,14 +13,21 @@ prefix state, batched verification and result publication. Select it explicitly:
 ninfer-serve model-with-dspark.ninfer --spec dspark --draft-tokens 7
 ```
 
-K is 1..7. Do not add `--lm-head-draft`: this implementation evaluates the full
-public vocabulary before applying the Markov head. The supported geometry is
+The maximum K is 1..7. Do not add `--lm-head-draft`: candidate selection uses
+the target's full head. The supported geometry is
 H5120, five local layers, D256/Q20/KV4, a 2048-token draft context and rank256
 vanilla Markov weights, as in
 [the RedHat Qwen3.8-27B drafter](https://huggingface.co/RedHatAI/Qwen3.8-27B-speculator.dspark).
-Its source block size is eight; fixed K7 is the initially tested route. Adaptive
-confidence-based verification is not implemented and confidence weights are not
-loaded. Other drafter geometries, vocabulary remapping, non-causal sliding
+Its source block size is eight. `--dspark-dynamic-k` requires an artifact with the
+official confidence weight and bias. Each lane uses the preceding round's
+confidence survival probabilities to select a contiguous verification prefix
+with survival at least 0.25, clamped to 1..maximum K. The output budget can
+further shorten it. This is a bounded confidence policy, not an online cost
+optimizer; calibration against actual reached-position acceptance is necessary.
+The proposal block, CUDA Graph width, projection work and maximum resource
+reservation remain fixed. Target attention/GDN consume the per-lane valid lengths;
+this does not promise proportional savings in the whole target pass.
+Other drafter geometries, vocabulary remapping, non-causal sliding
 windows and indexed proposal heads fail explicitly.
 
 The eight source auxiliary IDs include the embedding state at index zero. They
@@ -29,7 +37,7 @@ query slots. The existing local draft cache stores BF16 keys and FP16 values.
 Anchor output row zero predicts the first new draft token. Each
 Markov step conditions on the anchor or the previously selected token, with the
 checkpoint's BF16 dot-result and logit-addition boundaries. CUDA tests compare
-attention against an independent FP64 softmax and Markov IDs against FP64 dots
+attention against an independent FP64 softmax and Markov distributions/IDs against FP64 dots
 with explicit BF16 casts, including ring wrap, ragged/permuted lanes, tie breaks,
 full vocabulary and Graph replay. The added Q8 projection shapes have separate
 FP64 reference and launch-boundary tests.
@@ -42,7 +50,7 @@ python -m tools.convert.attach_dspark --base target.ninfer --draft checkpoint/ \
   --draft-out scratch/dspark-q8.ninfer --out target-with-dspark.ninfer
 ```
 
-The tool quantizes draft projections to Q8, retains direct BF16 norms/Markov
+The tool quantizes draft projections to Q8, retains direct BF16 norms/Markov/confidence
 weights, checks target config and frontend resources, copies encoded target
 objects unchanged, and verifies every output object by SHA256. The output and
 draft paths must not already exist. WSL mapped SMB drives that lack hardlinks
@@ -59,3 +67,9 @@ paths can differ, so do not infer bitwise output identity or general quality
 acceptance from an artifact join or a few successful prompts. Measure net committed
 output per wall second, per-position acceptance, proposal cost, zero/full-accept
 rounds, context length, KV transfer and memory headroom for the actual workload.
+
+JSONL includes `confidence_sum_on_reached` and `confidence_samples_on_reached`.
+Divide their matching entries to compare predicted conditional acceptance with
+`accepted_per_position / reached_per_position`. Unreached positions do not count
+as rejections. The verification-length histogram can be derived from consecutive
+differences in `attempted_per_position`; zero-draft rounds are `fallback_steps`.

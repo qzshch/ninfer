@@ -460,6 +460,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::move(result.speculative.reached_per_position);
     outcome.metrics.speculative_rejected_per_position =
         std::move(result.speculative.rejected_per_position);
+    outcome.metrics.speculative_confidence_sum_on_reached =
+        std::move(result.speculative.confidence_sum_on_reached);
+    outcome.metrics.speculative_confidence_samples_on_reached =
+        std::move(result.speculative.confidence_samples_on_reached);
     outcome.metrics.speculative_zero_accept_rounds = result.speculative.zero_accept_rounds;
     outcome.metrics.speculative_partial_accept_rounds = result.speculative.partial_accept_rounds;
     outcome.metrics.speculative_full_accept_rounds = result.speculative.full_accept_rounds;

@@ -116,7 +116,7 @@ def attach(args):
         torch.set_num_threads(4)
         convert(model, recipe, args.draft_out, device='cpu', rows_per_chunk=128,
                 provenance={'source': str(args.draft), 'source_config': deepcopy(source.config),
-                            'policy': 'fixed K<=7; confidence adaptation disabled; Q8 drafter'},
+                            'policy': 'maximum K<=7; optional confidence head; Q8 drafter'},
                 progress=lambda i, n, job: print(f'draft {i+1}/{n}: {job.spec.id}', flush=True))
         with Artifact(args.draft_out) as donor:
             specs, components, bindings, uses, copies = compose_plan(base, donor)

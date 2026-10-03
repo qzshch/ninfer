@@ -575,17 +575,32 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
             Tensor logits = state.execution.work.alloc(
                 DType::BF16,
                 {dimension(target.vocab_size), static_cast<std::int32_t>(k) * batch_size});
-            project(proposal_hidden, state.execution.parameters.draft->output_head, logits,
-                    state.execution.work, state.execution.device.stream);
             if (config.dspark) {
                 const auto& markov = state.execution.parameters.draft->markov.value();
-                auto logits_batch  = logits.view(
-                    {dimension(target.vocab_size), static_cast<std::int32_t>(k), batch_size});
-                ops::dspark_markov_greedy(
-                    logits_batch, markov.first, markov.second, anchors,
+                auto candidates    = frame.candidate_ids.slice(2, 0, batch_size);
+                auto flat_ids = candidates.view({16, static_cast<std::int32_t>(k) * batch_size});
+                auto scores   = state.execution.work.alloc(
+                    DType::FP32, {16, static_cast<std::int32_t>(k) * batch_size});
+                const auto& head = state.execution.parameters.draft->output_head;
+                ops::linear_topk(
+                    proposal_hidden, head.weight,
                     dimension(state.execution.parameters.model.resources().public_token_count),
-                    state.execution.work, drafts, state.execution.device.stream);
+                    flat_ids, scores, state.execution.work, state.execution.device.stream);
+                auto q                      = frame.proposal_q.slice(2, 0, batch_size);
+                auto confidence             = frame.confidence.slice(1, 0, batch_size);
+                const auto& confidence_head = state.execution.parameters.draft->confidence;
+                ops::dspark_markov_sample(
+                    candidates, scores.view({16, static_cast<std::int32_t>(k), batch_size}),
+                    proposal_hidden.view(
+                        {dimension(target.hidden_size), static_cast<std::int32_t>(k), batch_size}),
+                    markov.first, markov.second, anchors,
+                    frame.execution_frontiers.slice(0, 0, batch_size), frame.sampling,
+                    confidence_head ? confidence_head->first : Tensor{},
+                    confidence_head ? confidence_head->second : Tensor{}, drafts, q, confidence,
+                    state.execution.device.stream);
             } else {
+            project(proposal_hidden, state.execution.parameters.draft->output_head, logits,
+                    state.execution.work, state.execution.device.stream);
                 ops::argmax(
                     logits, flat_drafts,
                     dimension(state.execution.parameters.model.resources().public_token_count),
