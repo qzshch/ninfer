@@ -788,10 +788,11 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     }
 }
 
-runtime::PrefillStepResult
-ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
+runtime::PrefillStepResult ProgramImpl::advance_prefill_raw(std::uint32_t lane,
+                                                            runtime::ExecutionTiming* failed_timing,
+                                                            std::uint32_t token_budget) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    return advance_prefill(active_sequence(lane), requests[lane], failed_timing, token_budget);
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
@@ -1060,7 +1061,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
-                                                        runtime::ExecutionTiming* failed_timing) {
+                                                        runtime::ExecutionTiming* failed_timing,
+                                                        std::uint32_t token_budget) {
     auto& sparse = kvmem_lanes_.at(sequence.lane);
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
@@ -1163,7 +1165,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         if (staged.query_replay_cursor) {
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
-            const auto final_chunk_tokens = advance_kvmem_query_replay(sequence, staged, timing);
+            const auto final_chunk_tokens =
+                advance_kvmem_query_replay(sequence, staged, timing, token_budget);
             if (*staged.query_replay_cursor < staged.prompt_tokens) {
                 timing.begin_wait();
                 device.synchronize();
@@ -1180,7 +1183,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                     1, static_cast<std::int32_t>(final_chunk_tokens) - 1, 1));
         } else if (staged.cursor < staged.prompt_tokens) {
             const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+                std::min({prefill_chunk, token_budget == 0 ? prefill_chunk : token_budget,
+                          staged.prompt_tokens - staged.cursor});
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
@@ -1543,7 +1547,8 @@ void ProgramImpl::copy_kvmem_query_state(SequenceState& sequence, bool restore) 
 
 std::uint32_t ProgramImpl::advance_kvmem_query_replay(SequenceState& sequence,
                                                      RequestControl::Prefill& staged,
-                                                     runtime::ExecutionTimingRecorder& timing) {
+                                                      runtime::ExecutionTimingRecorder& timing,
+                                                      std::uint32_t token_budget) {
     auto& sparse = kvmem_lanes_.at(sequence.lane);
     if (!sparse.query_checkpoint_valid || !staged.query_replay_cursor ||
         staged.next_capture != staged.capture_groups.size()) {
@@ -1605,8 +1610,11 @@ std::uint32_t ProgramImpl::advance_kvmem_query_replay(SequenceState& sequence,
             sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0,
             dflash_prefill_host_ingress};
         if (dflash) { mark_workspace_usage(workspace_plan.dflash_context); }
-        const auto count = std::min(prefill_chunk, staged.prompt_tokens - cursor);
-        const auto split = std::upper_bound(staged.prompt.identity.rewrite_execution_frontiers.begin(),
+        const auto count =
+            std::min({prefill_chunk, token_budget == 0 ? prefill_chunk : token_budget,
+                      staged.prompt_tokens - cursor});
+        const auto split =
+            std::upper_bound(staged.prompt.identity.rewrite_execution_frontiers.begin(),
                                             staged.prompt.identity.rewrite_execution_frontiers.end(), cursor);
         const auto frontier = split == staged.prompt.identity.rewrite_execution_frontiers.end()
                                   ? std::optional<std::uint32_t>{} : std::optional<std::uint32_t>{*split};

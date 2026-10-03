@@ -34,6 +34,9 @@ struct ServeOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Zero preserves serialized cold prefill. Positive: shared token budget,
+    // fair cold/replay owners, at most one configured chunk per execution unit.
+    std::uint32_t prefill_token_budget = 0;
     // Sparse KV working-set window in 64-token pages; 0 keeps dense semantics.
     std::uint32_t kvmem_window_pages   = 0;
     std::filesystem::path context_cost_presets;

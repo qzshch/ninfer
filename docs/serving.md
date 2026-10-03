@@ -1190,3 +1190,39 @@ Prompt-token usage includes chat-template and expanded media tokens. Generated-t
 from accepted output token IDs, including a stop token whose decoded text may be withheld.
 
 For the experimental full-head DSpark route, see [DSpark](dspark.md).
+
+### Bounded fair prefill
+
+`--prefill-token-budget N` enables multiple ordinary cold-prefill owners as well
+as replay owners. All owners share N tokens of work between decode rounds; each
+unit is additionally capped by `--prefill-chunk`. Owners rotate at completed GPU
+unit boundaries. The decoder replenishes the shared budget, and oversized atomic
+media groups carry budget debt rather than being split. With no decode-ready
+request, cold work continues at bounded unit boundaries. Zero retains the legacy
+serialized cold-prefill policy. The flag changes scheduling and latency tradeoffs;
+it is not a promise of higher aggregate throughput.
+
+Admission accounts for the smallest possible one-token grant when this policy is
+enabled, including replay and capture boundaries. Physical workspace and latency
+estimates still use the configured chunk; the service upper bound does not
+allocate more KV memory.
+
+NVFP4 projections retain their existing fused A4/TMA paths, including partial
+token tiles. Each sequence retains its own GDN state, KV, RoPE and media groups;
+this option does not combine different requests into one transformer sequence.
+Sparse KVMem admission supports up to four lanes with shared immutable Host history
+and bounded resource proofs. Four full 256K lanes are not implied to fit a given
+machine: Device windows and future Host reservations must pass admission checks.
+
+The opt-in `tests/e2e/kvmem_suite.py --profile fair-prefill` regression requires
+a positive `--prefill-token-budget`, two to four lanes and sparse trace. It compares
+isolated and batched old-history recall, switches full membership to one lane and
+back, cancels one request while survivors remain active, then reuses the slot.
+For example, pass `--concurrency 3 --window 576 --context 262144 --chunk 1024
+--prefill-token-budget 1024 --dtype fp8 --spec dflash2` together with explicit
+binary, model and output paths. `--profile cache-lifecycle` separately compares
+warm/growing/forked histories against same-input cold controls. Keep these
+correctness traces enabled; use `--no-trace` for matched performance measurements.
+Cache hits depend on retained resource availability; admission may validly evict
+checkpoints under pressure. A missing required warm hit fails the cache gate and
+must not be relabelled as successful prefix reuse.

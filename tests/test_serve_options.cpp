@@ -389,6 +389,18 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    const auto adaptive =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "7",
+               "--dspark-dynamic-k", "--prefill-token-budget", "1024"});
+    failures +=
+        check(adaptive.speculative.dspark_dynamic_k && adaptive.prefill_token_budget == 1024,
+              "adaptive DSpark / global prefill options did not reach Engine configuration");
+    bool adaptive_wrong_backend = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+                     "--dspark-dynamic-k"});
+    } catch (const std::invalid_argument&) { adaptive_wrong_backend = true; }
+    failures += check(adaptive_wrong_backend, "DSpark dynamic K was accepted for another backend");
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

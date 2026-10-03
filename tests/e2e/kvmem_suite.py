@@ -83,8 +83,8 @@ def validate_answer(result, expected):
 
 
 def validate_lane_trace(text, backend, lanes):
-    if lanes not in (2, 3):
-        raise ValueError("parallel sparse trace requires two or three lanes")
+    if lanes not in (2, 3, 4):
+        raise ValueError("parallel sparse trace requires two to four lanes")
     batches = re.findall(rf"KVMEM decode backend={re.escape(backend)} lanes={lanes}\b", text)
     retrieved = {int(lane) for scored, promoted, lane in re.findall(
         r"KVMEM retrieval scored=(\d+) selected=\d+ promoted=(\d+) demoted=\d+ lane=(\d+)", text)
@@ -219,6 +219,10 @@ class Suite:
             command += ['--vision']
         if getattr(self.args, 'no_context_retention', False):
             command += ['--no-context-retention']
+        if getattr(self.args, 'prefill_token_budget', 0):
+            command += ['--prefill-token-budget', str(self.args.prefill_token_budget)]
+        if getattr(self.args, 'dspark_dynamic_k', False):
+            command += ['--dspark-dynamic-k']
         return command
 
     def start(self):
@@ -230,8 +234,13 @@ class Suite:
             binary_sha256 = hashlib.file_digest(binary, "sha256").hexdigest()
         model_stat = self.args.model.stat()
         self.log_file = self.log.open("w", encoding="utf-8")
+        environment = dict(os.environ)
+        if getattr(self.args, 'trace', True):
+            environment['NINFER_KVMEM_TRACE'] = '1'
+        else:
+            environment.pop('NINFER_KVMEM_TRACE', None)
         self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT,
-                                     start_new_session=True, env={**os.environ, "NINFER_KVMEM_TRACE": "1"})
+                                     start_new_session=True, env=environment)
         self.host_monitor = threading.Thread(target=self.monitor_host_memory, daemon=True)
         self.host_monitor.start()
         self.monitor_file = (self.args.output / "gpu.csv").open("w", encoding="utf-8")
@@ -309,7 +318,7 @@ class Suite:
         # with different queries next round to expose stale lane-local retrieval.
         lanes = self.args.concurrency
         markers = [f"{color}-{round_index}-{code}" for color, code in
-                   [("AMBER", 7193), ("COBALT", 8426), ("EMERALD", 5638)][:lanes]]
+                   [("AMBER", 7193), ("COBALT", 8426), ("EMERALD", 5638), ("VIOLET", 9217)][:lanes]]
         prompts = [self.lane_messages(marker, i * 512) for i, marker in enumerate(markers)]
         baseline = [self.request(prompt, tokens=512, stream=True) for prompt in prompts]
         begin = self.log.stat().st_size
@@ -655,6 +664,12 @@ class Suite:
             self.case("cancel-one-lane-and-reuse", self.cancel_one_lane)
             self.case("final-health", self.health)
             return
+        if self.args.profile == 'fair-prefill':
+            from fair_prefill import run_fair_prefill
+            self.case('fair-cold-prefill-lane-lifecycle', lambda: run_fair_prefill(self))
+            self.case('cancel-one-lane-and-reuse', self.cancel_one_lane)
+            self.case('final-health', self.health)
+            return
         if self.args.profile == "replay-budget":
             self.case("query-replay-service-budget", self.replay_service_budget)
             self.case("generation-after-replay-budget", self.health)
@@ -709,8 +724,13 @@ def main():
     p.add_argument("--host-mib", type=int, default=12288)
     p.add_argument("--dtype", choices=["bf16", "int8", "fp8", "nvfp4", "k8v4"], default="int8")
     p.add_argument("--spec", choices=["none", "mtp", "dflash2", "dspark"], default="mtp")
-    p.add_argument("--concurrency", type=int, choices=[1, 2, 3], default=1)
-    p.add_argument("--profile", choices=["smoke", "regression", "long", "capacity", "penalty", "replay-cancel", "replay-budget", "concurrency", "cache-lifecycle"], default="regression")
+    p.add_argument("--concurrency", type=int, choices=[1, 2, 3, 4], default=1)
+    p.add_argument('--prefill-token-budget', type=int, default=0)
+    p.add_argument('--dspark-dynamic-k', action='store_true')
+    p.add_argument('--no-trace', dest='trace', action='store_false', default=True,
+                   help='Disable verbose sparse tracing for matched throughput measurements')
+    p.add_argument('--vision', action='store_true')
+    p.add_argument("--profile", choices=["smoke", "regression", "long", "capacity", "penalty", "replay-cancel", "replay-budget", "concurrency", "cache-lifecycle", "fair-prefill"], default="regression")
     p.add_argument("--seed", type=int, default=20261003)
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--startup-timeout", type=float, default=600)
@@ -720,7 +740,15 @@ def main():
         p.error("cache-lifecycle requires a sparse window and context >= 4 * window * 64 + 4096")
     if args.profile == "concurrency" and (args.concurrency < 2 or args.window == 0 or
                                            args.context < args.window * 64 + 4096):
-        p.error("concurrency profile requires two or three lanes and context >= window * 64 + 4096")
+        p.error("concurrency profile requires two to four lanes and context >= window * 64 + 4096")
+    if args.prefill_token_budget < 0:
+        p.error('prefill-token-budget must be nonnegative')
+    if args.dspark_dynamic_k and args.spec != 'dspark':
+        p.error('dspark-dynamic-k requires the dspark backend')
+    if args.profile == 'fair-prefill' and (
+            args.prefill_token_budget <= 0 or args.concurrency < 2 or not args.trace or
+            args.window <= 0 or args.context < args.window * 64 + 4096):
+        p.error('fair-prefill requires a positive global budget, two to four lanes, sparse capacity and trace')
     args.output.mkdir(parents=True, exist_ok=False)
     suite = Suite(args)
     def interrupted(signum, _frame):

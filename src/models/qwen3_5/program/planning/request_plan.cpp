@@ -529,7 +529,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     const std::size_t cold_prefill_splits =
         base->vision_control_plan ? base->vision_control_plan->items.size() : 0ULL;
     base->summary.service_work_quanta =
-        projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits,
+        projected_service_work(base->summary, 0, prefill_service_chunk, cold_prefill_splits,
                                base->capture_groups, prompt.identity.rewrite_execution_frontiers,
                                prompt, kvmem_window_pages * kPagedKVPageSize);
     base->root_rebuild_work =
@@ -851,7 +851,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
 
     const std::size_t prefill_splits = plan->vision ? plan->vision->uses.size() : 0ULL;
     plan->summary.service_work_quanta =
-        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits,
+        projected_service_work(plan->summary, plan->reuse_base, prefill_service_chunk, prefill_splits,
                                plan->capture_groups, prompt.identity.rewrite_execution_frontiers,
                                prompt, kvmem_window_pages * kPagedKVPageSize);
     std::uint64_t remaining_vision_items   = 0;
@@ -1398,7 +1398,7 @@ void ProgramImpl::select_shared_captures(AdmissionCandidate& candidate,
 
     const std::size_t prefill_splits = plan.vision ? plan.vision->uses.size() : 0ULL;
     plan.summary.service_work_quanta =
-        projected_service_work(plan.summary, plan.reuse_base, prefill_chunk, prefill_splits,
+        projected_service_work(plan.summary, plan.reuse_base, prefill_service_chunk, prefill_splits,
                                plan.capture_groups, prompt.identity.rewrite_execution_frontiers,
                                prompt, kvmem_window_pages * kPagedKVPageSize);
     std::uint64_t vision_items   = 0;

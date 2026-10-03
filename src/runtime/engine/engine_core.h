@@ -10,6 +10,7 @@
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
+#include "runtime/engine/prefill_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/sparse_epoch_binding.h"
 
@@ -70,6 +71,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          prefill_chunk_(options.prefill_chunk), prefill_budget_(options.prefill_token_budget),
           resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
@@ -1486,7 +1488,8 @@ private:
     }
 
     void run_prefill_step(std::uint32_t lane,
-                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                          std::uint32_t token_budget) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
         if (!scheduler_.owns_prefill_lane(lane)) {
@@ -1501,8 +1504,23 @@ private:
         }
         setup.finish();
         ProgramCallScope program_call(*this);
-        auto progress =
-            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+        auto progress = [&] {
+            if constexpr (requires {
+                              instance_.program->advance_prefill(
+                                  *request->sequence, &program_call.failed_timing(), token_budget);
+                          }) {
+                return instance_.program->advance_prefill(
+                    *request->sequence, &program_call.failed_timing(), token_budget);
+            } else {
+                return instance_.program->advance_prefill(*request->sequence,
+                                                          &program_call.failed_timing());
+            }
+        }();
+        if constexpr (requires { progress.work_tokens; }) {
+            prefill_budget_.consume(progress.work_tokens);
+        } else {
+            prefill_budget_.consume(std::max(token_budget, progress.processed_prompt_tokens));
+        }
         program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         if (scheduler_.owns_prefill_lane(lane)) {
@@ -1521,7 +1539,9 @@ private:
                     break;
                 }
             }
-            if (have_replay_owner) { scheduler_.rotate_prefill_lane(lane); }
+            if (prefill_budget_.enabled() || have_replay_owner) {
+                scheduler_.rotate_prefill_lane(lane);
+            }
         }
         publish_runtime_stats();
     }
@@ -2105,7 +2125,8 @@ private:
                 // An additional staged owner is useful while an existing owner
                 // replays its completed logical prompt. Preserve first-pass FIFO
                 // admission so ordinary prefill/decode overlap keeps its old shape.
-                bool replay_allows_admission = !scheduler_.prefill_lane().has_value();
+                bool replay_allows_admission =
+                    prefill_budget_.enabled() || !scheduler_.prefill_lane().has_value();
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                     const auto& staged = slots_[lane];
                     if (!scheduler_.owns_prefill_lane(lane) || !staged ||
@@ -2163,12 +2184,16 @@ private:
                     runnable_prefills[lane] = !slots_[lane]->capture_pending;
                 }
                 const auto prefill_lane = scheduler_.runnable_prefill_lane(runnable_prefills);
+                const auto token_grant =
+                    prefill_budget_.allowance(!membership.empty(), prefill_chunk_);
                 const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_lane.has_value(), previous_unit_was_decode);
+                    !membership.empty(), prefill_lane.has_value() && token_grant != 0,
+                    previous_unit_was_decode, prefill_budget_.enabled());
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    run_prefill_step(*prefill_lane, cancelled_at_unit_start);
+                    run_prefill_step(*prefill_lane, cancelled_at_unit_start, token_grant);
+                    if (prefill_budget_.enabled()) request_admission_check();
                     previous_unit_was_decode = false;
                     continue;
                 }
@@ -2176,6 +2201,7 @@ private:
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
+                    prefill_budget_.decode_completed();
                     previous_unit_was_decode = true;
                     continue;
                 }
@@ -2203,6 +2229,8 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const std::uint32_t prefill_chunk_;
+    PrefillBudget prefill_budget_;
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;

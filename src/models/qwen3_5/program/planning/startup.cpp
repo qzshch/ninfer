@@ -896,6 +896,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
+    impl->prefill_service_chunk = inputs.prefill_service_chunk == 0
+                                     ? inputs.prefill_chunk : inputs.prefill_service_chunk;
     impl->kvmem_window_pages   = inputs.kvmem_window_pages;
     impl->draft_window         = inputs.draft_window;
     impl->dspark_dynamic_k     = inputs.dspark_dynamic_k;
@@ -964,6 +966,10 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity             = options.max_context,
         .max_concurrency      = options.max_concurrency,
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
+        // A shared budget may leave a one-token grant after another owner's
+        // capture/rewrite split. Service accounting needs a true unit bound;
+        // physical workspace and latency costing retain the configured chunk.
+        .prefill_service_chunk = options.prefill_token_budget == 0 ? options.prefill_chunk : 1U,
         .kvmem_window_pages   = options.kvmem_window_pages,
         .draft_window         = options.speculative.draft_tokens,
         .dspark_dynamic_k     = options.speculative.dspark_dynamic_k,

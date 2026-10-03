@@ -536,7 +536,8 @@ public:
     [[nodiscard]] bool can_plan_materialization() const noexcept;
     [[nodiscard]] bool has_pending_kv_restore() const noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
-                                                  runtime::ExecutionTiming* failed_timing);
+                                                  runtime::ExecutionTiming* failed_timing,
+                                                  std::uint32_t token_budget = 0);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -608,6 +609,7 @@ public:
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
+    const std::uint32_t prefill_service_chunk;
     // Sparse working-set window (pages) for prefill rolling; 0 keeps dense semantics.
     const std::uint32_t kvmem_window_pages;
     const std::uint32_t draft_window;
@@ -1000,7 +1002,8 @@ private:
                         MaterializationTransaction& transaction);
     void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
     [[nodiscard]] runtime::PrefillStepResult
-    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing);
+    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing,
+                        std::uint32_t token_budget = 0);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
                runtime::ExecutionTiming* failed_timing);
@@ -1219,7 +1222,7 @@ private:
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
-                    runtime::ExecutionTiming* failed_timing);
+                    runtime::ExecutionTiming* failed_timing, std::uint32_t token_budget = 0);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
@@ -1250,7 +1253,8 @@ private:
     void copy_kvmem_query_state(SequenceState& sequence, bool restore);
     std::uint32_t advance_kvmem_query_replay(SequenceState& sequence,
                                             RequestControl::Prefill& staged,
-                                            runtime::ExecutionTimingRecorder& timing);
+                                             runtime::ExecutionTimingRecorder& timing,
+                                             std::uint32_t token_budget = 0);
     void apply_kvmem_retrieval_placement(SequenceState& sequence);
     void roll_sparse_prefill_window(SequenceState& sequence, std::uint32_t prompt_tokens,
                                     std::uint32_t cursor,

@@ -241,7 +241,9 @@ public:
     }
 
     [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
-                                                   bool previous_unit_was_decode) const noexcept {
+                                                   bool previous_unit_was_decode,
+                                                   bool budgeted = false) const noexcept {
+        if (budgeted && prefill_runnable) return ExecutionAction::Prefill;
         if (prefill_runnable) {
             return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
                                                             : ExecutionAction::Prefill;

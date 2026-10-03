@@ -719,6 +719,7 @@ private:
 struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
+    std::uint32_t work_tokens             = 0;
     bool complete                         = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
@@ -895,8 +896,9 @@ public:
     // Materialization must wait until source StateImage forks are settled too.
     [[nodiscard]] bool can_plan_materialization() const noexcept;
     [[nodiscard]] bool has_pending_kv_restore() const noexcept;
-    [[nodiscard]] PrefillProgress
-    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
+                                                  runtime::ExecutionTiming* failed_timing = nullptr,
+                                                  std::uint32_t token_budget              = 0);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,

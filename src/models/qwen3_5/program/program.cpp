@@ -350,8 +350,9 @@ bool Program::can_plan_materialization() const noexcept {
 
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
-                                         runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, failed_timing);
+                                         runtime::ExecutionTiming* failed_timing,
+                                         std::uint32_t token_budget) {
+    return impl_->advance_prefill(sequence, failed_timing, token_budget);
 }
 
 CaptureAssessment
