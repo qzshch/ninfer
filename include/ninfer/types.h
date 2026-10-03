@@ -167,7 +167,7 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     // Sparse KV working-set window in 64-token pages for prefill rolling; 0 keeps the
-    // dense full-residency semantics. Experimental sparse mode supports 1..3 active
+    // dense full-residency semantics. Experimental sparse mode supports 1..4 active
     // lanes; higher concurrency is rejected. Device/Host headroom must cover all lanes.
     std::uint32_t kvmem_window_pages = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::BFloat16;

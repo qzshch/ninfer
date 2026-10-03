@@ -76,14 +76,14 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         if (options.kvmem_window_pages < 8 || options.kvmem_window_pages > logical_pages) {
             throw std::invalid_argument("kvmem_window_pages must be in [8,ceil(max_context/64)]");
         }
-        if (options.max_concurrency == 0 || options.max_concurrency > 3 ||
+        if (options.max_concurrency == 0 || options.max_concurrency > 4 ||
             options.purpose != EnginePurpose::Generation ||
             (options.speculative.backend != SpeculativeBackend::None &&
              options.speculative.backend != SpeculativeBackend::Mtp &&
              options.speculative.backend != SpeculativeBackend::DFlash2 &&
              options.speculative.backend != SpeculativeBackend::DSpark)) {
             throw std::invalid_argument(
-                "KVMem requires one to three lanes with none, MTP, DFlash2 or DSpark speculation");
+                "KVMem requires one to four lanes with none, MTP, DFlash2 or DSpark speculation");
         }
         if (!options.context_cache.enabled || options.context_cache.host_kv_capacity_bytes == 0) {
             throw std::invalid_argument("KVMem requires an enabled Host KV arena");
