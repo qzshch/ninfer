@@ -38,6 +38,8 @@ struct RequestHostTiming {
     std::uint64_t decode_host_exposed_ns          = 0;
     std::uint64_t decode_device_wait_exposed_ns   = 0;
     std::uint64_t prefill_units                   = 0;
+    std::uint64_t packed_prefill_units            = 0;
+    std::uint64_t packed_prefill_tokens           = 0;
     std::uint64_t decode_rounds                   = 0;
     std::uint64_t control_units                   = 0;
 
@@ -88,6 +90,8 @@ struct RequestHostTiming {
             .decode_device_wait_exposed_seconds =
                 static_cast<double>(decode_device_wait_exposed_ns) * kNanosecondsToSeconds,
             .prefill_units = prefill_units,
+            .packed_prefill_units = packed_prefill_units,
+            .packed_prefill_tokens = packed_prefill_tokens,
             .decode_rounds = decode_rounds,
             .control_units = control_units,
         };

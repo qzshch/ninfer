@@ -538,6 +538,10 @@ public:
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing,
                                                   std::uint32_t token_budget = 0);
+    [[nodiscard]] std::optional<PrefillBatchProgress>
+    advance_prefill_batch(std::span<const SequenceHandle> sequences, std::uint32_t token_budget,
+                         runtime::ExecutionTiming* failed_timing = nullptr);
+
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -1222,7 +1226,8 @@ private:
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
-                    runtime::ExecutionTiming* failed_timing, std::uint32_t token_budget = 0);
+                    runtime::ExecutionTiming* failed_timing, std::uint32_t token_budget = 0,
+                    const execution::PrefillChunkResult* executed_chunk = nullptr);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);

@@ -20,7 +20,7 @@ Audit actual per-request cache-hit tokens and capture counters even when the fla
 zero cache hits alone do not prove zero retained ownership. Protocol response/media stores
 remain independently bounded and do not hold model KV continuations.
 
-## Optional DFlash2 probability diagnostics
+## Optional DFlash2 / DSpark probability diagnostics
 
 This observer is disabled by default. For a bounded diagnostic run set
 `NINFER_DFLASH_DIAGNOSTIC_ROUNDS=32` and optionally
@@ -28,7 +28,11 @@ This observer is disabled by default. For a bounded diagnostic run set
 limit of sampled rounds, in `0..256`; `0` disables all observer allocation, kernels,
 and extra copies. `EVERY` is a positive period in `1..1000000`: `1` samples the first
 N rounds, `16` samples rounds 0,16,32,... until N records have been collected. These
-settings require DFlash2 and never change target/draft sampling settings.
+settings require DFlash2 or DSpark and never change target/draft sampling settings.
+The environment names are retained for compatibility. DSpark uses its actual
+Markov proposal probabilities in the same sparse acceptance observer. The separate
+raw-logit support-frontier observer remains DFlash2-only; DSpark packets do not
+claim raw ranks, penalty attribution, or a captured reached-prefix identity.
 
 `request_done.speculative.diagnostics` is null while disabled. When enabled it records
 the budget/period and a bounded `samples` list, scoped to that request. Each sample
@@ -88,6 +92,11 @@ guarantee that an arbitrary maximum-length concurrent workload fits those budget
 This keeps a 96K historical Device window and bounded prefill/growth margins.
 Host RAM retains evicted KV at original positions. Prefill rolls over processed
 history; completed block means and pre-RoPE Q features choose the decode window.
+During prefill, the history window ends at the committed cursor, rather than the
+end of advance mapping. Already mapped future append pages stay writable outside
+that window. A service grant smaller than the workspace chunk therefore cannot
+evict additional history merely because future pages have been reserved. The
+startup claim covers the historical window plus chunk growth and slack.
 The text query uses at most the last 512 tokens of the last typed user message, even
 when tool results follow it. If the template cannot prove that message's token
 boundaries, the query falls back to the new prompt suffix. Long prompts checkpoint
@@ -1193,12 +1202,42 @@ For the experimental full-head DSpark route, see [DSpark](dspark.md).
 
 ### Bounded fair prefill
 
+`--prefill-pack` is an experimental opt-in with a positive `--prefill-token-budget`.
+It submits non-final text chunks together with one completion wait, preserving
+each request's original projection shapes, attention, convolution, recurrent state
+and draft append. It does not combine linear layers into one GEMM: the initial
+shared-GEMM prototype failed its serial numerical gate.
+Media, replay, finalization and checkpoint boundaries use the existing individual
+units. Grouping is limited to cold work without a decode-ready request and must
+fit `--prefill-chunk` without shrinking any scalar grant. It falls back to an
+individual unit when an original grant reaches a checkpoint or finalization.
+`packed_prefill` in request timing
+and the corresponding throughput counters show whether this route ran. The startup
+record identifies the mode as `scalar_shape_submission`, rather than shared GEMM.
+
+`--prefill-time-budget-ms N` requires a positive `--prefill-token-budget` and estimates the mixed-work grant from completed unit
+time, with 25% headroom. Completed units also consume shared time credit between
+decode rounds; atomic overshoot is carried as debt. It is a target, not a hard latency bound. Pure prefill keeps
+the large-chunk route. `--prefill-request-token-cap N` additionally bounds an
+individual grant; zero disables each optional limit. Neither option removes the
+atomic media rule or the shared token-budget debt.
+
 `--prefill-token-budget N` enables multiple ordinary cold-prefill owners as well
 as replay owners. All owners share N tokens of work between decode rounds; each
 unit is additionally capped by `--prefill-chunk`. Owners rotate at completed GPU
 unit boundaries. The decoder replenishes the shared budget, and oversized atomic
 media groups carry budget debt rather than being split. With no decode-ready
-request, cold work continues at bounded unit boundaries. Zero retains the legacy
+request, one runnable owner uses the full configured chunk. Multiple cold owners
+each receive `min(prefill_chunk, max(N, prefill_chunk / runnable_owners))`
+tokens per unit and rotate; capture-blocked owners are excluded. Fair rotation
+does not shrink a configured 1024-token unit to 341 merely because three owners
+are runnable. Pure-prefill work does not incur debt against a decoder that
+becomes ready later. Cold-only work may exceed N across owners; N is the shared
+work bound between decode rounds once a decoder exists. This lets
+`--prefill-chunk 4096 --prefill-token-budget 1024` use larger configured units for isolated input
+while bounding mixed prefill/replay work to 1024 tokens between decode rounds.
+The workspace and sparse growth envelope are still sized at startup for 4096;
+no decoder latency deadline is promised for atomic media. Zero retains the legacy
 serialized cold-prefill policy. The flag changes scheduling and latency tradeoffs;
 it is not a promise of higher aggregate throughput.
 

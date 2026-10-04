@@ -359,7 +359,9 @@ Json speculative_diagnostics_json(const GenerationMetrics& metrics) {
                 ? Json(static_cast<std::uint64_t>(sample.frontier) + 1 + sample.first.position) : Json(nullptr)},
             {"accepted_proposal_absolute_position_0based", sample.accepted.position >= 0 && sample.round_anchor_id >= 0
                 ? Json(static_cast<std::uint64_t>(sample.frontier) + 1 + sample.accepted.position) : Json(nullptr)},
-            {"prefix_binding_scope", "round_anchor_plus_prior_accepted_drafts_full_prompt_identity_separate"}});
+            {"prefix_binding_scope", sample.round_anchor_id >= 0
+                ? "round_anchor_plus_prior_accepted_drafts_full_prompt_identity_separate"
+                : "not_collected"}});
     }
     return Json{{"max_sampled_rounds", metrics.speculative_diagnostic_max_rounds},
         {"sample_every", metrics.speculative_diagnostic_every},
@@ -492,6 +494,7 @@ Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
                         {"device_wait_exposed_seconds", timing.decode_device_wait_exposed_seconds},
                         {"rounds", timing.decode_rounds}}},
         {"units", Json{{"prefill", timing.prefill_units}, {"control", timing.control_units}}},
+        {"packed_prefill", Json{{"units", timing.packed_prefill_units}, {"tokens", timing.packed_prefill_tokens}}},
     };
 }
 
@@ -517,6 +520,8 @@ ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats&
         .control_device_wait_ns =
             monotonic_delta(previous.control_device_wait_ns, current.control_device_wait_ns),
         .prefill_units = monotonic_delta(previous.prefill_units, current.prefill_units),
+        .packed_prefill_units = monotonic_delta(previous.packed_prefill_units, current.packed_prefill_units),
+        .packed_prefill_tokens = monotonic_delta(previous.packed_prefill_tokens, current.packed_prefill_tokens),
         .control_units = monotonic_delta(previous.control_units, current.control_units),
         .admission_policy_ns =
             monotonic_delta(previous.admission_policy_ns, current.admission_policy_ns),
@@ -607,6 +612,10 @@ std::string format_server_start_json(
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
              {"prefill_chunk", engine_options.prefill_chunk},
              {"prefill_token_budget", engine_options.prefill_token_budget},
+             {"prefill_pack", engine_options.prefill_pack},
+             {"prefill_pack_mode", engine_options.prefill_pack ? "scalar_shape_submission" : "disabled"},
+             {"prefill_time_budget_ms", engine_options.prefill_time_budget_ms},
+             {"prefill_request_token_cap", engine_options.prefill_request_token_cap},
              {"dspark_dynamic_k", engine_options.speculative.dspark_dynamic_k},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
@@ -847,6 +856,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                        {"context_progress", host.context_progress_invocations},
                                        {"stats_publication", host.stats_publication_invocations}}},
            {"units", Json{{"prefill", host.prefill_units}, {"control", host.control_units}}},
+           {"packed_prefill", Json{{"units", host.packed_prefill_units}, {"tokens", host.packed_prefill_tokens}}},
            {"decode_host_microseconds_per_round",
             microseconds_per(host.decode_host_ns, report.decode_rounds)},
            {"decode_host_microseconds_per_row_round",

@@ -1154,6 +1154,121 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
     run_layers(x, ph, tap);
 }
 
+std::vector<PrefillChunkResult>
+TextContext::prefill_packed(std::span<PackedPrefillSegment> segments) {
+    if (segments.size() < 2 || segments.size() > kMaximumConcurrency) {
+        throw std::invalid_argument("packed prefill requires two or more rows");
+    }
+    std::uint32_t total = 0;
+    for (std::size_t row = 0; row < segments.size(); ++row) {
+        auto& segment = segments[row];
+        if (segment.context == nullptr || segment.tokens == 0) {
+            throw std::invalid_argument("packed prefill row is empty");
+        }
+        const auto& card = *segment.context;
+        if (&card.ctx_ != &ctx_ || &card.parameters_ != &parameters_ ||
+            &card.work_ != &work_ || &card.state_ != &state_ || &card.io_ != &io_ ||
+            &card.prefill_hidden_ != &prefill_hidden_ || card.prefill_chunk_ != prefill_chunk_ ||
+            static_cast<std::uint64_t>(card.text_kv_base_) + segment.tokens >= segment.prompt.size() ||
+            segment.kv_table_row < 0 || total > prefill_chunk_ ||
+            segment.tokens > prefill_chunk_ - total) {
+            throw std::invalid_argument("packed prefill row exceeds its non-final workspace contract");
+        }
+        for (std::size_t previous = 0; previous < row; ++previous) {
+            const auto& other = *segments[previous].context;
+            if (other.linear_state_destination_slot_ == card.linear_state_destination_slot_ ||
+                other.linear_state_destination_slot_ == card.linear_state_source_slot_ ||
+                other.linear_state_source_slot_ == card.linear_state_destination_slot_ ||
+                segments[previous].kv_table_row == segment.kv_table_row) {
+                throw std::invalid_argument("packed prefill rows alias mutable state");
+            }
+        }
+        segment.column_offset = static_cast<std::int32_t>(total);
+        total += segment.tokens;
+    }
+
+    runtime::ExecutionTimingRecorder timing;
+    const auto stream = ctx_.stream;
+    work_.reset();
+    try {
+        auto roots = workspace::text_prefill_roots(work_, config_, total, 1, 0);
+        for (auto& segment : segments) {
+            auto& card = *segment.context;
+            Tensor ids = roots.ids.slice(0, segment.column_offset, segment.tokens);
+            copy_i32(segment.prompt.data() + card.text_kv_base_, ids, stream);
+            segment.positions = roots.positions.slice(0, segment.column_offset, segment.tokens);
+            ops::fill_i32_positions(segment.positions, card.text_kv_base_, stream);
+            segment.rope_positions = roots.rope_positions.slice(0, segment.column_offset,
+                                                                segment.tokens).view({int(segment.tokens)});
+            ops::set_i32_scalar(io_.rope_delta, segment.rope_delta, stream);
+            ops::offset_i32_positions(segment.positions, io_.rope_delta,
+                                      segment.rope_positions, stream);
+        }
+        ops::embedding(roots.ids, *embed_, roots.residual, stream);
+        Tensor hidden = matrix_window(prefill_hidden_, total);
+        // One submission/wait, preserving the original per-row projection shapes.
+        // The shared-GEMM prototype failed the serial numerical gate: retain the
+        // scalar arithmetic until its reduction/quantization drift is qualified.
+        for (auto& segment : segments) {
+            auto scope = work_.scope();
+            auto& card = *segment.context;
+            Tensor x = roots.residual.slice(1, segment.column_offset, segment.tokens);
+            Tensor out = hidden.slice(1, segment.column_offset, segment.tokens);
+            ops::set_i32_scalar(io_.text_kv_table_row, segment.kv_table_row, stream);
+            ScopedPositions cache(card.active_cache_positions_, segment.positions);
+            ScopedPositions rope(card.active_rope_positions_, segment.rope_positions);
+            const auto frontier = card.text_kv_base_ + segment.tokens;
+            const ops::CausalAttentionExecutionEnvelope envelope{frontier, frontier};
+            ScopedEnvelope visible(card.active_causal_attention_envelope_, envelope);
+            if (segment.sink != nullptr) {
+                segment.sink->begin(x);
+                card.run_layers(x, Phase::Prefill, *segment.sink);
+            } else {
+                card.run_layers(x, Phase::Prefill);
+            }
+            ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, out, stream);
+        }
+        for (auto& segment : segments) {
+            auto& card = *segment.context;
+            if (segment.sink != nullptr) {
+                segment.sink->capture_positions(segment.positions, stream);
+            }
+            if (card.mtp_enabled()) {
+                auto scope = work_.scope();
+                Tensor ids = work_.alloc(DType::I32, {int(segment.tokens)});
+                copy_i32(segment.prompt.data() + card.text_kv_base_ + 1, ids, stream);
+                ops::set_i32_scalar(io_.backend_kv_table_row, segment.backend_kv_table_row, stream);
+                const auto frontier = card.text_kv_base_ + segment.tokens;
+                const ops::CausalAttentionExecutionEnvelope envelope{frontier, frontier};
+                card.mtp_prefill_chunk(ids, hidden.slice(1, segment.column_offset, segment.tokens),
+                    nullptr, segment.positions, segment.rope_positions, envelope,
+                    false, nullptr, nullptr, nullptr);
+            }
+        }
+        // Target scratch is no longer referenced. Features/positions live in Program backing.
+        work_.reset();
+        for (auto& segment : segments) {
+            if (segment.sink != nullptr) {
+                segment.sink->consume_prefill_chunk(segment.tokens, false);
+            }
+        }
+        timing.begin_wait();
+        ctx_.synchronize();
+        timing.end_wait();
+        work_.reset();
+        std::vector<PrefillChunkResult> results(segments.size());
+        for (std::size_t row = 0; row < segments.size(); ++row) {
+            results[row].processed_tokens = segments[row].tokens;
+        }
+        results.front().timing = timing.finish();
+        return results;
+    } catch (...) {
+        ctx_.synchronize();
+        work_.reset();
+        throw;
+    }
+}
+
 template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,

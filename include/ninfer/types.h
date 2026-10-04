@@ -166,9 +166,13 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
-    // Zero preserves serialized cold prefill. Positive: shared token budget,
-    // fair cold/replay owners, at most one configured chunk per execution unit.
+    // Zero preserves serialized cold prefill. Positive: shared budget between
+    // decode rounds; cold owners share the startup-fixed chunk with a minimum
+    // unit equal to min(budget, chunk). Actual media/replay work is charged.
     std::uint32_t prefill_token_budget = 0;
+    std::uint32_t prefill_time_budget_ms = 0; // Measured mixed-unit target, not a hard deadline.
+    std::uint32_t prefill_request_token_cap = 0;
+    bool prefill_pack = false; // One submission for ragged rows, retaining scalar compute shapes.
     // Sparse KV working-set window in 64-token pages for prefill rolling; 0 keeps the
     // dense full-residency semantics. Experimental sparse mode supports 1..4 active
     // lanes; higher concurrency is rejected. Device/Host headroom must cover all lanes.
@@ -727,6 +731,8 @@ struct GenerationEngineTiming {
     double decode_host_exposed_seconds          = 0.0;
     double decode_device_wait_exposed_seconds   = 0.0;
     std::uint64_t prefill_units                 = 0;
+    std::uint64_t packed_prefill_units          = 0;
+    std::uint64_t packed_prefill_tokens         = 0;
     std::uint64_t decode_rounds                 = 0;
     std::uint64_t control_units                 = 0;
 };
@@ -973,6 +979,8 @@ struct RuntimeHostWorkStats {
     std::uint64_t control_host_ns        = 0;
     std::uint64_t control_device_wait_ns = 0;
     std::uint64_t prefill_units          = 0;
+    std::uint64_t packed_prefill_units   = 0;
+    std::uint64_t packed_prefill_tokens  = 0;
     std::uint64_t control_units          = 0;
 
     std::uint64_t admission_policy_ns           = 0;

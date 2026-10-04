@@ -69,7 +69,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--prefill-token-budget N] [--log-stats-interval-ms N] [--device "
+           "[--prefill-chunk N] [--prefill-token-budget N] [--prefill-pack] [--prefill-time-budget-ms N] [--prefill-request-token-cap N] [--log-stats-interval-ms N] [--device "
            "N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
@@ -103,7 +103,7 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --prefill-token-budget 0 preserves legacy cold scheduling; positive values\n"
-           "       share prefill work across fair cold/replay owners between decode rounds\n"
+           "       share work between decode rounds; cold prefill uses --prefill-chunk with min(budget, chunk) floor\n"
            "       --dspark-dynamic-k requires DSpark confidence weights; maximum K stays "
            "reserved\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
@@ -185,6 +185,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
         } else if (arg == "--dspark-dynamic-k") {
             options.speculative.dspark_dynamic_k = true;
+        } else if (arg == "--prefill-time-budget-ms") {
+            options.prefill_time_budget_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--prefill-time-budget-ms"), "prefill-time-budget-ms"));
+        } else if (arg == "--prefill-request-token-cap") {
+            options.prefill_request_token_cap = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--prefill-request-token-cap"), "prefill-request-token-cap"));
+        } else if (arg == "--prefill-pack") {
+            options.prefill_pack = true;
         } else if (arg == "--prefill-token-budget") {
             options.prefill_token_budget = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--prefill-token-budget"), "prefill-token-budget"));
@@ -376,6 +384,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
+    }
+    if (options.prefill_pack && options.prefill_token_budget == 0) {
+        throw std::invalid_argument("--prefill-pack requires a positive --prefill-token-budget");
+    }
+    if (options.prefill_time_budget_ms != 0 && options.prefill_token_budget == 0) {
+        throw std::invalid_argument("--prefill-time-budget-ms requires a positive --prefill-token-budget");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");

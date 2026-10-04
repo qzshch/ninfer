@@ -391,10 +391,25 @@ int main() {
 
     const auto adaptive =
         parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "7",
-               "--dspark-dynamic-k", "--prefill-token-budget", "1024"});
+               "--dspark-dynamic-k", "--prefill-token-budget", "1024", "--prefill-pack"});
     failures +=
-        check(adaptive.speculative.dspark_dynamic_k && adaptive.prefill_token_budget == 1024,
+        check(adaptive.speculative.dspark_dynamic_k && adaptive.prefill_token_budget == 1024 &&
+                  adaptive.prefill_pack,
               "adaptive DSpark / global prefill options did not reach Engine configuration");
+    bool unbudgeted_pack = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--prefill-pack"});
+    } catch (const std::invalid_argument&) { unbudgeted_pack = true; }
+    failures += check(unbudgeted_pack, "packed prefill requires staged-owner token scheduling");
+    const auto timed = parse({"ninfer-serve", "model.ninfer", "--prefill-token-budget", "1024",
+                               "--prefill-time-budget-ms", "50", "--prefill-request-token-cap", "512"});
+    failures += check(timed.prefill_time_budget_ms == 50 && timed.prefill_request_token_cap == 512,
+                       "prefill time/request limits did not reach Engine configuration");
+    bool unbudgeted_time = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--prefill-time-budget-ms", "50"});
+    } catch (const std::invalid_argument&) { unbudgeted_time = true; }
+    failures += check(unbudgeted_time, "time budget requires global mixed-work scheduling");
     bool adaptive_wrong_backend = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",

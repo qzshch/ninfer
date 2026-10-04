@@ -726,6 +726,13 @@ struct PrefillProgress {
     std::optional<CaptureOffer> capture;
 };
 
+struct PrefillBatchProgress {
+    std::vector<std::uint32_t> lanes;
+    std::vector<PrefillProgress> rows;
+    runtime::ExecutionTiming timing;
+    std::uint32_t work_tokens = 0;
+};
+
 enum class CaptureStatePlacement : std::uint8_t {
     DeviceFork,
     HostSnapshot,
@@ -899,6 +906,10 @@ public:
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing = nullptr,
                                                   std::uint32_t token_budget              = 0);
+    [[nodiscard]] std::optional<PrefillBatchProgress>
+    advance_prefill_batch(std::span<const SequenceHandle> sequences, std::uint32_t token_budget,
+                         runtime::ExecutionTiming* failed_timing = nullptr);
+
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,

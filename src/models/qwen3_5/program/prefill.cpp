@@ -1062,7 +1062,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
                                                         runtime::ExecutionTiming* failed_timing,
-                                                        std::uint32_t token_budget) {
+                                                        std::uint32_t token_budget,
+                                                        const execution::PrefillChunkResult* executed_chunk) {
     auto& sparse = kvmem_lanes_.at(sequence.lane);
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
@@ -1231,7 +1232,14 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 execution::PrefillChunkResult result;
                 timing.pause();
-                if (staged.prompt.has_media()) {
+                if (executed_chunk != nullptr) {
+                    if (executed_chunk->finalized || executed_chunk->processed_tokens != remaining ||
+                        remaining >= staged.prompt_tokens - staged.cursor) {
+                        throw std::logic_error("packed chunk no longer matches its staged row");
+                    }
+                    result = *executed_chunk;
+                    executed_chunk = nullptr;
+                } else if (staged.prompt.has_media()) {
                     if (!workspace_plan.vision) {
                         throw std::logic_error("active Vision prefill lost its workspace plan");
                     }

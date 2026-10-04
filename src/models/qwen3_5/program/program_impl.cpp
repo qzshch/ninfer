@@ -95,6 +95,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         std::getenv("NINFER_DFLASH_SUPPORT_FRONTIER"));
     if (dflash_support_frontier_enabled && dflash_diagnostic_max_rounds == 0)
         throw std::invalid_argument("DFlash support frontier requires diagnostic rounds > 0");
+    if (dflash_support_frontier_enabled && speculative_backend != SpeculativeBackend::DFlash2)
+        throw std::invalid_argument("support frontier diagnostics require DFlash2");
     if (dflash_support_frontier_enabled) {
         constexpr auto bytes = kMaximumConcurrency * 2 * sizeof(DFlashSupportFrontier);
         dflash_support_frontier_device.emplace(bytes);
@@ -107,8 +109,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             {16, 2, static_cast<std::int32_t>(kMaximumConcurrency)});
     }
     if (dflash_diagnostic_max_rounds != 0) {
-        if (speculative_backend != SpeculativeBackend::DFlash2) {
-            throw std::invalid_argument("DFlash probability diagnostics require DFlash2");
+        if (speculative_backend != SpeculativeBackend::DFlash2 &&
+            speculative_backend != SpeculativeBackend::DSpark) {
+            throw std::invalid_argument("sparse probability diagnostics require DFlash2 or DSpark");
         }
         constexpr auto masks_bytes = kMaximumConcurrency * sizeof(std::int32_t);
         constexpr auto packets_bytes = kMaximumConcurrency * 2 * sizeof(SpeculativeProposalDiagnostic);

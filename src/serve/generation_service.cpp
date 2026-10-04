@@ -243,6 +243,9 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.prefill_token_budget     = options_.prefill_token_budget;
+    engine_options.prefill_pack             = options_.prefill_pack;
+    engine_options.prefill_time_budget_ms = options_.prefill_time_budget_ms;
+    engine_options.prefill_request_token_cap = options_.prefill_request_token_cap;
     engine_options.kvmem_window_pages       = options_.kvmem_window_pages;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.enable_vision            = options_.enable_vision;

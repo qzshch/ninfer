@@ -319,7 +319,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto finish = [](const WorkspaceLayoutBuilder& layout) { return layout.peak_bytes(1); };
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
-        (void)workspace::text_prefill_roots(layout, config, tokens, plan.features.vision ? 3 : 0,
+        (void)workspace::text_prefill_roots(layout, config, tokens, plan.features.vision ? 3 : 1,
                                             plan.features.vision ? tokens : 0);
     };
     const auto linear_scratch = [&](WorkspaceLayoutBuilder& layout,
@@ -969,7 +969,10 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         // A shared budget may leave a one-token grant after another owner's
         // capture/rewrite split. Service accounting needs a true unit bound;
         // physical workspace and latency costing retain the configured chunk.
-        .prefill_service_chunk = options.prefill_token_budget == 0 ? options.prefill_chunk : 1U,
+        .prefill_service_chunk = options.prefill_token_budget == 0 &&
+                                         options.prefill_time_budget_ms == 0 &&
+                                         options.prefill_request_token_cap == 0
+                                     ? options.prefill_chunk : 1U,
         .kvmem_window_pages   = options.kvmem_window_pages,
         .draft_window         = options.speculative.draft_tokens,
         .dspark_dynamic_k     = options.speculative.dspark_dynamic_k,

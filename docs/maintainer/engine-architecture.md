@@ -363,7 +363,9 @@ Scheduler 保证：
 
 - 可以同时持有多个已通过资源准入的 staged-prefill owner，数量不超过 active lane；
 - 新准入须等待 Program 的 context transaction、pending transaction 和 GDN state fork 全部结算；
-- 普通首遍 prefill 保留原有单 owner 准入顺序；已有 owner 进入 replay 后才允许额外 staged owner，避免改变普通 decode-ready 顺序；
+- 默认普通首遍 prefill 保留单 owner 准入顺序；正值全局预算允许多个首遍/replay owner，仍逐个通过 Program 的物理准入和事务边界；
+- 有 decode 时，全局预算约束两次 decode 间的所有 prefill/replay 实际工作；纯 prefill 时每个 runnable owner 得到 startup chunk 除以 owner 数量的份额，但每次 unit 至少 min(全局预算, startup chunk)，单 owner 可用完整 chunk；
+- 纯 prefill 不产生对未来 decoder 的预算债；有 decode 的原子 media 超额仍保留债务，capture 阻塞 owner 不参与纯 prefill 的份额分母；
 - 有 owner 已完成逻辑 prompt、仍在执行 replay/tail 时，各 runnable owner 在 GPU unit 边界轮转；
 - capture 等待中的 owner 不阻塞其他 runnable owner；取消或完成只移除自己的 owner；
 - 已有 decode work 不会被连续 prefill 饿死；
@@ -373,7 +375,16 @@ Scheduler 保证：
 Program 接收紧凑的 `SequenceHandle[B]` 和每行预算。Prefix reuse 只减少 materialization 或 suffix
 prefill，不创建另一条调度路径。
 
-这仍然是单个 GPU unit 串行提交的调度，不是多个 prompt 的 ragged kernel packing。
+默认仍然按单 owner 提交 GPU unit。实验性 `prefill_pack` 可以把多个普通文本的非末尾
+chunk 合为一个提交/等待 unit，共用 embedding ingress；线性投影、MLP、归一化、attention、
+卷积及 GDN 递归状态仍按原单行 shape 和各 sequence 的位置、KV row 与 StateImage selectors 执行。
+跨请求 GEMM 原型未通过串行数值门禁，不包含在此路线中。聚合 token 数
+不得超过 startup workspace chunk，禁止可变状态交叉别名。最终采样、media、capture 边界和
+query replay 仍走原单 owner 单元。这个路径合并提交及完成等待，不是完整的 CPU/GPU overlap。
+只在没有 decode-ready 请求时合并；不能为凑 aggregate 容量缩短原本的每行 grant。
+原 grant 会触及 capture/query/finalization 边界时退回单 owner，不提前切碎那个执行单元。
+混合负载可用 `prefill_time_budget_ms` 按已完成单元的 Host 与 Device-wait 时间估算下一次
+token grant，保留 25% 余量；这不是实时截止保证，原子 media 单元仍可能超过预算。
 每次切换必须重新绑定该 sequence 的 KV execution row 和 rope delta；这些标量属于共享 IO scratch。
 Host→Device 的 checkpoint KV 恢复尚未发布时暂停 GPU execution unit，仍在 worker boundary 处理取消和事务进度，避免共享历史页被另一路 replay 重复恢复。
 query replay 仍按原 prefill chunk 返回取消边界，不省略必要的历史计算。

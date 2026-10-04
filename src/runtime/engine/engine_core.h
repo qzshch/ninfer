@@ -71,7 +71,9 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
-          prefill_chunk_(options.prefill_chunk), prefill_budget_(options.prefill_token_budget),
+          prefill_chunk_(options.prefill_chunk), prefill_pack_(options.prefill_pack),
+          prefill_budget_(options.prefill_token_budget, options.prefill_time_budget_ms,
+                          options.prefill_request_token_cap),
           resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
@@ -84,6 +86,10 @@ public:
         if (!options.context_cache.max_private_continuations ||
             !options.context_cache.max_shared_prefixes) {
             throw std::logic_error("target admission capacity does not match the Engine");
+        }
+        if ((options.prefill_pack || options.prefill_time_budget_ms != 0) &&
+            options.prefill_token_budget == 0) {
+            throw std::invalid_argument("packed/time-limited prefill requires a positive token budget");
         }
         cumulative_stats_.lane_count = max_concurrency_;
         published_stats_ = cumulative_stats_;
@@ -1434,9 +1440,10 @@ private:
     void
     resolve_prefill_progress(const std::shared_ptr<Request>& request,
                              typename ModelContract::PrefillProgress&& progress,
-                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                             bool unique_unit = true) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
-        ++cumulative_stats_.host_work.prefill_units;
+        if (unique_unit) ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
         cumulative_stats_.lanes[request->lane->value].computed_prefill_tokens +=
@@ -1487,6 +1494,53 @@ private:
         progress.pending.reset();
     }
 
+    bool run_packed_prefill(std::uint32_t first_lane,
+                            const std::array<bool, kMaximumConcurrency>& runnable,
+                            const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                            std::uint32_t token_budget) {
+        if constexpr (requires(std::span<const typename ModelContract::SequenceHandle> handles,
+                               runtime::ExecutionTiming* timing) {
+                          instance_.program->advance_prefill_batch(handles, token_budget, timing);
+                      }) {
+            std::array<typename ModelContract::SequenceHandle, kMaximumConcurrency> handles{};
+            std::uint32_t count = 0;
+            for (std::uint32_t offset = 0; offset < max_concurrency_; ++offset) {
+                const auto lane = (first_lane + offset) % max_concurrency_;
+                if (runnable[lane] && !cancelled_at_unit_start[lane]) {
+                    if (!slots_[lane] || !slots_[lane]->sequence)
+                        throw std::logic_error("packed prefill owner has no sequence");
+                    handles[count++] = *slots_[lane]->sequence;
+                }
+            }
+            if (count < 2) return false;
+            nvtx::ScopedRange range(nvtx::Name::Prefill, nvtx::Category::Prefill, count);
+            ProgramCallScope call(*this);
+            auto result = instance_.program->advance_prefill_batch(
+                std::span<const typename ModelContract::SequenceHandle>(handles.data(), count),
+                token_budget, &call.failed_timing());
+            if (!result) { call.finish({}); return false; }
+            call.finish(result->timing);
+            prefill_budget_.observe(result->work_tokens, result->timing.host_ns() +
+                                                         result->timing.device_wait_ns);
+            prefill_budget_.consume(result->work_tokens);
+            for (std::size_t row = 0; row < result->lanes.size(); ++row) {
+                const auto lane = result->lanes[row];
+                ++slots_[lane]->host_timing.packed_prefill_units;
+                slots_[lane]->host_timing.packed_prefill_tokens += result->rows[row].processed_prompt_tokens;
+                resolve_prefill_progress(slots_[lane], std::move(result->rows[row]),
+                                         cancelled_at_unit_start, row == 0);
+            }
+            // One worker unit, even though each request observes shared service.
+            ++cumulative_stats_.host_work.packed_prefill_units;
+            cumulative_stats_.host_work.packed_prefill_tokens += result->work_tokens;
+            scheduler_.rotate_prefill_lane(first_lane);
+            publish_runtime_stats();
+            return true;
+        } else {
+            return false;
+        }
+    }
+
     void run_prefill_step(std::uint32_t lane,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
                           std::uint32_t token_budget) {
@@ -1516,6 +1570,10 @@ private:
                                                           &program_call.failed_timing());
             }
         }();
+        if constexpr (requires { progress.work_tokens; }) {
+            prefill_budget_.observe(progress.work_tokens,
+                progress.timing.host_ns() + progress.timing.device_wait_ns);
+        }
         if constexpr (requires { progress.work_tokens; }) {
             prefill_budget_.consume(progress.work_tokens);
         } else {
@@ -2176,23 +2234,32 @@ private:
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
 
                 std::array<bool, kMaximumConcurrency> runnable_prefills{};
+                std::uint32_t runnable_prefill_count = 0;
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                     if (!scheduler_.owns_prefill_lane(lane)) { continue; }
                     if (slots_[lane] == nullptr || !slots_[lane]->is_prefilling()) {
                         throw std::logic_error("prefill owner has no active Engine request");
                     }
                     runnable_prefills[lane] = !slots_[lane]->capture_pending;
+                    runnable_prefill_count += runnable_prefills[lane] ? 1U : 0U;
                 }
                 const auto prefill_lane = scheduler_.runnable_prefill_lane(runnable_prefills);
                 const auto token_grant =
-                    prefill_budget_.allowance(!membership.empty(), prefill_chunk_);
+                    prefill_budget_.allowance(!membership.empty(), prefill_chunk_,
+                                              runnable_prefill_count);
                 const ExecutionAction action = scheduler_.choose_execution(
                     !membership.empty(), prefill_lane.has_value() && token_grant != 0,
                     previous_unit_was_decode, prefill_budget_.enabled());
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    run_prefill_step(*prefill_lane, cancelled_at_unit_start, token_grant);
+                    const auto aggregate_grant = PrefillBudget::packed_allowance(
+                        !membership.empty(), prefill_chunk_, token_grant, runnable_prefill_count);
+                    if (!prefill_pack_ || aggregate_grant == 0 || !run_packed_prefill(*prefill_lane, runnable_prefills,
+                                                              cancelled_at_unit_start,
+                                                              aggregate_grant)) {
+                        run_prefill_step(*prefill_lane, cancelled_at_unit_start, token_grant);
+                    }
                     if (prefill_budget_.enabled()) request_admission_check();
                     previous_unit_was_decode = false;
                     continue;
@@ -2230,6 +2297,7 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const std::uint32_t prefill_chunk_;
+    const bool prefill_pack_;
     PrefillBudget prefill_budget_;
     ResourceManagement resources_;
 

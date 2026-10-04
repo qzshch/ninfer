@@ -69,6 +69,20 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
+class TextContext;
+struct PackedPrefillSegment {
+    TextContext* context = nullptr;
+    std::span<const int> prompt;
+    std::uint32_t tokens = 0;
+    std::int32_t kv_table_row = 0;
+    std::int32_t rope_delta = 0;
+    std::int32_t backend_kv_table_row = 0;
+    DFlashFeatureSink* sink = nullptr;
+    Tensor positions;
+    Tensor rope_positions;
+    std::int32_t column_offset = 0;
+};
+
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, WorkspaceArena& work,
@@ -141,6 +155,11 @@ public:
                                                    std::uint32_t nominal_length,
                                                    VisionPrefillSession* vision,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    // Non-final plain-text chunks: one submission/wait, original per-row compute shapes.
+    // Sum of row tokens is bounded by the existing startup prefill workspace.
+    [[nodiscard]] std::vector<PrefillChunkResult>
+    prefill_packed(std::span<PackedPrefillSegment> segments);
+
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_source_slots,

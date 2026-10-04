@@ -172,6 +172,15 @@ int main() {
               "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
+    failures += check(server.at("engine").at("prefill_pack_mode") == "disabled",
+                      "disabled prefill mode misreported as packed compute");
+    engine_options.prefill_pack = true;
+    const Json grouped_server = Json::parse(format_server_start_json(
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias", load,
+        memory, environment, std::uint64_t{123456}));
+    failures += check(grouped_server.at("engine").at("prefill_pack_mode") == "scalar_shape_submission",
+                      "grouped submission misreported as shared GEMM");
+    engine_options.prefill_pack = false;
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
     failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
                           server.at("engine").at("kv_capacity_page_groups") == 8192 &&
@@ -610,6 +619,21 @@ int main() {
         detailed_sample.at("accepted_reached_prefix_token_ids") == Json::array({17}) &&
         detailed_sample.at("first_proposal_absolute_position_0based") == 40003,
         "exact bounded prompt/round anchor/reached prefix identity lost");
+    auto unbound_outcome = diagnostic_outcome;
+    unbound_outcome.metrics.speculative_backend = ninfer::SpeculativeBackend::DSpark;
+    unbound_outcome.metrics.speculative_support_frontier_enabled = false;
+    auto& unbound_sample = unbound_outcome.metrics.speculative_diagnostic_samples.front();
+    unbound_sample.round_anchor_id = -1;
+    unbound_sample.first_reached_prefix_token_ids.clear();
+    unbound_sample.accepted_reached_prefix_token_ids.clear();
+    unbound_sample.first_support_frontier = {};
+    unbound_sample.accepted_support_frontier = {};
+    const auto unbound_done = Json::parse(format_request_done_json("serve-test", 1000, context, unbound_outcome));
+    const auto& unbound = unbound_done.at("speculative").at("diagnostics").at("samples").at(0);
+    failures += check(unbound.at("prefix_binding_scope") == "not_collected" &&
+        unbound.at("round_anchor_id").is_null() && unbound.at("first_reached_prefix_token_ids").is_null() &&
+        unbound.at("first_support_frontier").is_null(),
+        "probability-only diagnostic must not claim collected prefix or raw-rank provenance");
     auto top_k_outcome = diagnostic_outcome;
     auto& top_k_sample = top_k_outcome.metrics.speculative_diagnostic_samples.front();
     top_k_sample.first.draft_in_target_support = 0;

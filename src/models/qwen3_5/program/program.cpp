@@ -355,6 +355,13 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence,
     return impl_->advance_prefill(sequence, failed_timing, token_budget);
 }
 
+std::optional<PrefillBatchProgress>
+Program::advance_prefill_batch(std::span<const SequenceHandle> sequences,
+                              std::uint32_t token_budget,
+                              runtime::ExecutionTiming* failed_timing) {
+    return impl_->advance_prefill_batch(sequences, token_budget, failed_timing);
+}
+
 CaptureAssessment
 Program::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                          const SharedPrefixHandle* replacement,
